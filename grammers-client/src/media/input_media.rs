@@ -6,7 +6,6 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use std::num::TryFromIntError;
 use std::time::Duration;
 
 use grammers_tl_types as tl;
@@ -105,23 +104,28 @@ pub struct InputVideo {
 pub enum TimeToLive {
     /// Never self-destruct.
     Unlimited,
-    /// Immediately self-destruct after it's played.
+    /// Immediately self-destruct after it's viewed.
     ViewableOnce,
-    /// Live the specified duration.
+    /// Viewable for the specified duration once opened.
     ///
-    /// Note: `Duration::ZERO` is equivalent to [`Self::Unlimited`],
-    /// and `Duration::from_secs(i32::MAX)` is equivalent to [`Self::ViewableOnce`].
+    /// Note that some specific durations are reserved by Telegram
+    /// and have special meanings, while others might be too long.
+    ///
+    /// Durations outside these limits will be clamped to be within them.
     Duration(Duration),
 }
 
-impl TryFrom<TimeToLive> for i32 {
-    type Error = TryFromIntError;
-
-    fn try_from(x: TimeToLive) -> Result<Self, Self::Error> {
+impl From<TimeToLive> for Option<i32> {
+    fn from(x: TimeToLive) -> Option<i32> {
         match x {
-            TimeToLive::Unlimited => Ok(0),
-            TimeToLive::ViewableOnce => Ok(i32::MAX),
-            TimeToLive::Duration(d) => d.as_secs().try_into(),
+            TimeToLive::Unlimited => None,
+            TimeToLive::ViewableOnce => Some(i32::MAX),
+            TimeToLive::Duration(d) => Some(
+                d.as_secs()
+                    .try_into()
+                    .unwrap_or(i32::MAX)
+                    .clamp(1, i32::MAX - 1),
+            ),
         }
     }
 }
@@ -378,12 +382,8 @@ impl InputMedia {
     /// Not all media supports this feature.
     ///
     /// This method should be called before setting any media, else it won't have any effect.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the given [`TimeToLive::Duration`] is longer than [`i32::MAX`] seconds.
-    pub fn media_ttl(mut self, ttl: Option<TimeToLive>) -> Self {
-        self.media_ttl = ttl.map(|t| t.try_into().unwrap());
+    pub fn media_ttl(mut self, ttl: TimeToLive) -> Self {
+        self.media_ttl = ttl.into();
         self
     }
 
@@ -611,12 +611,8 @@ impl InputVideo {
     ///
     /// This enables you to send a `video` that can only be viewed for a certain
     /// amount of seconds before it expires.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the given [`TimeToLive::Duration`] is longer than [`i32::MAX`] seconds.
-    pub fn ttl(mut self, ttl: Option<TimeToLive>) -> Self {
-        self.ttl = ttl.map(|t| t.try_into().unwrap());
+    pub fn ttl(mut self, ttl: TimeToLive) -> Self {
+        self.ttl = ttl.into();
         self
     }
 
