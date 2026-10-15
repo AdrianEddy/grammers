@@ -22,7 +22,7 @@ fs = ["tokio/fs"]
 default = ["fs"]
 
 [dependencies]
-futures-util = { version = "0.3.32", default-features = false, features = [
+futures-util = { version = "0.3.34", default-features = false, features = [
     "alloc"
 ] }
 grammers-crypto = { path = "../grammers-crypto", version = "0.10.0" }
@@ -31,24 +31,24 @@ grammers-session = { path = "../grammers-session", version = "0.10.0", default-f
 grammers-tl-types = { path = "../grammers-tl-types", version = "0.10.0", features = [
     "tl-mtproto",
 ] }
-html5ever = { version = "0.39.0", optional = true }
-jiff = "0.2.35"
-md5 = "0.8.0"
+html5ever = { version = "0.40.1", optional = true }
+jiff = "0.2.38"
+md5 = "0.8.1"
 mime_guess = "2.0.5"
 pin-project-lite = "0.2"
 pulldown-cmark = { version = "0.13.4", default-features = false, optional = true }
-tokio = { version = "1.52.3", default-features = false, features = [
+tokio = { version = "1.53.3", default-features = false, features = [
     "rt", "macros"
 ] }
 tracing.workspace = true
 url = { version = "2.5.8", optional = true }
 
 [dev-dependencies]
-tokio = { version = "1.52.3", default-features = false, features = [
+tokio = { version = "1.53.3", default-features = false, features = [
     "signal",
 ] }
 tracing-subscriber.workspace = true
-toml = "1.1.2"
+toml = "1.1.8"
 
 [[example]]
 name = "ping"
