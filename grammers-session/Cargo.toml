@@ -1,6 +1,6 @@
 [package]
 name = "grammers-session"
-version = "0.10.0"
+version = "0.11.0"
 authors = ["Lonami Exo <totufals@hotmail.com>"]
 license = "MIT OR Apache-2.0"
 description = """
@@ -19,7 +19,7 @@ sqlite-storage = ["dep:libsql"]
 serde = ["dep:serde", "dep:serde_with"]
 
 [dependencies]
-grammers-tl-types = { path = "../grammers-tl-types", version = "0.10.0" }
+grammers-tl-types = { path = "../grammers-tl-types", version = "0.11.0" }
 
 libsql = { version = "0.10.0", default-features = false, features = ["core"], optional = true }
 tokio = { version = "1.53.3", default-features = false, features = ["sync"] }
