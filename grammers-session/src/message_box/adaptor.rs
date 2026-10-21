@@ -299,6 +299,7 @@ pub(super) fn adapt(updates: UpdatesLike) -> Result<tl::types::UpdatesCombined, 
                                         quote_offset: i.quote_offset,
                                         todo_item_id: None,
                                         poll_option: None,
+                                        quote_rich: None,
                                     },
                                 ))
                             }

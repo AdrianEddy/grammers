@@ -102,8 +102,10 @@ impl Channel {
                             bot_verification_icon: None,
                             send_paid_messages_stars: None,
                             forum_tabs: false,
+                            in_news: false,
                             linked_monoforum_id: None,
                             linked_community_id: None,
+                            pinned_msg_id: None,
                         },
                         client: client.clone(),
                     }
