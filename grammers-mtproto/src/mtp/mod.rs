@@ -30,7 +30,7 @@ use grammers_crypto as crypto;
 use grammers_tl_types as tl;
 pub use plain::Plain;
 
-use crate::MsgId;
+use crate::{MsgId, transport};
 
 /// Manual implementation of Telegram's `rpc_result`.
 pub struct RpcResult {
@@ -143,6 +143,9 @@ pub enum DeserializeError {
 
     /// Attempting to decrypt the message failed in some way.
     DecryptionError(crypto::Error),
+
+    /// Deserialization failed at the earlier transport level.
+    Transport(transport::Error),
 }
 
 impl std::error::Error for DeserializeError {}
@@ -168,6 +171,9 @@ impl fmt::Display for DeserializeError {
             Self::DecompressionFailed => write!(f, "failed to decompress server's data"),
             Self::UnexpectedConstructor { id } => write!(f, "unexpected constructor: {id:08x}"),
             Self::DecryptionError(ref error) => write!(f, "failed to decrypt message: {error}"),
+            Self::Transport(ref error) => {
+                write!(f, "deserialization failed at transport level: {error}")
+            }
         }
     }
 }

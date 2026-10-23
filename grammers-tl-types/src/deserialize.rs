@@ -10,6 +10,8 @@
 
 use std::fmt;
 
+use crate::Identifiable;
+
 /// Errors that can be produced by [`Cursor`].
 #[derive(Clone, Debug, PartialEq)]
 pub enum Error {
@@ -117,6 +119,12 @@ pub trait Deserializable {
 
     /// Convenience function to deserialize an instance from a slice of bytes.
     ///
+    /// For functions and concrete types, this will only read their body
+    /// (i.e. the constructor identifier should not be present in the buffer.)
+    ///
+    /// For boxed types, the constructor identifier should be present in
+    /// the buffer, so that the correct concrete type can be deserialized.
+    ///
     /// # Examples
     ///
     /// ```
@@ -129,6 +137,28 @@ pub trait Deserializable {
         Self: std::marker::Sized,
     {
         Self::deserialize(&mut Cursor::from_slice(buf))
+    }
+
+    /// Convenience function to deserialize a boxed instance from a slice of bytes.
+    ///
+    /// Unlike [`Self::from_bytes`], the [`Identifiable::CONSTRUCTOR_ID`] will first
+    /// be read from the buffer and then compared against the constructor from self.
+    /// The instance will only be returned if the identifiers match.
+    fn from_boxed_bytes(buf: &[u8]) -> Result<Self>
+    where
+        Self: Identifiable + std::marker::Sized,
+    {
+        let buf = &mut Cursor::from_slice(buf);
+        match u32::deserialize(buf) {
+            Ok(id) => {
+                if id == Self::CONSTRUCTOR_ID {
+                    Self::deserialize(buf)
+                } else {
+                    Err(Error::UnexpectedConstructor { id })
+                }
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 

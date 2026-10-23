@@ -17,6 +17,7 @@
 #![deny(unsafe_code)]
 
 pub mod authentication;
+pub mod connection;
 mod manual_tl;
 pub mod mtp;
 pub mod transport;

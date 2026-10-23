@@ -10,40 +10,21 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, SystemTime};
 use std::{io, thread};
 
-use grammers_crypto::DequeBuffer;
-use grammers_mtproto::mtp::{
-    self, BadMessage, Deserialization, DeserializationFailure, Mtp, RpcResult, RpcResultError,
-};
-use grammers_mtproto::transport::{self, Transport};
-use grammers_mtproto::{MsgId, authentication};
+use grammers_mtproto::mtp;
+use grammers_mtproto::transport::Transport;
+use grammers_mtproto::{MsgId, authentication, connection};
 use grammers_session::updates::UpdatesLike;
 use grammers_tl_types::{self as tl, Deserializable, RemoteCall};
-use tl::{Cursor, Identifiable, Serializable};
+use tl::Serializable;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::oneshot;
 use tokio::sync::oneshot::error::TryRecvError;
 use tokio::time::{Instant, sleep_until};
 use tracing::{debug, error, info, trace, warn};
 
-use crate::errors::{InvocationError, ReadError, RpcError};
+use crate::RpcError;
+use crate::errors::{InvocationError, ReadError};
 use crate::net::{NetStream, ServerAddr};
-
-/// The maximum data that we're willing to send or receive at once.
-///
-/// By having a fixed-size buffer, we can avoid unnecessary allocations
-/// and trivially prevent allocating more than this limit if we ever
-/// received invalid data.
-///
-/// Telegram will close the connection with roughly a megabyte of data,
-/// so to account for the transports' own overhead, we add a few extra
-/// kilobytes to the maximum data size.
-const MAXIMUM_DATA: usize = (1024 * 1024) + (8 * 1024);
-
-/// How much leading space should be reserved in a buffer to avoid moving memory.
-const LEADING_BUFFER_SPACE: usize = mtp::MAX_TRANSPORT_HEADER_LEN
-    + mtp::ENCRYPTED_PACKET_HEADER_LEN
-    + mtp::PLAIN_PACKET_HEADER_LEN
-    + mtp::MESSAGE_CONTAINER_HEADER_LEN;
 
 /// Every how often are pings sent?
 const PING_DELAY: Duration = Duration::from_secs(60);
@@ -78,54 +59,13 @@ pub(crate) fn generate_random_id() -> i64 {
     LAST_ID.fetch_add(1, Ordering::SeqCst)
 }
 
-fn deserialize_updates_like(update: Vec<u8>) -> tl::deserialize::Result<UpdatesLike> {
-    match tl::enums::Updates::from_bytes(&update) {
-        Ok(u) => Ok(UpdatesLike::Updates(u)),
-        Err(e) => {
-            if let Ok(tl::enums::messages::AffectedMessages::Messages(u)) =
-                tl::enums::messages::AffectedMessages::from_bytes(&update)
-            {
-                Ok(UpdatesLike::AffectedMessages(u))
-            } else if let Ok(tl::enums::messages::InvitedUsers::Users(u)) =
-                tl::enums::messages::InvitedUsers::from_bytes(&update)
-            {
-                Ok(UpdatesLike::InvitedUsers(u))
-            } else if let Ok(tl::enums::messages::ChatInviteJoinResult::Ok(u)) =
-                tl::enums::messages::ChatInviteJoinResult::from_bytes(&update)
-            {
-                Ok(UpdatesLike::ChatInviteJoinResult(u))
-            } else {
-                Err(e)
-            }
-        }
-    }
-}
-
-fn deserialize_request<T>(body: &[u8]) -> Option<T>
-where
-    T: Identifiable + Deserializable,
-{
-    let buf = &mut Cursor::from_slice(body);
-    match u32::deserialize(buf) {
-        Ok(id) if id == T::CONSTRUCTOR_ID => T::deserialize(buf).ok(),
-        _ => None,
-    }
-}
-
 /// Manages enqueuing requests, matching them to their response, and IO.
-pub struct Sender<T: Transport, M: Mtp> {
+pub struct Sender<T: Transport, M: mtp::Mtp> {
     stream: NetStream,
-    transport: T,
-    mtp: M,
     addr: ServerAddr,
+    state: connection::State<T, M>,
     requests: Vec<Request>,
     next_ping: Instant,
-
-    // Transport-level buffers and positions
-    read_buffer: Vec<u8>,
-    read_tail: usize,
-    write_buffer: DequeBuffer<u8>,
-    write_head: usize,
 }
 
 struct Request {
@@ -155,7 +95,7 @@ impl MsgIdPair {
     }
 }
 
-impl<T: Transport, M: Mtp> Sender<T, M> {
+impl<T: Transport, M: mtp::Mtp> Sender<T, M> {
     /// Create a new connection using the specified transport, MTP state and server address.
     ///
     /// Note that this does not attempt to invoke [`tl::functions::InitConnection`].
@@ -164,16 +104,10 @@ impl<T: Transport, M: Mtp> Sender<T, M> {
         let stream = NetStream::connect(&addr).await?;
         Ok(Self {
             stream,
-            transport,
-            mtp,
             addr,
+            state: connection::State::new(transport, mtp),
             requests: vec![],
             next_ping: Instant::now() + PING_DELAY,
-
-            read_buffer: vec![0; MAXIMUM_DATA],
-            read_tail: 0,
-            write_buffer: DequeBuffer::with_capacity(MAXIMUM_DATA, LEADING_BUFFER_SPACE),
-            write_head: 0,
         })
     }
 
@@ -241,20 +175,20 @@ impl<T: Transport, M: Mtp> Sender<T, M> {
     /// as dead and the sender instance recreated.
     pub async fn step(&mut self) -> Result<Vec<UpdatesLike>, ReadError> {
         self.try_fill_write();
-        let write_len = self.write_buffer.len() - self.write_head;
-        trace!(
-            "reading bytes and sending up to {} bytes via network",
-            write_len
-        );
 
         let (mut reader, mut writer) = self.stream.split();
         let sleep = sleep_until(self.next_ping);
+        let (read, write) = self.state.io_buffers();
 
+        trace!(
+            "reading bytes and sending up to {} bytes via network",
+            write.len()
+        );
         let res = tokio::select! {
-            n = reader.read(&mut self.read_buffer[self.read_tail..]) => {
+            n = reader.read(read) => {
                 n.map_err(ReadError::Io).and_then(|n| self.on_net_read(n))
             }
-            n = writer.write(&self.write_buffer[self.write_head..]), if !self.write_buffer.is_empty() => {
+            n = writer.write(write), if !write.is_empty() => {
                 n.map_err(ReadError::Io).map(|n| {
                     self.on_net_write(n);
                     Vec::new()
@@ -277,7 +211,7 @@ impl<T: Transport, M: Mtp> Sender<T, M> {
 
     /// Setup the write buffer for the transport, unless a write is already pending.
     fn try_fill_write(&mut self) {
-        if !self.write_buffer.is_empty() {
+        if !self.state.can_buffer_requests() {
             return;
         }
 
@@ -287,21 +221,7 @@ impl<T: Transport, M: Mtp> Sender<T, M> {
             .iter_mut()
             .filter(|r| matches!(r.state, RequestState::NotSerialized))
         {
-            // TODO make mtp itself use BytesMut to avoid copies
-            if let Some(msg_id) = self.mtp.push(&mut self.write_buffer, &request.body) {
-                assert!(request.body.len() >= 4);
-                let req_id = u32::from_le_bytes([
-                    request.body[0],
-                    request.body[1],
-                    request.body[2],
-                    request.body[3],
-                ]);
-                debug!(
-                    req_id = format_args!("{:x}", req_id),
-                    req_name = tl::name_for_id(req_id),
-                    ?msg_id,
-                    "serialized request",
-                );
+            if let Some(msg_id) = self.state.buffer_request(&request.body) {
                 // Note how only NotSerialized become Serialized.
                 // Nasty bugs that take ~2h to find occur otherwise!
                 // (e.g. infinite loops leading to transport flood.)
@@ -311,7 +231,7 @@ impl<T: Transport, M: Mtp> Sender<T, M> {
             }
         }
 
-        if let Some(container_msg_id) = self.mtp.finalize(&mut self.write_buffer) {
+        if let Some(container_msg_id) = self.state.pack_outgoing_buffer() {
             for request in self.requests.iter_mut() {
                 match request.state {
                     RequestState::Serialized(ref mut pair) => {
@@ -320,7 +240,6 @@ impl<T: Transport, M: Mtp> Sender<T, M> {
                     RequestState::NotSerialized | RequestState::Sent(..) => {}
                 }
             }
-            self.transport.pack(&mut self.write_buffer)
         }
     }
 
@@ -328,68 +247,27 @@ impl<T: Transport, M: Mtp> Sender<T, M> {
     ///
     /// This won't cause `ReadError::Io`, but yet another enum would be overkill.
     fn on_net_read(&mut self, n: usize) -> Result<Vec<UpdatesLike>, ReadError> {
-        if n == 0 {
-            return Err(ReadError::Io(io::Error::new(
-                io::ErrorKind::ConnectionReset,
-                "read 0 bytes",
-            )));
-        }
-
-        self.read_tail += n;
-        trace!("read {} bytes from the network", n);
-        trace!("trying to unpack buffer of {} bytes...", self.read_tail);
+        self.state.handle_net_read(n)?;
 
         // TODO the buffer might have multiple transport packets, what should happen with the
         // updates successfully read if subsequent packets fail to be deserialized properly?
         let mut updates = Vec::new();
-        let mut next_offset = 0;
-        while next_offset != self.read_tail {
-            match self
-                .transport
-                .unpack(&mut self.read_buffer[next_offset..self.read_tail])
-            {
-                Ok(offset) => {
-                    debug!("deserializing valid transport packet...");
-                    let result = self
-                        .mtp
-                        .deserialize(&mut self.read_buffer[next_offset..][offset.data_range])?;
-
-                    self.process_mtp_buffer(result, &mut updates);
-                    next_offset += offset.next_offset;
-                }
-                Err(transport::Error::MissingBytes) => break,
-                Err(err) => return Err(err.into()),
-            }
+        while let Some(result) = self.state.unpack_next() {
+            self.process_mtp_buffer(result?, &mut updates);
         }
-
-        self.read_buffer.copy_within(next_offset..self.read_tail, 0);
-        self.read_tail -= next_offset;
-
         Ok(updates)
     }
 
     /// Handle `n` more written bytes being ready to process by the transport.
     fn on_net_write(&mut self, n: usize) {
-        self.write_head += n;
-        trace!(
-            "written {} bytes to the network ({}/{})",
-            n,
-            self.write_head,
-            self.write_buffer.len()
-        );
-        assert!(self.write_head <= self.write_buffer.len());
-        if self.write_head != self.write_buffer.len() {
-            return;
-        }
-
-        self.write_buffer.clear();
-        self.write_head = 0;
-        for req in self.requests.iter_mut() {
-            match &req.state {
-                RequestState::NotSerialized | RequestState::Sent(_) => {}
-                RequestState::Serialized(pair) => {
-                    debug!(?pair, "sent request with");
-                    req.state = RequestState::Sent(pair.clone());
+        if self.state.handle_net_write(n) {
+            for req in self.requests.iter_mut() {
+                match &req.state {
+                    RequestState::NotSerialized | RequestState::Sent(_) => {}
+                    RequestState::Serialized(pair) => {
+                        debug!(?pair, "sent request with");
+                        req.state = RequestState::Sent(pair.clone());
+                    }
                 }
             }
         }
@@ -427,19 +305,19 @@ impl<T: Transport, M: Mtp> Sender<T, M> {
     /// Process the result of deserializing an MTP buffer.
     fn process_mtp_buffer(
         &mut self,
-        results: Vec<Deserialization>,
+        results: Vec<mtp::Deserialization>,
         updates: &mut Vec<UpdatesLike>,
     ) {
         for result in results {
             match result {
-                Deserialization::OwnUpdate { msg_id, update } => {
+                mtp::Deserialization::OwnUpdate { msg_id, update } => {
                     self.process_own_update(updates, msg_id, update)
                 }
-                Deserialization::Update(update) => self.process_update(updates, update),
-                Deserialization::RpcResult(result) => self.process_result(result),
-                Deserialization::RpcError(error) => self.process_error(error),
-                Deserialization::BadMessage(bad_msg) => self.process_bad_message(bad_msg),
-                Deserialization::Failure(failure) => self.process_deserialize_error(failure),
+                mtp::Deserialization::Update(update) => self.process_update(updates, update),
+                mtp::Deserialization::RpcResult(result) => self.process_result(result),
+                mtp::Deserialization::RpcError(error) => self.process_error(error),
+                mtp::Deserialization::BadMessage(bad_msg) => self.process_bad_message(bad_msg),
+                mtp::Deserialization::Failure(failure) => self.process_deserialize_error(failure),
             }
         }
     }
@@ -451,9 +329,9 @@ impl<T: Transport, M: Mtp> Sender<T, M> {
         update: Vec<u8>,
     ) {
         match (
-            deserialize_updates_like(update),
+            UpdatesLike::from_bytes(&update),
             self.peek_request(msg_id).and_then(|request| {
-                deserialize_request::<tl::functions::messages::SendMessage>(&request.body)
+                tl::functions::messages::SendMessage::from_boxed_bytes(&request.body).ok()
             }),
         ) {
             (
@@ -470,9 +348,8 @@ impl<T: Transport, M: Mtp> Sender<T, M> {
                 let channel_id = self
                     .peek_request(msg_id)
                     .and_then(|request| {
-                        deserialize_request::<tl::functions::channels::DeleteMessages>(
-                            &request.body,
-                        )
+                        tl::functions::channels::DeleteMessages::from_boxed_bytes(&request.body)
+                            .ok()
                     })
                     .and_then(|request| match request.channel {
                         tl::enums::InputChannel::Channel(c) => Some((c.channel_id, request.id)),
@@ -502,7 +379,7 @@ impl<T: Transport, M: Mtp> Sender<T, M> {
     }
 
     fn process_update(&mut self, updates: &mut Vec<UpdatesLike>, update: Vec<u8>) {
-        match deserialize_updates_like(update) {
+        match UpdatesLike::from_bytes(&update) {
             Ok(u) => updates.push(u),
             Err(e) => {
                 // These are to be treated as a gap.
@@ -514,7 +391,7 @@ impl<T: Transport, M: Mtp> Sender<T, M> {
         }
     }
 
-    fn process_result(&mut self, result: RpcResult) {
+    fn process_result(&mut self, result: mtp::RpcResult) {
         if let Some(req) = self.pop_request(result.msg_id) {
             let x = result.body;
             assert!(x.len() >= 4);
@@ -534,7 +411,7 @@ impl<T: Transport, M: Mtp> Sender<T, M> {
         }
     }
 
-    fn process_error(&mut self, error: RpcResultError) {
+    fn process_error(&mut self, error: mtp::RpcResultError) {
         if let Some(req) = self.pop_request(error.msg_id) {
             debug!(error = ?error.error, "got rpc error");
             let x = req.body.as_slice();
@@ -552,7 +429,7 @@ impl<T: Transport, M: Mtp> Sender<T, M> {
         }
     }
 
-    fn process_bad_message(&mut self, bad_msg: BadMessage) {
+    fn process_bad_message(&mut self, bad_msg: mtp::BadMessage) {
         for i in (0..self.requests.len()).rev() {
             match &self.requests[i].state {
                 RequestState::Serialized(pair)
@@ -602,7 +479,7 @@ impl<T: Transport, M: Mtp> Sender<T, M> {
         }
     }
 
-    fn process_deserialize_error(&mut self, failure: DeserializationFailure) {
+    fn process_deserialize_error(&mut self, failure: mtp::DeserializationFailure) {
         if let Some(req) = self.pop_request(failure.msg_id) {
             debug!(error = ?failure.error, "got deserialization failure");
             drop(req.result.send(Err(InvocationError::from(failure.error))));
@@ -641,7 +518,7 @@ impl<T: Transport, M: Mtp> Sender<T, M> {
 
 impl<T: Transport> Sender<T, mtp::Encrypted> {
     pub fn auth_key(&self) -> [u8; 256] {
-        self.mtp.auth_key()
+        self.state.mtp.auth_key()
     }
 }
 
@@ -672,27 +549,15 @@ pub async fn generate_auth_key<T: Transport>(
     debug!("gen auth key: sending step 3");
     let response = sender.invoke(&request).await?;
     debug!("gen auth key: completing generation");
-    let authentication::Finished {
-        auth_key,
-        time_offset,
-        first_salt,
-    } = authentication::create_key(data, response)?;
+    let auth = authentication::create_key(data, response)?;
     info!("authorization key generated successfully");
 
     Ok(Sender {
         stream: sender.stream,
-        transport: sender.transport,
-        mtp: mtp::Encrypted::build()
-            .time_offset(time_offset)
-            .first_salt(first_salt)
-            .finish(auth_key),
+        addr: sender.addr,
+        state: sender.state.into_encrypted(auth),
         requests: sender.requests,
         next_ping: Instant::now() + PING_DELAY,
-        read_buffer: sender.read_buffer,
-        read_tail: sender.read_tail,
-        write_buffer: sender.write_buffer,
-        write_head: sender.write_head,
-        addr: sender.addr,
     })
 }
 

@@ -16,8 +16,6 @@ use grammers_tl_types as tl;
 pub enum ReadError {
     /// Standard I/O error.
     Io(io::Error),
-    /// Error propagated from the underlying [`transport`].
-    Transport(transport::Error),
     /// Error propagated from attempting to deserialize an invalid [`tl::Deserializable`].
     Deserialize(mtp::DeserializeError),
 }
@@ -32,7 +30,6 @@ impl Clone for ReadError {
                     .map(io::Error::from_raw_os_error)
                     .unwrap_or_else(|| io::Error::new(e.kind(), e.to_string())),
             ),
-            Self::Transport(e) => Self::Transport(e.clone()),
             Self::Deserialize(e) => Self::Deserialize(e.clone()),
         }
     }
@@ -42,7 +39,6 @@ impl fmt::Display for ReadError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(err) => write!(f, "read error, IO failed: {err}"),
-            Self::Transport(err) => write!(f, "read error, transport-level: {err}"),
             Self::Deserialize(err) => write!(f, "read error, bad response: {err}"),
         }
     }
@@ -51,12 +47,6 @@ impl fmt::Display for ReadError {
 impl From<io::Error> for ReadError {
     fn from(error: io::Error) -> Self {
         Self::Io(error)
-    }
-}
-
-impl From<transport::Error> for ReadError {
-    fn from(error: transport::Error) -> Self {
-        Self::Transport(error)
     }
 }
 
@@ -270,7 +260,6 @@ impl From<ReadError> for InvocationError {
     fn from(error: ReadError) -> Self {
         match error {
             ReadError::Io(error) => Self::from(error),
-            ReadError::Transport(error) => Self::from(error),
             ReadError::Deserialize(error) => Self::from(error),
         }
     }
