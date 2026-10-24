@@ -458,13 +458,13 @@ impl<T: Transport, M: mtp::Mtp> Sender<T, M> {
                         if bad_msg.fatal() {
                             error!(
                                 request = ?pair.msg_id,
-                                "{}; canont retry request",
+                                "{}; cannot retry request",
                                 bad_msg.description(),
                             );
                         } else {
                             warn!(
                                 request = ?pair.msg_id,
-                                "{}; canont retry request",
+                                "{}; cannot retry request",
                                 bad_msg.description(),
                             );
                         }
