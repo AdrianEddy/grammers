@@ -33,6 +33,7 @@ pub use plain::Plain;
 use crate::{MsgId, transport};
 
 /// Manual implementation of Telegram's `rpc_result`.
+#[derive(Debug)]
 pub struct RpcResult {
     /// Message identifier matching that of the outgoing RPC.
     pub msg_id: MsgId,
@@ -41,6 +42,7 @@ pub struct RpcResult {
 }
 
 /// Wrapper around Telegram's `rpc_error`.
+#[derive(Debug)]
 pub struct RpcResultError {
     /// Message identifier matching that of the outgoing RPC.
     pub msg_id: MsgId,
@@ -49,6 +51,7 @@ pub struct RpcResultError {
 }
 
 /// Pseudo-wrapper around Telegram's `bad_msg_notification` constructor.
+#[derive(Debug)]
 pub struct BadMessage {
     /// Message identifier of the outgoing message that caused this notification.
     pub msg_id: MsgId,
@@ -57,6 +60,7 @@ pub struct BadMessage {
 }
 
 /// [`DeserializeError`] with the corresponding [`MsgId`] that caused it.
+#[derive(Debug)]
 pub struct DeserializationFailure {
     /// Message identifier of the outgoing mesasge whose response failed to be deserialized.
     pub msg_id: MsgId,
@@ -65,6 +69,7 @@ pub struct DeserializationFailure {
 }
 
 /// Results from the deserialization of a response.
+#[derive(Debug)]
 pub enum Deserialization {
     /// Copy of an `rpc_result` that contained an `Updates` type.
     OwnUpdate { msg_id: MsgId, update: Vec<u8> },
