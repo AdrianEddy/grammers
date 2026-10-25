@@ -18,7 +18,6 @@ proxy = ["tokio-socks", "hickory-resolver", "url"]
 
 [dependencies]
 bytes = "1.12.1"
-grammers-crypto = { path = "../grammers-crypto", version = "0.11.0" }
 grammers-mtproto = { path = "../grammers-mtproto", version = "0.11.0" }
 grammers-session = { path = "../grammers-session", version = "0.11.0", default-features = false }
 grammers-tl-types = { path = "../grammers-tl-types", version = "0.11.0", features = [ "tl-mtproto", "deserializable-functions" ] }
