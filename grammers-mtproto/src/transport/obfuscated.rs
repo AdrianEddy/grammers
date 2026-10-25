@@ -6,9 +6,10 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use grammers_crypto::{DequeBuffer, ObfuscatedCipher};
+use grammers_crypto::ObfuscatedCipher;
 
 use super::{Error, Tagged, Transport, UnpackedOffset};
+use crate::DequeBuffer;
 
 /// Obfuscation layer for other MTProto transport protocols.
 ///

@@ -7,9 +7,9 @@
 // except according to those terms.
 
 use crc32fast::Hasher;
-use grammers_crypto::DequeBuffer;
 
 use super::{Error, Transport, UnpackedOffset};
+use crate::DequeBuffer;
 
 /// The basic MTProto transport protocol.
 ///

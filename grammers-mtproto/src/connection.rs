@@ -10,10 +10,10 @@
 
 use std::io;
 
-use grammers_crypto::DequeBuffer;
 use grammers_tl_types as tl;
 use tracing::{debug, trace};
 
+use crate::DequeBuffer;
 use crate::authentication::Finished;
 use crate::mtp::{self, Deserialization, DeserializeError, Encrypted, Mtp, Plain};
 use crate::transport::Transport;

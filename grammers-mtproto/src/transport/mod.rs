@@ -22,9 +22,10 @@ use std::{fmt, ops::Range};
 
 pub use abridged::Abridged;
 pub use full::Full;
-use grammers_crypto::DequeBuffer;
 pub use intermediate::Intermediate;
 pub use obfuscated::Obfuscated;
+
+use crate::DequeBuffer;
 
 /// The error type reported by the different transports when something is wrong.
 ///

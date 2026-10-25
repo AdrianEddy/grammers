@@ -6,9 +6,8 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use grammers_crypto::DequeBuffer;
-
 use super::{Error, Tagged, Transport, UnpackedOffset};
+use crate::DequeBuffer;
 
 /// The lightest MTProto transport protocol available.
 ///

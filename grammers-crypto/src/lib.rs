@@ -13,7 +13,6 @@
 
 pub mod aes;
 mod auth_key;
-mod deque_buffer;
 mod factorize;
 pub mod hex;
 mod obfuscated;
@@ -24,7 +23,6 @@ pub mod two_factor_auth;
 use std::fmt;
 
 pub use auth_key::AuthKey;
-pub use deque_buffer::DequeBuffer;
 pub use factorize::factorize;
 pub use obfuscated::ObfuscatedCipher;
 

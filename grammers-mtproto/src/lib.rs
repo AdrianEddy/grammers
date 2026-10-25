@@ -18,10 +18,13 @@
 
 pub mod authentication;
 pub mod connection;
+mod deque_buffer;
 mod manual_tl;
 pub mod mtp;
 pub mod transport;
 mod utils;
+
+pub use deque_buffer::DequeBuffer;
 
 /// The default compression threshold to be used.
 pub const DEFAULT_COMPRESSION_THRESHOLD: Option<usize> = Some(512);

@@ -6,10 +6,10 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use grammers_crypto::DequeBuffer;
 use grammers_tl_types::{Cursor, Deserializable, Serializable};
 
 use super::{Deserialization, DeserializeError, Mtp, RpcResult};
+use crate::DequeBuffer;
 use crate::MsgId;
 
 /// An implementation of the [Mobile Transport Protocol] for plaintext
