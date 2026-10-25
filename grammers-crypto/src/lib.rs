@@ -111,12 +111,30 @@ fn determine_padding_v2_length(len: usize) -> usize {
     16 + (16 - (len % 16))
 }
 
-// Inner body of `encrypt_data_v2`, separated for testing purposes.
-fn do_encrypt_data_v2(buffer: &mut DequeBuffer<u8>, auth_key: &AuthKey, random_padding: &[u8; 32]) {
-    // "Note that MTProto 2.0 requires from 12 to 1024 bytes of padding"
-    // "[...] the resulting message length be divisible by 16 bytes"
-    let padding_len = determine_padding_v2_length(buffer.len());
-    buffer.extend_back(&random_padding[0..padding_len]);
+/// Generates random padding data and returns the amount of bytes from said
+/// data that need to be appended to the buffer to make it correctly-sized.
+pub fn get_padding_data_v2(buffer_len: usize) -> ([u8; 32], usize) {
+    let random_padding = {
+        let mut rnd = [0; 32];
+        getrandom::fill(&mut rnd).expect("failed to generate a secure padding");
+        rnd
+    };
+    (random_padding, determine_padding_v2_length(buffer_len))
+}
+
+/// This function implements the [MTProto 2.0 algorithm] for computing
+/// `aes_key` and `aes_iv` from `auth_key` and `msg_key` as specified.
+///
+/// The buffer must've been padded with [`get_padding_data_v2`]
+/// before calling this function.
+///
+/// The returned `msg_key` should be prepended to the buffer first.
+/// Then the `auth_key.key_id` should also be prepended to the buffer.
+///
+/// [MTProto 2.0 algorithm]: https://core.telegram.org/mtproto/description#defining-aes-key-and-initialization-vector
+#[must_use]
+pub fn encrypt_data_v2(buffer: &mut [u8], auth_key: &AuthKey) -> [u8; 16] {
+    debug_assert_eq!(buffer.len() % 16, 0, "buffer should have been padded");
 
     // Encryption is done by the client
     let side = Side::Client;
@@ -136,23 +154,7 @@ fn do_encrypt_data_v2(buffer: &mut DequeBuffer<u8>, auth_key: &AuthKey, random_p
     let (key, iv) = calc_key(auth_key, &msg_key, side);
 
     aes::ige_encrypt(&mut buffer[..], &key, &iv);
-
-    buffer.extend_front(&msg_key);
-    buffer.extend_front(&auth_key.key_id);
-}
-
-/// This function implements the [MTProto 2.0 algorithm] for computing
-/// `aes_key` and `aes_iv` from `auth_key` and `msg_key` as specified
-///
-/// [MTProto 2.0 algorithm]: https://core.telegram.org/mtproto/description#defining-aes-key-and-initialization-vector
-pub fn encrypt_data_v2(buffer: &mut DequeBuffer<u8>, auth_key: &AuthKey) {
-    let random_padding = {
-        let mut rnd = [0; 32];
-        getrandom::fill(&mut rnd).expect("failed to generate a secure padding");
-        rnd
-    };
-
-    do_encrypt_data_v2(buffer, auth_key, &random_padding)
+    msg_key
 }
 
 /// This method is the inverse of `encrypt_data_v2`.
@@ -171,7 +173,7 @@ pub fn decrypt_data_v2<'b>(
 
     // TODO Check salt, session_id and sequence_number
     let key_id = &buffer[..8];
-    if auth_key.key_id != *key_id {
+    if auth_key.key_id() != *key_id {
         return Err(Error::AuthKeyMismatch);
     }
 
@@ -293,7 +295,7 @@ mod tests {
 
     #[test]
     fn encrypt_client_data_v2() {
-        let mut buffer = DequeBuffer::with_capacity(0, 0);
+        let mut buffer = Vec::new();
         buffer.extend(b"Hello, world! This data should remain secure!");
         let auth_key = get_test_auth_key();
         let random_padding = [0; 32];
@@ -305,8 +307,13 @@ mod tests {
             36, 61, 86, 62, 161, 128, 210, 24, 238, 117, 124, 154,
         ];
 
-        do_encrypt_data_v2(&mut buffer, &auth_key, &random_padding);
-        assert_eq!(&buffer[..], expected);
+        let len = determine_padding_v2_length(buffer.len());
+        buffer.extend_from_slice(&random_padding[..len]);
+        let msg_key = encrypt_data_v2(&mut buffer, &auth_key);
+
+        assert_eq!(&buffer[..], &expected[24..]);
+        assert_eq!(msg_key, &expected[8..24]);
+        assert_eq!(auth_key.key_id(), &expected[..8]);
     }
 
     #[test]

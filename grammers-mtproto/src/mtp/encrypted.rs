@@ -9,7 +9,9 @@
 use std::mem;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use grammers_crypto::{AuthKey, DequeBuffer, decrypt_data_v2, encrypt_data_v2};
+use grammers_crypto::{
+    AuthKey, DequeBuffer, decrypt_data_v2, encrypt_data_v2, get_padding_data_v2,
+};
 use grammers_tl_types::{self as tl, Cursor, Deserializable, Identifiable, Serializable};
 use tracing::info;
 
@@ -1287,7 +1289,14 @@ impl Mtp for Encrypted {
         if buffer.is_empty() {
             None
         } else {
-            encrypt_data_v2(buffer, &self.auth_key);
+            let (padding, padding_len) = get_padding_data_v2(buffer.len());
+            buffer.extend_back(&padding[..padding_len]);
+
+            let msg_key = encrypt_data_v2(&mut buffer[..], &self.auth_key);
+
+            buffer.extend_front(&msg_key);
+            buffer.extend_front(&self.auth_key.key_id());
+
             Some(MsgId(self.last_msg_id))
         }
     }

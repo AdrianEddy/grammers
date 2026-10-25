@@ -17,8 +17,8 @@ use crate::sha1;
 #[derive(Clone)]
 pub struct AuthKey {
     pub(crate) data: [u8; 256],
-    pub(crate) aux_hash: [u8; 8],
-    pub(crate) key_id: [u8; 8],
+    aux_hash: [u8; 8],
+    key_id: [u8; 8],
 }
 
 impl PartialEq for AuthKey {
@@ -68,6 +68,11 @@ impl AuthKey {
         let mut result = [0u8; 16];
         result.copy_from_slice(&sha1!(data)[4..]);
         result
+    }
+
+    /// Returns the key identifier for this data.
+    pub fn key_id(&self) -> [u8; 8] {
+        self.key_id
     }
 }
 
