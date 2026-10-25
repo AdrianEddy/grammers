@@ -111,3 +111,13 @@ pub trait Tagged {
     /// changes the internal state to avoid sending the tag again.
     fn init_tag(&mut self) -> [u8; 4];
 }
+
+impl Transport for Box<dyn Transport + Send> {
+    fn pack(&mut self, buffer: &mut DequeBuffer<u8>) {
+        (**self).pack(buffer)
+    }
+
+    fn unpack(&mut self, buffer: &mut [u8]) -> Result<UnpackedOffset, Error> {
+        (**self).unpack(buffer)
+    }
+}

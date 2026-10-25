@@ -10,9 +10,13 @@ use std::num::{NonZeroU32, NonZeroUsize};
 use std::ops::ControlFlow;
 use std::time::Duration;
 
+use grammers_mtproto::transport::{self, Transport};
+
 use crate::errors::{InvocationError, RpcError};
 
 const DEFAULT_LOCALE: &str = "en";
+
+type TransportFactory = dyn Fn() -> Box<dyn Transport + Send> + Send + Sync;
 
 /// Connection parameters used whenever a new connection is initialized.
 ///
@@ -54,13 +58,15 @@ pub struct ConnectionParams {
     pub use_ipv6: bool,
 
     /// The retry policy to use when encountering errors after invoking a request.
-    pub retry_policy: Box<dyn super::RetryPolicy>,
+    pub retry_policy: Box<dyn RetryPolicy>,
 
     /// Maximum number of updates that can be buffered in the internal channel
     /// between the network senders and the updates receiver.
     ///
     /// When the channel is full, newly received updates are **dropped**.
     pub updates_channel_capacity: NonZeroUsize,
+
+    pub transport: Box<TransportFactory>,
 
     #[doc(hidden)]
     pub __non_exhaustive: (),
@@ -148,6 +154,7 @@ impl Default for ConnectionParams {
             proxy_url: None,
             retry_policy: Box::new(super::AutoSleep::default()),
             updates_channel_capacity: NonZeroUsize::new(100).unwrap(),
+            transport: Box::new(|| Box::new(transport::Full::new())),
             __non_exhaustive: (),
         }
     }

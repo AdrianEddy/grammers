@@ -201,7 +201,7 @@ impl<T: Transport, M: Mtp> State<T, M> {
 
         self.read_tail -= self.read_head;
         self.read_head = 0;
-        return None;
+        None
     }
 }
 

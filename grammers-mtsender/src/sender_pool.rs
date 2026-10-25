@@ -34,8 +34,6 @@ use crate::{Sender, ServerAddr, connect, connect_with_auth};
 /// How long to wait after warning the user that the updates was dropped.
 const UPDATES_DROPPED_LOG_COOLDOWN: Duration = Duration::from_secs(300);
 
-pub(crate) type Transport = transport::Full;
-
 type InvokeResponse = Vec<u8>;
 
 enum Request {
@@ -409,8 +407,8 @@ impl SenderPoolRunner {
     async fn connect_sender(
         &mut self,
         dc_option: &DcOption,
-    ) -> Result<Sender<transport::Full, mtp::Encrypted>, InvocationError> {
-        let transport = transport::Full::new;
+    ) -> Result<Sender<Box<dyn transport::Transport + Send>, mtp::Encrypted>, InvocationError> {
+        let transport = &self.connection_params.transport;
 
         let address = if self.connection_params.use_ipv6 {
             dc_option.ipv6.into()
@@ -520,7 +518,7 @@ impl SenderPoolRunner {
 }
 
 async fn run_sender(
-    mut sender: Sender<Transport, grammers_mtproto::mtp::Encrypted>,
+    mut sender: Sender<Box<dyn transport::Transport + Send>, grammers_mtproto::mtp::Encrypted>,
     mut rpc_rx: mpsc::UnboundedReceiver<Rpc>,
     updates: mpsc::Sender<UpdatesLike>,
     home_sender: bool,
