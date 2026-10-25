@@ -56,6 +56,10 @@ impl<T: Copy + Default> DequeBuffer<T> {
         self.buffer[self.head..self.head + slice.len()].copy_from_slice(slice);
     }
 
+    pub fn extend_back(&mut self, slice: &[T]) {
+        self.buffer.extend_from_slice(slice)
+    }
+
     /// Appends an element to the back of the buffer.
     pub fn push(&mut self, value: T) {
         self.buffer.push(value)

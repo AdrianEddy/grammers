@@ -116,7 +116,7 @@ fn do_encrypt_data_v2(buffer: &mut DequeBuffer<u8>, auth_key: &AuthKey, random_p
     // "Note that MTProto 2.0 requires from 12 to 1024 bytes of padding"
     // "[...] the resulting message length be divisible by 16 bytes"
     let padding_len = determine_padding_v2_length(buffer.len());
-    buffer.extend(random_padding.iter().take(padding_len));
+    buffer.extend_back(&random_padding[0..padding_len]);
 
     // Encryption is done by the client
     let side = Side::Client;
