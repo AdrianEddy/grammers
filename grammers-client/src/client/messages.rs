@@ -709,6 +709,10 @@ impl Client {
     ///
     /// See also: [`Message::respond_album`], [`Message::reply_album`].
     ///
+    /// Note:
+    /// - Empty `InputMedia` entries will be filtered out.
+    /// - If an album contains more than 10 media items, Telegram will returns RpcError `400 MULTI_MEDIA_TOO_LONG`.
+    ///
     /// # Examples
     ///
     /// ```
@@ -725,38 +729,48 @@ impl Client {
         mut medias: Vec<InputMedia>,
     ) -> Result<Vec<Option<Message>>, InvocationError> {
         let peer = peer.into();
-        let random_ids = generate_random_ids(medias.len());
 
         // Upload external files
-        for media in medias.iter_mut() {
-            let raw_media = media.media.clone().unwrap();
+        use tl::enums::InputMedia as M;
 
-            if matches!(
-                raw_media,
-                tl::enums::InputMedia::UploadedPhoto(_)
-                    | tl::enums::InputMedia::PhotoExternal(_)
-                    | tl::enums::InputMedia::UploadedDocument(_)
-                    | tl::enums::InputMedia::DocumentExternal(_)
-            ) {
-                let uploaded = self
-                    .invoke(&tl::functions::messages::UploadMedia {
-                        business_connection_id: None,
-                        peer: peer.into(),
-                        media: raw_media,
-                    })
-                    .await?;
-                media.media = Some(
-                    Media::from_raw(uploaded)
-                        .unwrap()
-                        .to_raw_input_media()
-                        .unwrap(),
-                );
+        for (index, media) in medias.iter_mut().enumerate() {
+            match media.media {
+                Some(M::Empty) | None => {
+                    warn!(index, "skipping empty media in Client::send_album");
+                    media.media = None;
+                }
+                Some(
+                    M::UploadedPhoto(_)
+                    | M::PhotoExternal(_)
+                    | M::UploadedDocument(_)
+                    | M::DocumentExternal(_),
+                ) => {
+                    media.media = self
+                        .upload_media(peer, media.media.take().unwrap())
+                        .await?
+                        .and_then(|media| media.to_raw_input_media());
+                    if media.media.is_none() {
+                        warn!(
+                            index,
+                            "upload_media produced no media in Client::send_album; skipping"
+                        );
+                    }
+                }
+                _ => {}
             }
         }
 
-        let first_media_reply = medias.first().unwrap().reply_to;
+        medias.retain(|media| media.media.is_some());
 
-        let mut multi_media = Vec::with_capacity(medias.len());
+        let first_media_reply = match medias.first() {
+            Some(media) => media.reply_to,
+            None => return Err(InvocationError::Dropped("No media left after filtering.")),
+        };
+
+        let len = medias.len();
+        let random_ids = generate_random_ids(len);
+
+        let mut multi_media = Vec::with_capacity(len);
         for (input_media, random_id) in medias.into_iter().zip(random_ids.iter()) {
             let entities = parse_mention_entities(self, input_media.entities).await;
             let raw_media = input_media.media.unwrap();
@@ -1346,5 +1360,21 @@ impl Client {
         .await?;
 
         Ok(())
+    }
+
+    /// Convert `InputMedia` to [`Media`].
+    pub async fn upload_media<P: Into<PeerRef>, M: Into<tl::enums::InputMedia>>(
+        &self,
+        peer: P,
+        input_media: M,
+    ) -> Result<Option<Media>, InvocationError> {
+        let media = self
+            .invoke(&tl::functions::messages::UploadMedia {
+                business_connection_id: None,
+                peer: peer.into().into(),
+                media: input_media.into(),
+            })
+            .await?;
+        Ok(Media::from_raw(media))
     }
 }
