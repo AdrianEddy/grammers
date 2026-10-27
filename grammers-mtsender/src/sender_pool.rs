@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::{fmt, panic};
 
-use grammers_mtproto::{mtp, transport};
+use grammers_mtproto::{MAX_REQUEST_SIZE, mtp, transport};
 use grammers_session::Session;
 use grammers_session::storages::{ErasedSession, erase};
 use grammers_session::types::DcOption;
@@ -147,6 +147,10 @@ impl SenderPoolHandle {
         dc_id: i32,
         body: Vec<u8>,
     ) -> Result<InvokeResponse, InvocationError> {
+        if body.len() > MAX_REQUEST_SIZE {
+            return Err(InvocationError::Dropped("request body is too large"));
+        }
+
         let (tx, rx) = oneshot::channel();
         self.0
             .send(Request::Invoke { dc_id, body, tx })

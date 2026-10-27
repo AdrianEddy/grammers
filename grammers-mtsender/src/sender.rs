@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, SystemTime};
 use std::{io, thread};
 
-use grammers_mtproto::mtp;
 use grammers_mtproto::transport::Transport;
+use grammers_mtproto::{MAX_REQUEST_SIZE, mtp};
 use grammers_mtproto::{MsgId, authentication, connection};
 use grammers_session::updates::UpdatesLike;
 use grammers_tl_types::{self as tl, Deserializable, RemoteCall};
@@ -125,8 +125,13 @@ impl<T: Transport, M: mtp::Mtp> Sender<T, M> {
         &mut self,
         request: &R,
     ) -> Result<R::Return, InvocationError> {
+        let body = request.to_bytes();
+        if body.len() > MAX_REQUEST_SIZE {
+            return Err(InvocationError::Dropped("request body is too large"));
+        }
+
         let (tx, rx) = oneshot::channel();
-        self.enqueue_body(request.to_bytes(), tx);
+        self.enqueue_body(body, tx);
         self.step_until_receive(rx)
             .await
             .and_then(|vec| R::Return::from_bytes(&vec).map_err(|err| err.into()))
