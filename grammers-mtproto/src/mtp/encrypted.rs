@@ -206,12 +206,28 @@ impl Encrypted {
         }
     }
 
-    fn serialize_msg(
+    fn try_serialize_msg(
         &mut self,
         buffer: &mut DequeBuffer<u8>,
         body: &[u8],
         content_related: bool,
-    ) -> MsgId {
+    ) -> Option<MsgId> {
+        // Make sure it's within bounds both in message count and buffer size.
+        if self.msg_count == manual_tl::MessageContainer::MAXIMUM_LENGTH {
+            return None;
+        }
+        let container_overhead = if self.msg_count == 0 {
+            0
+        } else {
+            manual_tl::MessageContainer::SIZE_OVERHEAD
+        };
+        if buffer.len() + body.len() + manual_tl::Message::SIZE_OVERHEAD + container_overhead
+            > manual_tl::MAX_ENCRYPTED_DATA_SIZE
+        {
+            return None;
+        }
+
+        // Within bounds; add it.
         let msg_id = self.get_new_msg_id();
 
         msg_id.serialize(buffer);
@@ -220,7 +236,7 @@ impl Encrypted {
         buffer.extend(body);
 
         self.msg_count += 1;
-        MsgId(msg_id)
+        Some(MsgId(msg_id))
     }
 
     fn get_current_salt(&self) -> i64 {
@@ -244,7 +260,7 @@ impl Encrypted {
                 num: NUM_FUTURE_SALTS,
             }
             .to_bytes();
-            self.salt_request_msg_id = Some(self.serialize_msg(buffer, &body, true));
+            self.salt_request_msg_id = self.try_serialize_msg(buffer, &body, true);
         }
     }
 
@@ -1241,20 +1257,19 @@ impl Mtp for Encrypted {
                 msg_ids: mem::take(&mut self.pending_ack),
             })
             .to_bytes();
-            self.serialize_msg(buffer, &body, false);
-        }
 
-        // Serialize `MAXIMUM_LENGTH` requests at most.
-        if self.msg_count == manual_tl::MessageContainer::MAXIMUM_LENGTH {
-            return None;
+            if self.try_serialize_msg(buffer, &body, false).is_none() {
+                // This should take priority during the next packet.
+                // Don't allow other requests through until this can be sent.
+                return None;
+            }
         }
 
         // Requests that are too large would cause Telegram to close the
         // connection but are so uncommon it's not worth returning `Err`.
-        assert!(
-            request.len() + manual_tl::Message::SIZE_OVERHEAD
-                <= manual_tl::MessageContainer::MAXIMUM_SIZE
-        );
+        // Without this, failing to serialize would repeatedly return `None`,
+        // leading to an infinite loop as well.
+        assert!(request.len() <= manual_tl::Message::MAX_BODY_SIZE);
 
         // Serialized requests will always be correctly padded.
         assert!(request.len().is_multiple_of(4));
@@ -1272,14 +1287,7 @@ impl Mtp for Encrypted {
             }
         }
 
-        let new_size = buffer.len() + body.len() + manual_tl::Message::SIZE_OVERHEAD;
-        if new_size >= manual_tl::MessageContainer::MAXIMUM_SIZE {
-            // No more messages fit in this container.
-            return None;
-        }
-
-        // This request still fits in the container, so give it a message ID.
-        Some(self.serialize_msg(buffer, body, true))
+        self.try_serialize_msg(buffer, body, true)
     }
 
     fn finalize(&mut self, buffer: &mut DequeBuffer<u8>) -> Option<MsgId> {

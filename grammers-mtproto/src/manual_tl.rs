@@ -10,8 +10,10 @@
 
 use std::io::Write;
 
+use crate::transport::MAX_TRANSPORT_BUFFER_SIZE;
 use flate2::Compression;
 use flate2::write::{GzDecoder, GzEncoder};
+use grammers_crypto::MAX_PADDING_LEN;
 use grammers_tl_types::{self as tl, Cursor, Deserializable, Identifiable, Serializable};
 
 use crate::mtp;
@@ -33,9 +35,23 @@ pub(crate) struct Message {
     pub body: Vec<u8>,
 }
 
+// https://core.telegram.org/mtproto/description#encrypted-message
+// Subtracting key_id (i64) and msg_key (i128).
+const MAX_ENCRYPTED_MESSAGE_SIZE: usize = MAX_TRANSPORT_BUFFER_SIZE - 8 - 16;
+
+// https://core.telegram.org/mtproto/description#encrypted-message-encrypted-data
+// Subtracting salt (i64), session_id (i64) and padding's upper bound.
+pub(crate) const MAX_ENCRYPTED_DATA_SIZE: usize =
+    MAX_ENCRYPTED_MESSAGE_SIZE - 8 - 8 - MAX_PADDING_LEN;
+
 impl Message {
     // msg_id (8 bytes), seq_no (4 bytes), bytes (4 len)
     pub const SIZE_OVERHEAD: usize = 16;
+
+    /// Maximum size a single request can be before it would be rejected by Telegram.
+    /// Pushing a request above this size will panic.
+    pub const MAX_BODY_SIZE: usize =
+        MAX_ENCRYPTED_DATA_SIZE - MessageContainer::SIZE_OVERHEAD - Message::SIZE_OVERHEAD;
 
     /// Peek the constructor ID from the body.
     pub fn constructor_id(&self) -> Result<u32, tl::deserialize::Error> {
@@ -72,7 +88,7 @@ impl Deserializable for Message {
         let len = i32::deserialize(buf)?;
         assert!(len >= 0);
         let len = len as usize;
-        assert!(len < MessageContainer::MAXIMUM_SIZE);
+        assert!(len < Message::MAX_BODY_SIZE);
         let mut body = vec![0; len];
         buf.read_exact(&mut body)?;
 
@@ -131,13 +147,8 @@ pub(crate) struct MessageContainer {
 }
 
 impl MessageContainer {
-    // constructor id (4 bytes), inner vec len (4 bytes)
-    pub const SIZE_OVERHEAD: usize = 8;
-
-    /// Maximum size in bytes for the inner payload of the container.
-    /// Telegram will close the connection if the payload is bigger.
-    /// The overhead of the container itself is subtracted.
-    pub const MAXIMUM_SIZE: usize = 1_044_456 - Self::SIZE_OVERHEAD;
+    // message around container, constructor id (4 bytes), inner vec len (4 bytes)
+    pub const SIZE_OVERHEAD: usize = Message::SIZE_OVERHEAD + 8;
 
     /// Maximum amount of messages that can't be sent inside a single
     /// container, inclusive. Beyond this limit Telegram will respond

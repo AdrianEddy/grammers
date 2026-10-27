@@ -27,6 +27,13 @@ pub use obfuscated::Obfuscated;
 
 use crate::DequeBuffer;
 
+// https://github.com/TelegramMessenger/MTProxy/blob/f36d8af769ffaeac36978d38c2c0f6d1104c2137/mtproto/mtproto-proxy.c#L1529
+// Can also be trivially tested manually by attempting to send a text message
+// without compression. Due to 16-byte-padding, the extremes on the size are
+// 0xff008 which causes the connection reset, and 0xfeff8 which doesn't.
+/// Maximum buffer size, inclusive. This ignores the overhead of the transports.
+pub(crate) const MAX_TRANSPORT_BUFFER_SIZE: usize = 0xff000;
+
 /// The error type reported by the different transports when something is wrong.
 ///
 /// Certain transports will only produce certain variants of this error.

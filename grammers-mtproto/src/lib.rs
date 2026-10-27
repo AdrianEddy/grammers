@@ -29,6 +29,10 @@ pub use deque_buffer::DequeBuffer;
 /// The default compression threshold to be used.
 pub const DEFAULT_COMPRESSION_THRESHOLD: Option<usize> = Some(512);
 
+/// Maximum serialized request size. Requests above this size
+/// are dropped, as they would otherwise reset the connection.
+pub const MAX_REQUEST_SIZE: usize = manual_tl::Message::MAX_BODY_SIZE;
+
 /// A Message Identifier.
 ///
 /// When requests are serialized, a new message identifier is attached to them.

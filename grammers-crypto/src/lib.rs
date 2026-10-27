@@ -100,6 +100,9 @@ fn calc_key(auth_key: &AuthKey, msg_key: &[u8; 16], side: Side) -> ([u8; 32], [u
     (aes_key, aes_iv)
 }
 
+/// Maximum amount of padding that will be returned by `determine_padding_v2_length`.
+pub const MAX_PADDING_LEN: usize = 32;
+
 /// Determines the padding length needed for a plaintext of a certain length,
 /// according to the following citation:
 ///
@@ -111,7 +114,7 @@ fn determine_padding_v2_length(len: usize) -> usize {
 
 /// Generates random padding data and returns the amount of bytes from said
 /// data that need to be appended to the buffer to make it correctly-sized.
-pub fn get_padding_data_v2(buffer_len: usize) -> ([u8; 32], usize) {
+pub fn get_padding_data_v2(buffer_len: usize) -> ([u8; MAX_PADDING_LEN], usize) {
     let random_padding = {
         let mut rnd = [0; 32];
         getrandom::fill(&mut rnd).expect("failed to generate a secure padding");
