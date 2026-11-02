@@ -10,13 +10,13 @@
 
 use std::io::Write;
 
-use crate::transport::MAX_TRANSPORT_BUFFER_SIZE;
 use flate2::Compression;
 use flate2::write::{GzDecoder, GzEncoder};
 use grammers_crypto::MAX_PADDING_LEN;
 use grammers_tl_types::{self as tl, Cursor, Deserializable, Identifiable, Serializable};
 
 use crate::mtp;
+use crate::transport::MAX_TRANSPORT_BUFFER_SIZE;
 
 /// This struct represents the following TL definition:
 ///
@@ -72,11 +72,11 @@ impl Message {
 }
 
 impl Serializable for Message {
-    fn serialize(&self, buf: &mut impl Extend<u8>) {
-        self.msg_id.serialize(buf);
-        self.seq_no.serialize(buf);
-        (self.body.len() as i32).serialize(buf);
-        buf.extend(self.body.iter().copied());
+    fn serialize(&self, sink: &mut impl FnMut(&[u8])) {
+        self.msg_id.serialize(sink);
+        self.seq_no.serialize(sink);
+        (self.body.len() as i32).serialize(sink);
+        sink(&self.body);
     }
 }
 
@@ -239,9 +239,9 @@ impl Identifiable for GzipPacked {
 }
 
 impl Serializable for GzipPacked {
-    fn serialize(&self, buf: &mut impl Extend<u8>) {
-        Self::CONSTRUCTOR_ID.serialize(buf);
-        self.packed_data.serialize(buf);
+    fn serialize(&self, sink: &mut impl FnMut(&[u8])) {
+        Self::CONSTRUCTOR_ID.serialize(sink);
+        self.packed_data.serialize(sink);
     }
 }
 

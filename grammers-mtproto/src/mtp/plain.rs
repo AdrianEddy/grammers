@@ -52,14 +52,15 @@ impl Mtp for Plain {
             return None;
         }
 
-        0i64.serialize(buffer); // auth_key_id = 0
+        let sink = &mut |bytes: &[u8]| buffer.extend_back(bytes);
+        0i64.serialize(sink); // auth_key_id = 0
 
         // Even though https://core.telegram.org/mtproto/samples-auth_key
         // seems to imply the `msg_id` has to follow some rules, there is
         // no need to generate a valid `msg_id`, it seems. Just use `0`.
-        0i64.serialize(buffer); // message_id
+        0i64.serialize(sink); // message_id
 
-        (request.len() as i32).serialize(buffer); // message_data_length
+        (request.len() as i32).serialize(sink); // message_data_length
         buffer.extend(request); // message_data
 
         Some(MsgId(0))

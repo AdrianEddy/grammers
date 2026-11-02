@@ -186,12 +186,12 @@ fn write_common_field_impl<W: Write>(
 ///
 /// ```ignore
 /// impl crate::Serializable for Name {
-///     fn serialize(&self, buf: &mut impl Extend<u8>) {
+///     fn serialize(&self, sink: &mut impl FnMut(&[u8])) {
 ///         use crate::Identifiable;
 ///         match self {
 ///             Self::Variant(x) => {
-///                 crate::types::Name::CONSTRUCTOR_ID.serialize(buf);
-///                 x.serialize(buf)
+///                 crate::types::Name::CONSTRUCTOR_ID.serialize(sink);
+///                 x.serialize(sink)
 ///             },
 ///         }
 ///     }
@@ -211,7 +211,7 @@ fn write_serializable<W: Write>(
     )?;
     writeln!(
         file,
-        "{indent}    fn serialize(&self, buf: &mut impl Extend<u8>) {{"
+        "{indent}    fn serialize(&self, sink: &mut impl FnMut(&[u8])) {{"
     )?;
 
     writeln!(file, "{indent}        use crate::Identifiable;")?;
@@ -226,12 +226,12 @@ fn write_serializable<W: Write>(
         )?;
         writeln!(
             file,
-            "{}                {}::CONSTRUCTOR_ID.serialize(buf);",
+            "{}                {}::CONSTRUCTOR_ID.serialize(sink);",
             indent,
             rustifier::definitions::qual_name(d)
         )?;
         if !d.params.is_empty() {
-            writeln!(file, "{indent}                x.serialize(buf)")?;
+            writeln!(file, "{indent}                x.serialize(sink)")?;
         }
         writeln!(file, "{indent}            }},")?;
     }

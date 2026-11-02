@@ -155,8 +155,8 @@ fn write_identifiable<W: Write>(
 ///
 /// ```ignore
 /// impl crate::Serializable for Name {
-///     fn serialize(&self, buf: &mut impl Extend<u8>) {
-///         self.field.serialize(buf);
+///     fn serialize(&self, sink: &mut impl FnMut(&[u8])) {
+///         self.field.serialize(sink);
 ///     }
 /// }
 /// ```
@@ -176,7 +176,7 @@ fn write_serializable<W: Write>(
     )?;
     writeln!(
         file,
-        "{}    fn serialize(&self, {}buf: &mut impl Extend<u8>) {{",
+        "{}    fn serialize(&self, {}sink: &mut impl FnMut(&[u8])) {{",
         indent,
         if def.category == Category::Types && def.params.is_empty() {
             "_"
@@ -192,7 +192,10 @@ fn write_serializable<W: Write>(
         Category::Functions => {
             // Functions should always write their `CONSTRUCTOR_ID`.
             writeln!(file, "{indent}        use crate::Identifiable;")?;
-            writeln!(file, "{indent}        Self::CONSTRUCTOR_ID.serialize(buf);")?;
+            writeln!(
+                file,
+                "{indent}        Self::CONSTRUCTOR_ID.serialize(sink);"
+            )?;
         }
     }
 
@@ -226,7 +229,7 @@ fn write_serializable<W: Write>(
                     }
                 }
 
-                writeln!(file, ").serialize(buf);")?;
+                writeln!(file, ").serialize(sink);")?;
             }
             ParameterType::Normal { ty, flag } => {
                 // The `true` bare type is a bit special: it's empty so there
@@ -239,12 +242,12 @@ fn write_serializable<W: Write>(
                             "if let Some(ref x) = self.{} {{ ",
                             rustifier::parameters::attr_name(param)
                         )?;
-                        writeln!(file, "{indent}            x.serialize(buf);")?;
+                        writeln!(file, "{indent}            x.serialize(sink);")?;
                         writeln!(file, "{indent}        }}")?;
                     } else {
                         writeln!(
                             file,
-                            "self.{}.serialize(buf);",
+                            "self.{}.serialize(sink);",
                             rustifier::parameters::attr_name(param)
                         )?;
                     }

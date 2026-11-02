@@ -230,10 +230,11 @@ impl Encrypted {
         // Within bounds; add it.
         let msg_id = self.get_new_msg_id();
 
-        msg_id.serialize(buffer);
-        self.get_seq_no(content_related).serialize(buffer);
-        (body.len() as i32).serialize(buffer);
-        buffer.extend(body);
+        let sink = &mut |bytes: &[u8]| buffer.extend_back(bytes);
+        msg_id.serialize(sink);
+        self.get_seq_no(content_related).serialize(sink);
+        (body.len() as i32).serialize(sink);
+        buffer.extend_back(body);
 
         self.msg_count += 1;
         Some(MsgId(msg_id))
@@ -279,22 +280,24 @@ impl Encrypted {
             let mut header = StackBuffer::<MESSAGE_CONTAINER_HEADER_LEN>::new();
 
             // Manually `serialize_msg` because the container body was already written.
-            self.get_new_msg_id().serialize(&mut header);
-            self.get_seq_no(false).serialize(&mut header);
+            let sink = &mut |bytes: &[u8]| header.extend_from_slice(bytes);
+            self.get_new_msg_id().serialize(sink);
+            self.get_seq_no(false).serialize(sink);
 
-            len.serialize(&mut header);
+            len.serialize(sink);
 
-            manual_tl::MessageContainer::CONSTRUCTOR_ID.serialize(&mut header);
-            (self.msg_count as i32).serialize(&mut header);
+            manual_tl::MessageContainer::CONSTRUCTOR_ID.serialize(sink);
+            (self.msg_count as i32).serialize(sink);
             buffer.extend_front(&header.into_inner());
         }
 
         {
             // Prepend the message header
             let mut header = StackBuffer::<PLAIN_PACKET_HEADER_LEN>::new();
-            self.get_current_salt().serialize(&mut header); // 8 bytes
+            let sink = &mut |bytes: &[u8]| header.extend_from_slice(bytes);
+            self.get_current_salt().serialize(sink); // 8 bytes
 
-            self.session_id.serialize(&mut header); // 8 bytes
+            self.session_id.serialize(sink); // 8 bytes
             buffer.extend_front(&header.into_inner());
         }
 
