@@ -103,18 +103,6 @@ impl<T: Copy + Default, I: SliceIndex<[T]>> IndexMut<I> for DequeBuffer<T> {
     }
 }
 
-impl<T: Copy + Default> Extend<T> for DequeBuffer<T> {
-    fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
-        self.buffer.extend(iter)
-    }
-}
-
-impl<'a, T: Copy + Default + 'a> Extend<&'a T> for DequeBuffer<T> {
-    fn extend<I: IntoIterator<Item = &'a T>>(&mut self, iter: I) {
-        self.buffer.extend(iter)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,7 +190,7 @@ mod tests {
     fn mutates_as_expected() {
         let mut buffer = DequeBuffer::<u8>::with_capacity(6, 4);
 
-        buffer.extend(1..=2);
+        buffer.extend_back(&[1, 2]);
         sanity_checks(&buffer);
         assert_eq!(repr(&buffer), "[ 0 0 0 0|1 2 ? ? ? ? ]");
 

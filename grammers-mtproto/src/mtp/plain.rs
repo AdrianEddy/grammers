@@ -61,7 +61,7 @@ impl Mtp for Plain {
         0i64.serialize(sink); // message_id
 
         (request.len() as i32).serialize(sink); // message_data_length
-        buffer.extend(request); // message_data
+        buffer.extend_back(request); // message_data
 
         Some(MsgId(0))
     }

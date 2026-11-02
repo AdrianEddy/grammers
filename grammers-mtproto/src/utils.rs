@@ -42,20 +42,3 @@ impl<const N: usize> StackBuffer<N> {
         self.pos = end;
     }
 }
-
-impl<const N: usize> Extend<u8> for StackBuffer<N> {
-    fn extend<T: IntoIterator<Item = u8>>(&mut self, iter: T) {
-        let mut pos = self.pos;
-        iter.into_iter().for_each(|x| {
-            self.array[pos] = x;
-            pos += 1;
-        });
-        self.pos = pos;
-    }
-}
-
-impl<'a, const N: usize> Extend<&'a u8> for StackBuffer<N> {
-    fn extend<T: IntoIterator<Item = &'a u8>>(&mut self, iter: T) {
-        <Self as Extend<u8>>::extend(self, iter.into_iter().copied())
-    }
-}

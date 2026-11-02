@@ -60,7 +60,7 @@ impl Transport for Full {
             hasher.update(buffer.as_ref());
             hasher.finalize()
         };
-        buffer.extend(crc.to_le_bytes());
+        buffer.extend_back(&crc.to_le_bytes());
 
         self.send_seq += 1;
     }
@@ -129,7 +129,9 @@ mod tests {
     /// Returns a full abridged transport, and `n` bytes of input data for it.
     fn setup_pack(n: usize) -> (Full, DequeBuffer<u8>) {
         let mut buffer = DequeBuffer::with_capacity(n, 0);
-        buffer.extend((0..n).map(|x| (x & 0xff) as u8));
+        for i in 0..n {
+            buffer.push((i & 0xff) as u8);
+        }
         (Full::new(), buffer)
     }
 
@@ -167,11 +169,11 @@ mod tests {
 
         let mut two_buffer = DequeBuffer::with_capacity(0, 0);
         transport.pack(&mut buffer);
-        two_buffer.extend(&buffer[..]);
+        two_buffer.extend_back(&buffer[..]);
 
         buffer = orig.clone();
         transport.pack(&mut buffer);
-        two_buffer.extend(&buffer[..]);
+        two_buffer.extend_back(&buffer[..]);
 
         assert_eq!(&buffer[..4], &[140, 0, 0, 0]);
         assert_eq!(&buffer[4..8], &[1, 0, 0, 0]);
@@ -183,7 +185,7 @@ mod tests {
     fn unpack_small() {
         let mut transport = Full::new();
         let mut buffer = DequeBuffer::with_capacity(3, 0);
-        buffer.extend([0, 1, 3]);
+        buffer.extend_back(&[0, 1, 3]);
         assert_eq!(transport.unpack(&mut buffer[..]), Err(Error::MissingBytes));
     }
 
@@ -203,12 +205,12 @@ mod tests {
 
         let mut two_buffer = DequeBuffer::with_capacity(0, 0);
         transport.pack(&mut buffer);
-        two_buffer.extend(&buffer[..]);
+        two_buffer.extend_back(&buffer[..]);
         let single_size = two_buffer.len();
 
         buffer = orig.clone();
         transport.pack(&mut buffer);
-        two_buffer.extend(&buffer[..]);
+        two_buffer.extend_back(&buffer[..]);
 
         let offset = transport.unpack(&mut two_buffer[..]).unwrap();
         assert_eq!(&buffer[offset.data_range], &orig[..]);
@@ -254,7 +256,7 @@ mod tests {
     fn unpack_bad_status() {
         let mut transport = Full::new();
         let mut buffer = DequeBuffer::with_capacity(4, 0);
-        buffer.extend(&(-404_i32).to_le_bytes());
+        buffer.extend_back(&(-404_i32).to_le_bytes());
 
         assert_eq!(
             transport.unpack(&mut buffer[..]),

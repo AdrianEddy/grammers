@@ -122,7 +122,9 @@ mod tests {
     /// Returns a new abridged transport, and `n` bytes of input data for it.
     fn setup_pack(n: usize) -> (Abridged, DequeBuffer<u8>) {
         let mut buffer = DequeBuffer::with_capacity(n, 0);
-        buffer.extend((0..n).map(|x| (x & 0xff) as u8));
+        for i in 0..n {
+            buffer.push((i & 0xff) as u8);
+        }
         (Abridged::new(), buffer)
     }
 
@@ -162,7 +164,7 @@ mod tests {
     fn unpack_small() {
         let mut transport = Abridged::new();
         let mut buffer = DequeBuffer::with_capacity(1, 0);
-        buffer.extend([1]);
+        buffer.extend_back(&[1]);
         assert_eq!(transport.unpack(&mut buffer[..]), Err(Error::MissingBytes));
     }
 
@@ -183,12 +185,12 @@ mod tests {
 
         let mut two_buffer = DequeBuffer::with_capacity(0, 0);
         transport.pack(&mut buffer);
-        two_buffer.extend(&buffer[1..]); // init byte
+        two_buffer.extend_back(&buffer[1..]); // init byte
         let single_size = two_buffer.len();
 
         buffer = orig.clone();
         transport.pack(&mut buffer);
-        two_buffer.extend(&buffer[..]);
+        two_buffer.extend_back(&buffer[..]);
 
         let offset = transport.unpack(&mut two_buffer[..]).unwrap();
         assert_eq!(&buffer[offset.data_range], &orig[..]);
@@ -214,7 +216,7 @@ mod tests {
         let mut transport = Abridged::new();
         let mut buffer = DequeBuffer::with_capacity(5, 0);
         buffer.push(1u8);
-        buffer.extend(&(-404_i32).to_le_bytes());
+        buffer.extend_back(&(-404_i32).to_le_bytes());
 
         assert_eq!(
             transport.unpack(&mut buffer[..]),

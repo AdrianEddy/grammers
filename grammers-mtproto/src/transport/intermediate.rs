@@ -96,7 +96,9 @@ mod tests {
     /// Returns a full intermediate transport, and `n` bytes of input data for it.
     fn setup_pack(n: usize) -> (Intermediate, DequeBuffer<u8>) {
         let mut buffer = DequeBuffer::with_capacity(n, 0);
-        buffer.extend((0..n).map(|x| (x & 0xff) as u8));
+        for i in 0..n {
+            buffer.push((i & 0xff) as u8);
+        }
         (Intermediate::new(), buffer)
     }
 
@@ -127,7 +129,7 @@ mod tests {
     fn unpack_small() {
         let mut transport = Intermediate::new();
         let mut buffer = DequeBuffer::with_capacity(1, 0);
-        buffer.extend([1]);
+        buffer.extend_back(&[1]);
         assert_eq!(transport.unpack(&mut buffer[..],), Err(Error::MissingBytes));
     }
 
@@ -148,12 +150,12 @@ mod tests {
 
         let mut two_buffer = DequeBuffer::with_capacity(0, 0);
         transport.pack(&mut buffer);
-        two_buffer.extend(&buffer[4..]); // init bytes
+        two_buffer.extend_back(&buffer[4..]); // init bytes
         let single_size = two_buffer.len();
 
         buffer = orig.clone();
         transport.pack(&mut buffer);
-        two_buffer.extend(&buffer[..]);
+        two_buffer.extend_back(&buffer[..]);
 
         let offset = transport.unpack(&mut two_buffer[..]).unwrap();
         assert_eq!(&buffer[offset.data_range], &orig[..]);
@@ -168,8 +170,8 @@ mod tests {
     fn unpack_bad_status() {
         let mut transport = Intermediate::new();
         let mut buffer = DequeBuffer::with_capacity(8, 0);
-        buffer.extend(&(4_i32).to_le_bytes());
-        buffer.extend(&(-404_i32).to_le_bytes());
+        buffer.extend_back(&(4_i32).to_le_bytes());
+        buffer.extend_back(&(-404_i32).to_le_bytes());
 
         assert_eq!(
             transport.unpack(&mut buffer[..]),
