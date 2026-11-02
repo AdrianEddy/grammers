@@ -24,6 +24,9 @@ use std::fmt;
 
 pub use auth_key::AuthKey;
 pub use factorize::factorize;
+use glass_pumpkin::safe_prime;
+use num_bigint::BigUint;
+use num_traits::ToPrimitive;
 pub use obfuscated::ObfuscatedCipher;
 
 /// The error type for [`decrypt_data_v2`].
@@ -224,6 +227,33 @@ pub fn generate_key_data_from_nonce(
     };
 
     (key, iv)
+}
+
+/// Validates the `dh_prime` is a safe 2048-bit Diffie-Hellman prime.
+///
+/// # Errors
+///
+/// Returns an error when operating-system randomness is unavailable.
+pub fn check_dh_prime(dh_prime: &BigUint, g: i32) -> Result<bool, glass_pumpkin::error::Error> {
+    if dh_prime.bits() != 2048 {
+        return Ok(false);
+    }
+
+    let valid = match g {
+        2 => (dh_prime % 8u32).to_u32() == Some(7),
+        3 => (dh_prime % 3u32).to_u32() == Some(2),
+        4 => true,
+        5 => matches!((dh_prime % 5u32).to_u32(), Some(1) | Some(4)),
+        6 => matches!((dh_prime % 24u32).to_u32(), Some(19) | Some(23)),
+        7 => matches!((dh_prime % 7u32).to_u32(), Some(3) | Some(5) | Some(6)),
+        _ => return Ok(false),
+    };
+    if !valid {
+        return Ok(false);
+    }
+
+    // This check is the most expensive, so leave it for last.
+    safe_prime::check(dh_prime)
 }
 
 #[cfg(test)]
