@@ -80,6 +80,7 @@ impl<T: Transport, M: Mtp> State<T, M> {
 
         // TODO make mtp itself use BytesMut to avoid copies
         if let Some(msg_id) = self.mtp.push(&mut self.write_buffer, body) {
+            // A body the client built, which the sender checked when it was enqueued.
             assert!(body.len() >= 4);
             let req_id = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
             debug!(
@@ -160,6 +161,7 @@ impl<T: Transport, M: Mtp> State<T, M> {
             self.write_head,
             self.write_buffer.len()
         );
+        // `n` is what the socket wrote of the slice `io_buffers` gave it.
         assert!(self.write_head <= self.write_buffer.len());
         if self.write_head != self.write_buffer.len() {
             return false;

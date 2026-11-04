@@ -120,6 +120,7 @@ fn determine_padding_v2_length(len: usize) -> usize {
 pub fn get_padding_data_v2(buffer_len: usize) -> ([u8; MAX_PADDING_LEN], usize) {
     let random_padding = {
         let mut rnd = [0; 32];
+        // The operating system's random number generator, not server data.
         getrandom::fill(&mut rnd).expect("failed to generate a secure padding");
         rnd
     };
@@ -229,14 +230,12 @@ pub fn generate_key_data_from_nonce(
     (key, iv)
 }
 
-/// Validates the `dh_prime` is a safe 2048-bit Diffie-Hellman prime.
-///
-/// # Errors
-///
-/// Returns an error when operating-system randomness is unavailable.
-pub fn check_dh_prime(dh_prime: &BigUint, g: i32) -> Result<bool, glass_pumpkin::error::Error> {
+/// Validates the `dh_prime` is a safe 2048-bit Diffie-Hellman prime and `g` generates its
+/// subgroup of prime order `(p - 1) / 2`. The key exchange and two-factor authentication both
+/// check the server's parameters with it, as TDLib and tdesktop do.
+pub fn check_dh_prime(dh_prime: &BigUint, g: i32) -> bool {
     if dh_prime.bits() != 2048 {
-        return Ok(false);
+        return false;
     }
 
     let valid = match g {
@@ -246,14 +245,16 @@ pub fn check_dh_prime(dh_prime: &BigUint, g: i32) -> Result<bool, glass_pumpkin:
         5 => matches!((dh_prime % 5u32).to_u32(), Some(1) | Some(4)),
         6 => matches!((dh_prime % 24u32).to_u32(), Some(19) | Some(23)),
         7 => matches!((dh_prime % 7u32).to_u32(), Some(3) | Some(5) | Some(6)),
-        _ => return Ok(false),
+        _ => return false,
     };
-    if !valid {
-        return Ok(false);
-    }
 
-    // This check is the most expensive, so leave it for last.
-    safe_prime::check(dh_prime)
+    // The most expensive check, so it goes last: Baillie-PSW on `p` and `(p - 1) / 2`, which needs
+    // no randomness and has no known pseudoprime, so the server can't craft a number that passes
+    // ("Prime and Prejudice", CCS 2018; GMP and Go use it too). Its Lucas half panics only for a
+    // non-square whose Jacobi symbol is 1 for each of the first 10,000 Selfridge `D`s, a residue
+    // condition modulo every odd prime up to about 20,000 that no 2048-bit number is expected to
+    // meet.
+    valid && safe_prime::strong_check(dh_prime)
 }
 
 #[cfg(test)]

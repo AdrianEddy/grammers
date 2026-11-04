@@ -8,8 +8,17 @@
 
 //! Functions used by Telegram's [Two-Factor Authentication](https://core.telegram.org/api/srp).
 
-use glass_pumpkin::safe_prime;
-use hmac::Hmac;
+// The parameters come from the server: values out of range are rejected, never a panic.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::panic,
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing
+    )
+)]
+
 use num_bigint::{BigInt, BigUint, Sign};
 use num_traits::ops::euclid::Euclid;
 use sha2::Sha512;
@@ -22,6 +31,13 @@ use crate::sha256 as h;
 /// (without the raw password!).
 ///
 /// The algorithm is described in <https://core.telegram.org/api/srp>.
+///
+/// `p` and `g` should have passed [`check_p_and_g`]. Returns `None` if the server's parameters
+/// can't be used: `p` isn't 256 bytes, `g` isn't one of the generators Telegram uses (2 to 7),
+/// `g_b` isn't between 0 and `p` (both excluded, as TDLib requires; RFC 5054 asks the client to
+/// abort if `g_b` is a multiple of `p`), the server's `g^b`, `t = (g_b - k*v) mod p`, isn't
+/// inside MTProto's DH safety range `(2^(2048-64), p - 2^(2048-64))` (as tdesktop checks it), or
+/// `g_b` or `a` is longer than 256 bytes.
 pub fn calculate_2fa(
     salt1: &[u8],
     salt2: &[u8],
@@ -30,17 +46,24 @@ pub fn calculate_2fa(
     g_b: Vec<u8>,
     a: Vec<u8>,
     password: impl AsRef<[u8]>,
-) -> ([u8; 32], [u8; 256]) {
+) -> Option<([u8; 32], [u8; 256])> {
+    if !check_p_len(p) || !(2..=7).contains(g) {
+        return None;
+    }
+
     // Prepare our parameters
     let big_p = BigInt::from_bytes_be(Sign::Plus, p);
 
-    let g_b = pad_to_256(&g_b);
-    let a = pad_to_256(&a);
+    let g_b = pad_to_256(&g_b)?;
+    let a = pad_to_256(&a)?;
 
-    let g_for_hash = vec![*g as u8];
-    let g_for_hash = pad_to_256(&g_for_hash);
+    let g_for_hash = pad_to_256(&[*g as u8])?;
 
     let big_g_b = BigInt::from_bytes_be(Sign::Plus, &g_b);
+    // Also makes `p` a valid modulus: it is above `g_b`, which is above zero.
+    if big_g_b <= BigInt::ZERO || big_g_b >= big_p {
+        return None;
+    }
 
     let big_g = BigInt::from(*g as u32);
     let big_a = BigInt::from_bytes_be(Sign::Plus, &a);
@@ -51,7 +74,8 @@ pub fn calculate_2fa(
 
     // g_a := pow(g, a) mod p
     let g_a = big_g.modpow(&big_a, &big_p);
-    let g_a = pad_to_256(&g_a.to_bytes_be().1);
+    // Below `p`, so it fits.
+    let g_a = pad_to_256(&g_a.to_bytes_be().1)?;
 
     // u := H(g_a | g_b)
     let u = h!(&g_a, &g_b);
@@ -70,13 +94,21 @@ pub fn calculate_2fa(
     // t := (g_b - k_v) mod p (positive modulo, if the result is negative increment by p)
     let big_t = (big_g_b - k_v).rem_euclid(&big_p);
 
+    // `t` is the server's `g^b`: inside the safety range the key exchange also requires, as
+    // tdesktop checks it (`IsGoodModExpFirst`). A degenerate `t` such as 0, 1 or `p - 1` makes
+    // `s_a` a value anyone can compute.
+    let safety = BigInt::ONE << (2048 - 64);
+    if big_t <= safety || big_t >= &big_p - &safety {
+        return None;
+    }
+
     // s_a := pow(t, a + u * x) mod p
     let first = u * x;
     let second = big_a + first;
     let big_s_a = big_t.modpow(&second, &big_p);
 
     // k_a := H(s_a)
-    let k_a = h!(&pad_to_256(&big_s_a.to_bytes_be().1));
+    let k_a = h!(&pad_to_256(&big_s_a.to_bytes_be().1)?);
 
     // M1 := H(H(p) xor H(g) | H(salt1) | H(salt2) | g_a | g_b | k_a)
     let h_p = h!(&p);
@@ -86,46 +118,15 @@ pub fn calculate_2fa(
 
     let m1 = h!(&p_xor_g, &h!(&salt1), &h!(&salt2), &g_a, &g_b, &k_a);
 
-    (m1, g_a)
+    Some((m1, g_a))
 }
 
-/// Validation for parameters required for Two-Factor authentication.
+/// Validation for parameters required for Two-Factor authentication: `p` is a safe 2048-bit
+/// prime in 256 bytes and `g` generates its subgroup of prime order `(p - 1) / 2`, the key
+/// exchange's check ([`check_dh_prime`](crate::check_dh_prime)).
 pub fn check_p_and_g(p: &[u8], g: &i32) -> bool {
-    if !check_p_len(p) {
-        return false;
-    }
-
-    check_p_prime_and_subgroup(p, g)
-}
-
-fn check_p_prime_and_subgroup(p: &[u8], g: &i32) -> bool {
-    let p = &BigUint::from_bytes_be(p);
-
-    // `safe_prime::check` returns an error when operating-system randomness is unavailable.
-    if !safe_prime::check(p).unwrap() {
-        return false;
-    }
-
-    match g {
-        2 => p % 8u8 == BigUint::from(7u8),
-        3 => p % 3u8 == BigUint::from(2u8),
-        4 => true,
-        5 => {
-            let mod_value = p % 5u8;
-            mod_value == BigUint::from(1u8) || mod_value == BigUint::from(4u8)
-        }
-        6 => {
-            let mod_value = p % 24u8;
-            mod_value == BigUint::from(19u8) || mod_value == BigUint::from(23u8)
-        }
-        7 => {
-            let mod_value = p % 7u8;
-            mod_value == BigUint::from(3u8)
-                || mod_value == BigUint::from(5u8)
-                || mod_value == BigUint::from(6u8)
-        }
-        _ => panic!("Unexpected g parameter"),
-    }
+    // The length too: the hashes take `p` as its 256 bytes, not as a number.
+    check_p_len(p) && crate::check_dh_prime(&BigUint::from_bytes_be(p), *g)
 }
 
 fn check_p_len(p: &[u8]) -> bool {
@@ -148,61 +149,30 @@ fn ph2(password: impl AsRef<[u8]>, salt1: &[u8], salt2: &[u8]) -> [u8; 32] {
     let hash1 = ph1(password, salt1, salt2);
 
     // 512-bit derived key
-    let mut dk = [0u8; 64];
-    pbkdf2::pbkdf2::<Hmac<Sha512>>(&hash1, salt1, 100000, &mut dk).unwrap();
+    let dk = pbkdf2::pbkdf2_hmac_array::<Sha512, 64>(&hash1, salt1, 100000);
 
     sh(dk, salt2)
 }
 
 fn xor(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
     let mut out = [0; 32];
-    out.iter_mut().enumerate().for_each(|(i, o)| {
-        *o = left[i] ^ right[i];
-    });
+    out.iter_mut()
+        .zip(left.iter().zip(right))
+        .for_each(|(o, (l, r))| *o = l ^ r);
     out
 }
 
-fn pad_to_256(data: &[u8]) -> [u8; 256] {
+/// `data` as a 256-byte big-endian number, or `None` if it is longer.
+fn pad_to_256(data: &[u8]) -> Option<[u8; 256]> {
     let mut out = [0; 256];
-    out[256 - data.len()..].copy_from_slice(data);
-    out
+    let start = out.len().checked_sub(data.len())?;
+    out.get_mut(start..)?.copy_from_slice(data);
+    Some(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn check_calculations_1() {
-        let salt1 = vec![1];
-        let salt2 = vec![2];
-        let g = 3;
-        let p = pad_to_256(&[47]);
-        let g_b = vec![5];
-        let a = vec![6];
-        let password = vec![7];
-
-        let (m1, g_a) = calculate_2fa(&salt1, &salt2, &p, &g, g_b, a, password);
-
-        let expected_m1 = vec![
-            157, 131, 196, 103, 0, 184, 116, 232, 7, 196, 85, 231, 17, 36, 30, 222, 158, 234, 98,
-            88, 59, 56, 71, 215, 183, 123, 122, 50, 19, 32, 54, 206,
-        ];
-        let expected_g_a = vec![
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 24,
-        ];
-
-        assert_eq!(expected_m1, m1);
-        assert_eq!(expected_g_a, g_a);
-    }
 
     #[test]
     fn check_calculations_2() {
@@ -279,7 +249,7 @@ mod tests {
         ];
         let password = vec![50, 51, 52, 53, 54, 55];
 
-        let (m1, g_a) = calculate_2fa(&salt1, &salt2, &p, &g, g_b, a, password);
+        let (m1, g_a) = calculate_2fa(&salt1, &salt2, &p, &g, g_b, a, password).unwrap();
 
         let expected_m1 = vec![
             77, 122, 244, 18, 197, 162, 231, 177, 84, 103, 55, 107, 209, 24, 184, 83, 96, 78, 104,
@@ -304,41 +274,5 @@ mod tests {
 
         assert_eq!(expected_m1, m1);
         assert_eq!(expected_g_a, g_a);
-    }
-
-    #[test]
-    fn test_check_p_and_g() {
-        // Not prime
-        assert_incorrect_pg(4, 0);
-        // Bad prime
-        assert_incorrect_pg(13, 0);
-
-        assert_incorrect_pg(11, 2);
-        assert_correct_pg(23, 2);
-
-        assert_incorrect_pg(13, 3);
-        assert_correct_pg(47, 3);
-
-        assert_correct_pg(11, 4);
-
-        assert_incorrect_pg(13, 5);
-        assert_correct_pg(11, 5);
-        assert_correct_pg(179, 5);
-
-        assert_incorrect_pg(13, 6);
-        assert_correct_pg(383, 6);
-
-        assert_incorrect_pg(13, 7);
-        assert_correct_pg(479, 7);
-        assert_correct_pg(383, 7);
-        assert_correct_pg(503, 7);
-    }
-
-    fn assert_incorrect_pg(p: u32, g: i32) {
-        assert!(!check_p_prime_and_subgroup(p.to_be_bytes().as_ref(), &g))
-    }
-
-    fn assert_correct_pg(p: u32, g: i32) {
-        assert!(check_p_prime_and_subgroup(p.to_be_bytes().as_ref(), &g))
     }
 }

@@ -62,34 +62,42 @@ impl Transport for Full {
         };
         buffer.extend_back(&crc.to_le_bytes());
 
-        self.send_seq += 1;
+        self.send_seq = self.send_seq.wrapping_add(1);
     }
 
     fn unpack(&mut self, buffer: &mut [u8]) -> Result<UnpackedOffset, Error> {
         // Need 4 bytes for the initial length
-        if buffer.len() < 4 {
+        let Some(len) = buffer.first_chunk::<4>() else {
             return Err(Error::MissingBytes);
-        }
+        };
 
-        let total_len = buffer.len() as i32;
-
-        // payload len
-        let len = i32::from_le_bytes(buffer[0..4].try_into().unwrap());
+        // The length of the whole packet: itself, the counter, the payload and the crc32.
+        let len = i32::from_le_bytes(*len);
         if len < 12 {
             if len < 0 {
                 return Err(Error::BadStatus {
-                    status: (-len) as u32,
+                    status: len.wrapping_neg() as u32,
                 });
             }
             return Err(Error::BadLen { got: len });
         }
 
-        if total_len < len {
+        let Some(packet) = buffer.get(..len as usize) else {
             return Err(Error::MissingBytes);
-        }
+        };
+        // At least 12 bytes: the length, the counter and the crc32 around the payload.
+        let Some((head, crc)) = packet.split_last_chunk::<4>() else {
+            return Err(Error::BadLen { got: len });
+        };
+        let Some((_len, rest)) = head.split_first_chunk::<4>() else {
+            return Err(Error::BadLen { got: len });
+        };
+        let Some((seq, _payload)) = rest.split_first_chunk::<4>() else {
+            return Err(Error::BadLen { got: len });
+        };
 
         // receive counter
-        let seq = i32::from_le_bytes(buffer[4..8].try_into().unwrap());
+        let seq = i32::from_le_bytes(*seq);
         if seq != self.recv_seq {
             return Err(Error::BadSeq {
                 expected: self.recv_seq,
@@ -97,14 +105,12 @@ impl Transport for Full {
             });
         }
 
-        let len = len as usize;
-
         // crc32
-        let crc = u32::from_le_bytes(buffer[len - 4..len].try_into().unwrap());
+        let crc = u32::from_le_bytes(*crc);
 
         let valid_crc = {
             let mut hasher = Hasher::new();
-            hasher.update(&buffer[0..len - 4]);
+            hasher.update(head);
             hasher.finalize()
         };
         if crc != valid_crc {
@@ -114,10 +120,10 @@ impl Transport for Full {
             });
         }
 
-        self.recv_seq += 1;
+        self.recv_seq = self.recv_seq.wrapping_add(1);
         Ok(UnpackedOffset {
-            data_range: 8..len - 4,
-            next_offset: len,
+            data_range: 8..packet.len() - 4,
+            next_offset: packet.len(),
         })
     }
 }

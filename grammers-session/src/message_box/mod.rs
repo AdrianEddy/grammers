@@ -39,13 +39,28 @@
 //! ([`StateDelta`]), which covers exactly the updates the call returned. A caller that stores
 //! each delta together with the updates it returned never stores state ahead of its updates,
 //! except for the server's own skips that [`StateDelta`] lists.
+//!
+//! Updates and differences come from the server: an update whose `pts` breaks the protocol is
+//! dropped, an unusable difference ends the box's difference, and an answer for a box that isn't
+//! getting its difference changes nothing. None of them panics.
+
+// Here and in the submodules, unexpected server data is handled, never a panic.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::panic,
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing
+    )
+)]
 
 mod adaptor;
 mod defs;
 #[cfg(test)]
 mod tests;
 
-use std::cmp::Ordering;
+use std::cmp::{Ordering, Reverse};
 use std::mem;
 use std::time::Duration;
 
@@ -54,9 +69,11 @@ pub use defs::{
     CommonState, DiffPending, Gap, MessageBox, MessageBoxes, Now, State, StateDelta,
     UpdateAndPeers, UpdatesLike,
 };
-use defs::{LiveEntry, NO_DATE, NO_PTS, NO_SEQ, POSSIBLE_GAP_TIMEOUT, PossibleGap, PtsInfo};
+use defs::{
+    LiveEntry, NO_DATE, NO_PTS, NO_SEQ, POSSIBLE_GAP_TIMEOUT, PossibleGap, PtsInfo, WrongPts,
+};
 use grammers_tl_types as tl;
-use tracing::{debug, info, trace};
+use tracing::{debug, info, trace, warn};
 
 use crate::types::{ChannelState, UpdatesState};
 
@@ -64,11 +81,16 @@ fn next_updates_deadline(now: Now) -> Now {
     now + defs::NO_UPDATES_TIMEOUT
 }
 
-fn update_sort_key(update: &tl::enums::Update) -> i32 {
-    match PtsInfo::from_update(update) {
-        Some(info) => info.pts - info.count,
-        None => NO_PTS,
-    }
+/// Where an update goes when a batch is sorted: by where it applies in its box's sequence.
+fn update_sort_key(info: Option<&PtsInfo>) -> i32 {
+    info.map_or(NO_PTS, PtsInfo::start)
+}
+
+/// Whether a container whose `seq_start` is the one given follows on from the local `seq`
+/// (`Equal`), was handled already (`Greater`), or comes after a gap (`Less`). The `seq` values are
+/// the server's, so they are compared without overflow.
+fn next_seq_cmp(local_seq: i32, seq_start: i32) -> Ordering {
+    (i64::from(local_seq) + 1).cmp(&i64::from(seq_start))
 }
 
 impl MessageBox {
@@ -198,14 +220,21 @@ impl MessageBoxes {
     fn entry(&self, key: Key) -> Option<&LiveEntry> {
         self.entries
             .binary_search_by_key(&key, |entry| entry.key)
-            .map(|i| &self.entries[i])
             .ok()
+            .and_then(|i| self.entries.get(i))
+    }
+
+    /// The entry with `key`, or where to insert one.
+    fn find_entry(&mut self, key: Key) -> Result<&mut LiveEntry, usize> {
+        let i = self.entries.binary_search_by_key(&key, |entry| entry.key)?;
+        // The search found it there.
+        self.entries.get_mut(i).ok_or(i)
     }
 
     fn update_entry(&mut self, key: Key, updater: impl FnOnce(&mut LiveEntry)) -> bool {
-        match self.entries.binary_search_by_key(&key, |entry| entry.key) {
-            Ok(i) => {
-                updater(&mut self.entries[i]);
+        match self.find_entry(key) {
+            Ok(entry) => {
+                updater(entry);
                 true
             }
             Err(_) => false,
@@ -214,21 +243,18 @@ impl MessageBoxes {
 
     /// Apply `updater` to the entry with `entry`'s key, inserting `entry` first if there is none.
     fn force_update_entry(&mut self, mut entry: LiveEntry, updater: impl FnOnce(&mut LiveEntry)) {
-        match self
-            .entries
-            .binary_search_by_key(&entry.key, |entry| entry.key)
-        {
-            Ok(i) => {
-                let existing = &mut self.entries[i];
+        let key = entry.key;
+        match self.find_entry(key) {
+            Ok(existing) => {
                 let pts = existing.pts;
                 updater(existing);
                 if existing.pts != pts {
-                    self.dirty.mark(existing.key);
+                    self.dirty.mark(key);
                 }
             }
             Err(i) => {
                 updater(&mut entry);
-                self.dirty.mark(entry.key);
+                self.dirty.mark(key);
                 self.entries.insert(i, entry);
             }
         }
@@ -236,33 +262,34 @@ impl MessageBoxes {
 
     /// Insert `entry`, replacing any entry with its key.
     fn set_entry(&mut self, entry: LiveEntry) {
-        match self
-            .entries
-            .binary_search_by_key(&entry.key, |entry| entry.key)
-        {
-            Ok(i) => {
-                if self.entries[i].pts != entry.pts {
-                    self.dirty.mark(entry.key);
+        let key = entry.key;
+        match self.find_entry(key) {
+            Ok(existing) => {
+                let changed = existing.pts != entry.pts;
+                *existing = entry;
+                if changed {
+                    self.dirty.mark(key);
                 }
-                self.entries[i] = entry;
             }
             Err(i) => {
-                self.dirty.mark(entry.key);
+                self.dirty.mark(key);
                 self.entries.insert(i, entry);
             }
         }
     }
 
     fn set_pts(&mut self, key: Key, pts: i32) {
-        match self.entries.binary_search_by_key(&key, |entry| entry.key) {
-            Ok(i) => {
-                let entry = &mut self.entries[i];
+        match self.find_entry(key) {
+            Ok(entry) => {
                 if entry.pts != pts {
                     entry.pts = pts;
                     self.dirty.mark(key);
                 }
             }
-            Err(_) => self.set_entry(LiveEntry::new(key, pts)),
+            Err(i) => {
+                self.dirty.mark(key);
+                self.entries.insert(i, LiveEntry::new(key, pts));
+            }
         }
     }
 
@@ -339,15 +366,9 @@ impl MessageBoxes {
         let mut channels = Vec::new();
         let mut removed_channels = Vec::new();
         for &id in &self.dirty.channels {
-            match self
-                .entries
-                .binary_search_by_key(&Key::Channel(id), |entry| entry.key)
-            {
-                Ok(i) => channels.push(ChannelState {
-                    id,
-                    pts: self.entries[i].pts,
-                }),
-                Err(_) => removed_channels.push(id),
+            match self.entry(Key::Channel(id)) {
+                Some(entry) => channels.push(ChannelState { id, pts: entry.pts }),
+                None => removed_channels.push(id),
             }
         }
         self.dirty.channels.clear();
@@ -477,7 +498,9 @@ impl MessageBoxes {
     pub fn begin_channel_difference(&mut self, channel_id: i64) -> bool {
         let key = Key::Channel(channel_id);
         if let Some(i) = self.getting_diff_for.iter().position(|&k| k == key) {
-            self.getting_diff_for[..=i].rotate_right(1);
+            if let Some(waiting) = self.getting_diff_for.get_mut(..=i) {
+                waiting.rotate_right(1);
+            }
         } else if self.update_entry(key, LiveEntry::begin_difference) {
             self.getting_diff_for.insert(0, key);
         } else {
@@ -641,7 +664,7 @@ impl MessageBoxes {
         // > For all the other [not `updates` or `updatesCombined`] `Updates` type constructors
         // > there is no need to check `seq` or change a local state.
         if seq_start != NO_SEQ {
-            match (self.seq + 1).cmp(&seq_start) {
+            match next_seq_cmp(self.seq, seq_start) {
                 // Ignore
                 Ordering::Greater => {
                     debug!(
@@ -687,20 +710,41 @@ impl MessageBoxes {
     /// touched waits on a gap.
     fn apply_updates(
         &mut self,
-        mut updates: Vec<tl::enums::Update>,
+        updates: Vec<tl::enums::Update>,
         (date, seq): (i32, i32),
         now: Now,
         source: Source,
     ) -> (Vec<(tl::enums::Update, State)>, bool) {
+        // Each update with its place in its box's sequence, read once. One whose `pts` breaks the
+        // protocol is dropped, as TDLib drops it; a later update of its box then finds the gap.
+        let mut updates: Vec<(Option<PtsInfo>, tl::enums::Update)> = updates
+            .into_iter()
+            .filter_map(|update| match PtsInfo::from_update(&update) {
+                Ok(info) => Some((info, update)),
+                // Logged without the update, which holds the user's messages; every caller has
+                // traced its whole input already.
+                Err(WrongPts::CommonInChannel) => {
+                    warn!(
+                        "dropping a common-box update about a channel; its pts breaks the protocol"
+                    );
+                    None
+                }
+                Err(WrongPts::Count(info)) => {
+                    warn!(?info, "dropping an update whose pts breaks the protocol");
+                    None
+                }
+            })
+            .collect();
+
         // Telegram can send updates out of order (e.g. `ReadChannelInbox` first
         // and then `NewChannelMessage`, both with the same `pts`, but the `count`
         // is `0` and `1` respectively), so we sort them first.
-        updates.sort_by_key(update_sort_key);
+        updates.sort_by_key(|(info, _)| update_sort_key(info.as_ref()));
 
         let mut result = Vec::with_capacity(updates.len());
         let mut postponed = false;
         let mut have_unresolved_gaps = false;
-        for update in updates {
+        for (info, update) in updates {
             if let tl::enums::Update::ChannelTooLong(u) = update {
                 // Can skip this one early since no processing can be done for the entry.
                 //
@@ -719,15 +763,15 @@ impl MessageBoxes {
                 // > updateChannelTooLong update.
                 let key = Key::Channel(u.channel_id);
                 if self.entry(key).is_none()
-                    && let Some(pts) = u.pts
+                    && let Some(info) = info
                 {
-                    self.set_entry(LiveEntry::new(key, pts));
+                    self.set_entry(LiveEntry::new(key, info.pts));
                 }
                 self.try_begin_get_diff(key);
                 continue;
             }
 
-            let Some(info) = PtsInfo::from_update(&update) else {
+            let Some(info) = info else {
                 // No pts means that the update can be applied in any order.
                 result.push((
                     update,
@@ -758,7 +802,7 @@ impl MessageBoxes {
                     remote = ?info.pts,
                     "postponing update (getting difference)",
                 );
-                self.postpone(info.key, update);
+                self.postpone(info, update);
                 postponed = true;
             } else {
                 have_unresolved_gaps |=
@@ -770,12 +814,14 @@ impl MessageBoxes {
         (result, applied)
     }
 
-    /// Hold `update` until the difference of its box, `key`, ends.
-    fn postpone(&mut self, key: Key, update: tl::enums::Update) {
-        match key {
-            Key::Common | Key::Secondary => self.account_postponed.push(update),
+    /// Hold `update` until the difference of its box, `info.key`, ends.
+    fn postpone(&mut self, info: PtsInfo, update: tl::enums::Update) {
+        match info.key {
+            Key::Common | Key::Secondary => self.account_postponed.push((info, update)),
             Key::Channel(_) => {
-                let found = self.update_entry(key, |entry| entry.postponed.push(update));
+                let found = self.update_entry(info.key, |entry| {
+                    entry.postponed.push((info, update));
+                });
                 debug_assert!(found, "a channel getting its difference has an entry");
             }
         }
@@ -803,8 +849,8 @@ impl MessageBoxes {
         };
         let mut applied = false;
         let mut gap_deadline = None;
-        self.force_update_entry(LiveEntry::new(key, info.pts - info.count), |entry| {
-            match (entry.pts + info.count).cmp(&info.pts) {
+        self.force_update_entry(LiveEntry::new(key, info.start()), |entry| {
+            match entry.pts.cmp(&info.start()) {
                 // Apply
                 Ordering::Equal => {
                     entry.pts = info.pts;
@@ -838,17 +884,15 @@ impl MessageBoxes {
                             updates: Vec::new(),
                         })
                         .updates
-                        .push(update);
+                        .push((info, update));
                 }
             };
 
             if let Some(mut gap) = entry.possible_gap.take() {
-                gap.updates.sort_by_key(|u| -update_sort_key(u));
-                while let Some(gap_update) = gap.updates.pop() {
-                    let gap_info = PtsInfo::from_update(&gap_update)
-                        .expect("only updates with pts info may be stored as gaps");
-
-                    match (entry.pts + gap_info.count).cmp(&gap_info.pts) {
+                gap.updates
+                    .sort_by_key(|(gap_info, _)| Reverse(gap_info.start()));
+                while let Some((gap_info, gap_update)) = gap.updates.pop() {
+                    match entry.pts.cmp(&gap_info.start()) {
                         Ordering::Equal => {
                             entry.pts = gap_info.pts;
                             // possible gap can only be resolve if new update closed
@@ -857,7 +901,7 @@ impl MessageBoxes {
                         }
                         Ordering::Greater => {}
                         Ordering::Less => {
-                            gap.updates.push(gap_update);
+                            gap.updates.push((gap_info, gap_update));
                             break;
                         }
                     };
@@ -885,28 +929,28 @@ impl MessageBoxes {
     /// Check the updates postponed while their box got its difference against the state the
     /// difference left, in `pts` order and the way updates arriving now are checked, and add those
     /// that follow on to `result`. One the difference returned is dropped. One that doesn't follow
-    /// on yet waits in its box's possible gap, unless `retry_pending`: the box's difference is due
-    /// again, and returns it and every later one, so they are dropped.
+    /// on yet waits in its box's possible gap, unless `drop_after_gap`: the difference ended
+    /// without an answer to apply, so it and every later one are dropped, for the box's next
+    /// difference to return (a retry after a temporary failure, or its next gap), rather than held
+    /// in a gap that would get the difference again at once.
     fn replay_postponed(
         &mut self,
-        mut postponed: Vec<tl::enums::Update>,
-        retry_pending: bool,
+        mut postponed: Vec<(PtsInfo, tl::enums::Update)>,
+        drop_after_gap: bool,
         now: Now,
         result: &mut Vec<(tl::enums::Update, State)>,
     ) {
-        postponed.sort_by_key(update_sort_key);
-        for update in postponed {
-            let info =
-                PtsInfo::from_update(&update).expect("only updates with pts info may be postponed");
-            if retry_pending
+        postponed.sort_by_key(|(info, _)| info.start());
+        for (info, update) in postponed {
+            if drop_after_gap
                 && self
                     .entry(info.key)
-                    .is_some_and(|entry| entry.pts + info.count < info.pts)
+                    .is_some_and(|entry| entry.pts < info.start())
             {
                 debug!(
                     key = ?info.key,
                     remote = ?info.pts,
-                    "dropping postponed updates after a gap; the retried difference returns them",
+                    "dropping postponed updates after a gap; the next difference returns them",
                 );
                 break;
             }
@@ -923,7 +967,7 @@ impl MessageBoxes {
         let mut postponed = mem::take(&mut self.postponed_seq);
         postponed.sort_unstable();
         for (seq_start, seq) in postponed {
-            match (self.seq + 1).cmp(&seq_start) {
+            match next_seq_cmp(self.seq, seq_start) {
                 Ordering::Equal => self.set_date_seq(self.date, seq),
                 Ordering::Greater => {}
                 Ordering::Less => {
@@ -943,14 +987,12 @@ impl MessageBoxes {
 impl MessageBoxes {
     /// Return the request that needs to be made to get the difference, if any.
     pub fn get_difference(&self) -> Option<tl::functions::updates::GetDifference> {
-        // Both account boxes always get their difference together (`begin_account_difference`).
+        // Both account boxes always get their difference together (`begin_account_difference`),
+        // which only begins with a common entry.
         if !self.getting_diff_for.contains(&Key::Common) {
             return None;
         }
-        let pts = self
-            .entry(Key::Common)
-            .map(|entry| entry.pts)
-            .expect("common entry to exist when getting difference for it");
+        let pts = self.entry(Key::Common)?.pts;
 
         let gd = tl::functions::updates::GetDifference {
             pts,
@@ -971,16 +1013,20 @@ impl MessageBoxes {
     ///
     /// A difference that isn't a slice ends the account's. The updates postponed for the account
     /// while it ran then follow the difference's own (see [`MessageBoxes::process_updates`]).
+    ///
+    /// A difference while the account isn't getting one, such as a second answer to a request
+    /// repeated while the first was in flight, is dropped: it changes nothing and returns nothing.
     pub fn apply_difference(
         &mut self,
         difference: tl::enums::updates::Difference,
         now: Now,
     ) -> UpdateAndPeers {
         trace!(?difference, "applying account difference");
-        debug_assert!(
-            self.getting_diff_for.contains(&Key::Common)
-                && self.getting_diff_for.contains(&Key::Secondary)
-        );
+        // Both account boxes always get their difference together (`begin_account_difference`).
+        if !self.getting_diff_for.contains(&Key::Common) {
+            warn!("dropping a difference for the account, which isn't getting one");
+            return (Vec::new(), Vec::new(), Vec::new());
+        }
         let finish: bool;
         let mut result = match difference {
             tl::enums::updates::Difference::Empty(diff) => {
@@ -1109,14 +1155,6 @@ impl MessageBoxes {
 
 /// Getting and applying channel difference.
 impl MessageBoxes {
-    /// The first channel currently getting its difference, as `(key, channel_id)`, if any.
-    fn channel_in_diff(&self) -> Option<(Key, i64)> {
-        self.getting_diff_for.iter().find_map(|&key| match key {
-            Key::Channel(id) => Some((key, id)),
-            _ => None,
-        })
-    }
-
     /// Return the request that needs to be made to get a channel's difference, if any: the
     /// channel [`MessageBoxes::begin_channel_difference`] asked for last, if it is still waiting,
     /// otherwise the one waiting longest. Its answer goes to
@@ -1126,25 +1164,25 @@ impl MessageBoxes {
     /// Note that this only returns the skeleton of a request.
     /// Both the channel hash and limit will be their default value.
     pub fn get_channel_difference(&self) -> Option<tl::functions::updates::GetChannelDifference> {
-        let (key, channel_id) = self.channel_in_diff()?;
+        // A channel only begins getting its difference with an entry, and keeps it until it ends.
+        let (channel_id, pts) = self.getting_diff_for.iter().find_map(|&key| match key {
+            Key::Channel(id) => self.entry(key).map(|entry| (id, entry.pts)),
+            _ => None,
+        })?;
 
-        if let Some(pts) = self.entry(key).map(|entry| entry.pts) {
-            let gd = tl::functions::updates::GetChannelDifference {
-                force: false,
-                channel: tl::types::InputChannel {
-                    channel_id,
-                    access_hash: 0,
-                }
-                .into(),
-                filter: tl::enums::ChannelMessagesFilter::Empty,
-                pts,
-                limit: 0,
-            };
-            trace!(?gd, "requesting");
-            Some(gd)
-        } else {
-            panic!("Should not try to get difference for an entry {key:?} without known state");
-        }
+        let gd = tl::functions::updates::GetChannelDifference {
+            force: false,
+            channel: tl::types::InputChannel {
+                channel_id,
+                access_hash: 0,
+            }
+            .into(),
+            filter: tl::enums::ChannelMessagesFilter::Empty,
+            pts,
+            limit: 0,
+        };
+        trace!(?gd, "requesting");
+        Some(gd)
     }
 
     /// Similar to [`MessageBoxes::process_updates`], but using the result from getting the
@@ -1156,9 +1194,13 @@ impl MessageBoxes {
     /// ([`MessageBoxes::begin_channel_difference`]): channels get no difference by themselves.
     ///
     /// `updates.channelDifferenceTooLong` moves the channel's `pts` to its `dialog`'s, and its
-    /// `dialog` and `messages` are dropped: the caller reads them from the response first.
+    /// `dialog` and `messages` are dropped: the caller reads them from the response first. One
+    /// whose `dialog` has no `pts`, or is a folder or community, ends the channel's difference
+    /// without moving its `pts`, as TDLib does: like [`MessageBoxes::end_channel_difference`] after
+    /// a temporary failure, but with no retry; its next gap gets the difference again.
     ///
-    /// Panics if the channel isn't getting its difference.
+    /// A difference for a channel that isn't getting one, such as a second answer to a request
+    /// repeated while the first was in flight, is dropped: it changes nothing and returns nothing.
     pub fn apply_channel_difference(
         &mut self,
         channel_id: i64,
@@ -1166,10 +1208,13 @@ impl MessageBoxes {
         now: Now,
     ) -> UpdateAndPeers {
         let key = Key::Channel(channel_id);
-        assert!(
-            self.getting_diff_for.contains(&key),
-            "applying the difference of channel {channel_id}, which isn't getting one"
-        );
+        if !self.getting_diff_for.contains(&key) {
+            warn!(
+                channel_id,
+                "dropping the difference of a channel that isn't getting one"
+            );
+            return (Vec::new(), Vec::new(), Vec::new());
+        }
 
         trace!(channel_id, ?difference, "applying channel difference");
 
@@ -1179,7 +1224,7 @@ impl MessageBoxes {
             entry.retry_delay = Duration::ZERO;
         });
 
-        let tl::types::updates::ChannelDifference {
+        let Some(tl::types::updates::ChannelDifference {
             r#final,
             pts,
             timeout: _,
@@ -1187,7 +1232,15 @@ impl MessageBoxes {
             other_updates,
             chats,
             users,
-        } = adaptor::adapt_channel_difference(difference);
+        }) = adaptor::adapt_channel_difference(difference)
+        else {
+            // No `pts` to move to: the difference ends unanswered, as in TDLib
+            // (`after_get_channel_difference`), and no retry is armed; the next gap gets it again.
+            self.try_end_get_diff(key);
+            let mut result = Vec::new();
+            self.replay_channel_postponed(key, true, now, &mut result);
+            return (result, Vec::new(), Vec::new());
+        };
 
         // The channel's updates are returned as they are, not checked against the `pts` this
         // difference ends at, which would drop every one of them as already handled
@@ -1222,9 +1275,7 @@ impl MessageBoxes {
                 channel_id
             );
             self.try_end_get_diff(key);
-            let mut postponed = Vec::new();
-            self.update_entry(key, |entry| postponed = mem::take(&mut entry.postponed));
-            self.replay_postponed(postponed, false, now, &mut result_updates);
+            self.replay_channel_postponed(key, false, now, &mut result_updates);
         } else {
             debug!("handling channel {} difference", channel_id);
         }
@@ -1240,7 +1291,8 @@ impl MessageBoxes {
     /// they arrived. After a temporary failure the others are dropped: the difference is due again
     /// after a backoff, and returns them. A banned channel's are dropped with its state.
     ///
-    /// Panics if the channel isn't getting its difference.
+    /// Ending the difference of a channel that isn't getting one, such as for a second answer to a
+    /// request repeated while the first was in flight, changes nothing and returns nothing.
     #[must_use = "the returned updates have moved the channel's state"]
     pub fn end_channel_difference(
         &mut self,
@@ -1250,22 +1302,22 @@ impl MessageBoxes {
     ) -> Vec<(tl::enums::Update, State)> {
         let key = Key::Channel(channel_id);
         trace!(channel_id, ?reason, "ending channel difference");
-        let ended = self.try_end_get_diff(key);
-        assert!(
-            ended,
-            "ending the difference of channel {channel_id}, which isn't getting one"
-        );
+        if !self.try_end_get_diff(key) {
+            warn!(
+                channel_id,
+                "ignoring the end of the difference of a channel that isn't getting one"
+            );
+            return Vec::new();
+        }
         let mut result = Vec::new();
         match reason {
             PrematureEndReason::TemporaryServerIssues => {
                 let mut retry_at = None;
-                let mut postponed = Vec::new();
                 self.update_entry(key, |entry| {
                     entry.retry_delay =
                         (entry.retry_delay * 2).clamp(CHANNEL_RETRY_MIN, CHANNEL_RETRY_MAX);
                     entry.retry_at = Some(now + entry.retry_delay);
                     retry_at = entry.retry_at;
-                    postponed = mem::take(&mut entry.postponed);
                 });
                 if let Some(retry_at) = retry_at {
                     self.arm(retry_at);
@@ -1273,13 +1325,32 @@ impl MessageBoxes {
                 // The others aren't held in a possible gap, whose 0.5 s would get the difference
                 // again ahead of the backoff. Like TDLib (`after_get_channel_difference`), this
                 // drops them, and the retry returns them.
-                self.replay_postponed(postponed, true, now, &mut result);
+                self.replay_channel_postponed(key, true, now, &mut result);
             }
             PrematureEndReason::Banned => {
                 self.pop_entry(key);
             }
         }
         result
+    }
+
+    /// Once the difference of the channel `key` has ended, add to `result` the updates postponed
+    /// for it meanwhile that follow on from its state ([`MessageBoxes::replay_postponed`]).
+    /// `drop_after_gap` when it ended without an answer to apply, its `pts` unchanged: the others
+    /// are dropped, as TDLib's `after_get_channel_difference` drops them after an unsuccessful
+    /// difference.
+    fn replay_channel_postponed(
+        &mut self,
+        key: Key,
+        drop_after_gap: bool,
+        now: Now,
+        result: &mut Vec<(tl::enums::Update, State)>,
+    ) {
+        let postponed = self
+            .find_entry(key)
+            .map(|entry| mem::take(&mut entry.postponed))
+            .unwrap_or_default();
+        self.replay_postponed(postponed, drop_after_gap, now, result);
     }
 }
 

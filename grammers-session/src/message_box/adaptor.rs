@@ -7,9 +7,9 @@
 // except according to those terms.
 
 use grammers_tl_types as tl;
-use tracing::info;
+use tracing::{info, warn};
 
-use super::defs::{Gap, Key, NO_PTS, NO_SEQ, PtsInfo, UpdatesLike};
+use super::defs::{Gap, Key, NO_PTS, NO_SEQ, PtsInfo, UpdatesLike, WrongPts};
 
 // > The `updateShortMessage`, `updateShortSentMessage` and `updateShortChatMessage` constructors
 // > [...] should be transformed to `updateShort` upon receiving.
@@ -383,10 +383,14 @@ pub(super) fn adapt(updates: UpdatesLike) -> Result<tl::types::UpdatesCombined, 
     }
 }
 
+/// The difference as `updates.channelDifference`, or `None` for an `updates.channelDifferenceTooLong`
+/// whose `dialog` has no `pts` to move the channel to: one without it, or a folder or community
+/// instead of the channel's dialog. TDLib ends the difference then without moving the `pts`
+/// (`on_get_channel_difference`).
 pub(super) fn adapt_channel_difference(
     difference: tl::enums::updates::ChannelDifference,
-) -> tl::types::updates::ChannelDifference {
-    match difference {
+) -> Option<tl::types::updates::ChannelDifference> {
+    Some(match difference {
         tl::enums::updates::ChannelDifference::Empty(difference) => {
             tl::types::updates::ChannelDifference {
                 r#final: difference.r#final,
@@ -399,19 +403,24 @@ pub(super) fn adapt_channel_difference(
             }
         }
         tl::enums::updates::ChannelDifference::TooLong(difference) => {
+            let pts = match difference.dialog {
+                tl::enums::Dialog::Dialog(tl::types::Dialog { pts: Some(pts), .. }) => pts,
+                tl::enums::Dialog::Dialog(_) => {
+                    warn!("received channelDifferenceTooLong whose dialog has no pts");
+                    return None;
+                }
+                tl::enums::Dialog::Folder(_) => {
+                    warn!("received a folder on channelDifferenceTooLong");
+                    return None;
+                }
+                tl::enums::Dialog::Community(_) => {
+                    warn!("received a community on channelDifferenceTooLong");
+                    return None;
+                }
+            };
             tl::types::updates::ChannelDifference {
                 r#final: difference.r#final,
-                pts: match difference.dialog {
-                    tl::enums::Dialog::Dialog(d) => d
-                        .pts
-                        .expect("channelDifferenceTooLong dialog did not actually contain a pts"),
-                    tl::enums::Dialog::Folder(_) => {
-                        panic!("received a folder on channelDifferenceTooLong")
-                    }
-                    tl::enums::Dialog::Community(_) => {
-                        panic!("received a community on channelDifferenceTooLong")
-                    }
-                },
+                pts,
                 timeout: difference.timeout,
                 new_messages: Vec::new(),
                 other_updates: Vec::new(),
@@ -420,7 +429,7 @@ pub(super) fn adapt_channel_difference(
             }
         }
         tl::enums::updates::ChannelDifference::Difference(difference) => difference,
-    }
+    })
 }
 
 fn peer_from_input_peer(input_peer: &tl::enums::InputPeer) -> tl::enums::Peer {
@@ -478,14 +487,27 @@ fn message_channel_id(message: &tl::enums::Message) -> Option<i64> {
 }
 
 impl PtsInfo {
-    pub(super) fn from_update(update: &tl::enums::Update) -> Option<Self> {
+    /// The box's `pts` before the update: the update applies once the box is at it.
+    pub(super) fn start(&self) -> i32 {
+        // `from_update` makes `pts` greater than `count`, and `count` not negative.
+        self.pts - self.count
+    }
+
+    /// Where `update` goes in its box's sequence, if it is in one; [`WrongPts`] if its `pts` breaks
+    /// the protocol.
+    pub(super) fn from_update(update: &tl::enums::Update) -> Result<Option<Self>, WrongPts> {
         use tl::enums::Update::*;
-        match update {
+        // An update of the common box in a channel: the channel's own `pts` sequence has it.
+        let in_channel = |peer: Option<&tl::enums::Peer>| {
+            if matches!(peer, Some(tl::enums::Peer::Channel(_))) {
+                Err(WrongPts::CommonInChannel)
+            } else {
+                Ok(())
+            }
+        };
+        let info = match update {
             NewMessage(u) => {
-                assert!(!matches!(
-                    message_peer(&u.message),
-                    Some(tl::enums::Peer::Channel(_))
-                ));
+                in_channel(message_peer(&u.message).as_ref())?;
                 Some(Self {
                     key: Key::Common,
                     pts: u.pts,
@@ -520,7 +542,7 @@ impl PtsInfo {
             Privacy(_) => None,
             UserPhone(_) => None,
             ReadHistoryInbox(u) => {
-                assert!(!matches!(u.peer, tl::enums::Peer::Channel(_)));
+                in_channel(Some(&u.peer))?;
                 Some(Self {
                     key: Key::Common,
                     pts: u.pts,
@@ -528,7 +550,7 @@ impl PtsInfo {
                 })
             }
             ReadHistoryOutbox(u) => {
-                assert!(!matches!(u.peer, tl::enums::Peer::Channel(_)));
+                in_channel(Some(&u.peer))?;
                 Some(Self {
                     key: Key::Common,
                     pts: u.pts,
@@ -545,7 +567,9 @@ impl PtsInfo {
                 pts: u.pts,
                 count: u.pts_count,
             }),
-            ChannelTooLong(u) => u.pts.map(|pts| Self {
+            // A `pts` that isn't positive can't start a channel's state: the update counts as
+            // having none.
+            ChannelTooLong(u) => u.pts.filter(|&pts| pts > 0).map(|pts| Self {
                 key: Key::Channel(u.channel_id),
                 pts,
                 count: 0,
@@ -586,10 +610,7 @@ impl PtsInfo {
             }),
             BotCallbackQuery(_) => None,
             EditMessage(u) => {
-                assert!(!matches!(
-                    message_peer(&u.message),
-                    Some(tl::enums::Peer::Channel(_))
-                ));
+                in_channel(message_peer(&u.message).as_ref())?;
                 Some(Self {
                     key: Key::Common,
                     pts: u.pts,
@@ -647,7 +668,7 @@ impl PtsInfo {
             PeerBlocked(_) => None,
             ChannelUserTyping(_) => None,
             PinnedMessages(u) => {
-                assert!(!matches!(u.peer, tl::enums::Peer::Channel(_)));
+                in_channel(Some(&u.peer))?;
                 Some(Self {
                     key: Key::Common,
                     pts: u.pts,
@@ -759,6 +780,12 @@ impl PtsInfo {
             PaidReactionPrivacy(_) => None,
             _ => None,
         }
-        .filter(|info| info.pts != NO_PTS)
+        .filter(|info| info.pts != NO_PTS);
+        match info {
+            // TDLib's check (`add_pending_pts_update`, `add_pending_channel_update`, and for `qts`,
+            // whose count is 1, `add_pending_qts_update`).
+            Some(info) if info.count < 0 || info.pts <= info.count => Err(WrongPts::Count(info)),
+            info => Ok(info),
+        }
     }
 }

@@ -21,6 +21,7 @@ pub struct ObfuscatedCipher {
 impl ObfuscatedCipher {
     pub fn new(init: &[u8; 64]) -> Self {
         let init_rev = init.iter().copied().rev().collect::<Vec<_>>();
+        // Fixed ranges of the client's own 64 bytes: these can't fail.
         #[allow(deprecated)] // see https://github.com/RustCrypto/block-ciphers/issues/509
         Self {
             rx: ctr::Ctr128BE::<aes::Aes256>::new(

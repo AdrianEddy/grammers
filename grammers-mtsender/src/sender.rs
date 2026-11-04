@@ -6,6 +6,18 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+// The sender matches the server's answers to its requests: an answer that matches none, or that
+// can't be read, is logged or failed, never a panic.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::panic,
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing
+    )
+)]
+
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, SystemTime};
 use std::{io, thread};
@@ -43,10 +55,12 @@ pub(crate) fn generate_random_id() -> i64 {
     static LAST_ID: AtomicI64 = AtomicI64::new(0);
 
     while LAST_ID.load(Ordering::SeqCst) == 0 {
+        // Any start but zero, which means "not started": a clock before the epoch starts at one.
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("system time is before epoch")
+            .unwrap_or_default()
             .as_nanos() as i64;
+        let now = if now == 0 { 1 } else { now };
 
         if LAST_ID
             .compare_exchange(0, now, Ordering::SeqCst, Ordering::SeqCst)
@@ -142,8 +156,14 @@ impl<T: Transport, M: mtp::Mtp> Sender<T, M> {
         body: Vec<u8>,
         tx: oneshot::Sender<Result<Vec<u8>, InvocationError>>,
     ) {
-        assert!(body.len() >= 4);
-        let req_id = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+        // What `Mtp::push` asserts of a body, which `raw_invoke_in_dc` takes from its caller: a TL
+        // object, which starts with its constructor identifier and is padded to 4 bytes.
+        let Some(req_id) = constructor_id(&body).filter(|_| body.len().is_multiple_of(4)) else {
+            drop(tx.send(Err(InvocationError::Dropped(
+                "request body is not a serialized TL object",
+            ))));
+            return;
+        };
         debug!(
             "enqueueing request {} to be serialized",
             tl::name_for_id(req_id)
@@ -166,7 +186,9 @@ impl<T: Transport, M: mtp::Mtp> Sender<T, M> {
                 Ok(x) => break x,
                 Err(TryRecvError::Empty) => continue,
                 Err(TryRecvError::Closed) => {
-                    panic!("request channel dropped before receiving a result")
+                    break Err(InvocationError::Dropped(
+                        "request channel dropped before receiving a result",
+                    ));
                 }
             }
         }
@@ -399,8 +421,14 @@ impl<T: Transport, M: mtp::Mtp> Sender<T, M> {
     fn process_result(&mut self, result: mtp::RpcResult) {
         if let Some(req) = self.pop_request(result.msg_id) {
             let x = result.body;
-            assert!(x.len() >= 4);
-            let res_id = u32::from_le_bytes([x[0], x[1], x[2], x[3]]);
+            // Every TL object starts with its constructor identifier.
+            let Some(res_id) = constructor_id(&x) else {
+                debug!(request = ?result.msg_id, len = x.len(), "got a result too short to read");
+                drop(req.result.send(Err(InvocationError::Deserialize(
+                    mtp::DeserializeError::MessageBufferTooSmall,
+                ))));
+                return;
+            };
             debug!(
                 res_id = format_args!("{:x}", res_id),
                 res_name = tl::name_for_id(res_id),
@@ -419,13 +447,11 @@ impl<T: Transport, M: mtp::Mtp> Sender<T, M> {
     fn process_error(&mut self, error: mtp::RpcResultError) {
         if let Some(req) = self.pop_request(error.msg_id) {
             debug!(error = ?error.error, "got rpc error");
-            let x = req.body.as_slice();
-            drop(
-                req.result.send(Err(InvocationError::Rpc(
-                    RpcError::from(error.error)
-                        .with_caused_by(u32::from_le_bytes([x[0], x[1], x[2], x[3]])),
-                ))),
-            );
+            let mut rpc_error = RpcError::from(error.error);
+            if let Some(caused_by) = constructor_id(&req.body) {
+                rpc_error = rpc_error.with_caused_by(caused_by);
+            }
+            drop(req.result.send(Err(InvocationError::Rpc(rpc_error))));
         } else {
             info!(
                 error = ?error.msg_id,
@@ -434,15 +460,29 @@ impl<T: Transport, M: mtp::Mtp> Sender<T, M> {
         }
     }
 
+    /// Handle a `bad_msg_notification` about one of the requests sent, or the container they were
+    /// sent in: send the request again, or fail it.
+    ///
+    /// > The client must check that it has, in fact, recently sent a message with the specified
+    /// > msg_id
+    ///
+    /// The sender ignores a notification about a request that wasn't sent yet, or about no request
+    /// (tdesktop does the same, "such message was not sent recently"), and the request is still
+    /// sent. The MTProto layer doesn't check: it has already applied the salt, time or `seq_no`
+    /// correction the notification carries (`Encrypted::handle_bad_notification`), whatever
+    /// message it names.
     fn process_bad_message(&mut self, bad_msg: mtp::BadMessage) {
         for i in (0..self.requests.len()).rev() {
-            match &self.requests[i].state {
+            let Some(request) = self.requests.get_mut(i) else {
+                continue;
+            };
+            match &request.state {
                 RequestState::Serialized(pair)
                     if pair.msg_id == bad_msg.msg_id || pair.container_msg_id == bad_msg.msg_id =>
                 {
-                    panic!(
-                        "bad msg for unsent request {:?}: {}",
-                        bad_msg.msg_id,
+                    warn!(
+                        request = ?pair.msg_id,
+                        "ignoring bad msg for a request not sent yet: {}",
                         bad_msg.description()
                     );
                 }
@@ -458,7 +498,7 @@ impl<T: Transport, M: mtp::Mtp> Sender<T, M> {
                         );
 
                         // TODO check if actually retryable first!
-                        self.requests[i].state = RequestState::NotSerialized;
+                        request.state = RequestState::NotSerialized;
                     } else {
                         if bad_msg.fatal() {
                             error!(
@@ -496,29 +536,41 @@ impl<T: Transport, M: mtp::Mtp> Sender<T, M> {
         }
     }
 
-    fn peek_request(&mut self, msg_id: MsgId) -> Option<&Request> {
-        self.requests.iter().find(|request| match request.state {
-            RequestState::NotSerialized => false,
-            RequestState::Serialized(MsgIdPair { msg_id: m, .. }) => m == msg_id,
-            RequestState::Sent(MsgIdPair { msg_id: m, .. }) => m == msg_id,
+    /// The sent request with the identifier `msg_id`, which an answer names. Like
+    /// [`Self::pop_request`], never one that wasn't sent yet.
+    fn peek_request(&self, msg_id: MsgId) -> Option<&Request> {
+        self.requests.iter().find(|request| match &request.state {
+            RequestState::Sent(pair) => pair.msg_id == msg_id,
+            // Not sent yet, so no answer can name it.
+            RequestState::NotSerialized | RequestState::Serialized(_) => false,
         })
     }
 
+    /// Remove and return the sent request with the identifier `msg_id`, which an answer names.
+    ///
+    /// A request that wasn't sent yet can't have an answer, so one that names it is ignored, like
+    /// one that names no request (tdesktop: "such message was not sent recently"); the request
+    /// stays, to be sent and answered.
     fn pop_request(&mut self, msg_id: MsgId) -> Option<Request> {
-        for i in 0..self.requests.len() {
-            match &self.requests[i].state {
-                RequestState::Serialized(pair) if pair.msg_id == msg_id => {
-                    panic!("got response {msg_id:?} for unsent request {pair:?}");
-                }
+        for (i, request) in self.requests.iter().enumerate() {
+            match &request.state {
                 RequestState::Sent(pair) if pair.msg_id == msg_id => {
                     return Some(self.requests.swap_remove(i));
+                }
+                RequestState::Serialized(pair) if pair.msg_id == msg_id => {
+                    warn!(request = ?msg_id, "ignoring an answer for a request not sent yet");
+                    return None;
                 }
                 _ => {}
             }
         }
-
         None
     }
+}
+
+/// The constructor identifier a serialized TL object starts with, if it has the 4 bytes.
+fn constructor_id(body: &[u8]) -> Option<u32> {
+    body.first_chunk().copied().map(u32::from_le_bytes)
 }
 
 impl<T: Transport> Sender<T, mtp::Encrypted> {
@@ -574,3 +626,6 @@ pub async fn connect_with_auth<T: Transport>(
 ) -> Result<Sender<T, mtp::Encrypted>, io::Error> {
     Sender::connect(transport, mtp::Encrypted::build().finish(auth_key), addr).await
 }
+
+#[cfg(test)]
+mod tests;

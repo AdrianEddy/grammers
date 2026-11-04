@@ -441,7 +441,11 @@ impl Client {
         let g_b = password_info.srp_b.clone().unwrap();
         let a = password_info.secure_random.clone();
 
-        let (m1, g_a) = calculate_2fa(salt1, salt2, p, g, g_b, a, password);
+        let Some((m1, g_a)) = calculate_2fa(salt1, salt2, p, g, g_b, a, password) else {
+            return Err(SignInError::Other(InvocationError::Dropped(
+                "Telegram sent password parameters that cannot be used",
+            )));
+        };
 
         let check_password = tl::functions::auth::CheckPassword {
             password: tl::enums::InputCheckPasswordSrp::Srp(tl::types::InputCheckPasswordSrp {

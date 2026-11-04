@@ -54,26 +54,27 @@ impl Transport for Intermediate {
     }
 
     fn unpack(&mut self, buffer: &mut [u8]) -> Result<UnpackedOffset, Error> {
-        if buffer.len() < 4 {
+        let Some((header, rest)) = buffer.split_first_chunk::<4>() else {
             return Err(Error::MissingBytes);
-        }
+        };
 
-        let len = i32::from_le_bytes(buffer[0..4].try_into().unwrap());
-        if (buffer.len() as i32) < len {
-            return Err(Error::MissingBytes);
-        }
-
-        if len <= 4 {
-            if len >= 4 {
-                let data = i32::from_le_bytes(buffer[4..8].try_into().unwrap());
-                return Err(Error::BadStatus {
-                    status: (-data) as u32,
-                });
-            }
+        let len = i32::from_le_bytes(*header);
+        if len < 4 {
             return Err(Error::BadLen { got: len });
         }
+        // The length counts the bytes after the 4 of the header.
+        let Some(data) = rest.get(..len as usize) else {
+            return Err(Error::MissingBytes);
+        };
 
-        let len = len as usize;
+        // A transport error is a packet of exactly one `int`, the negated error code.
+        if let Ok(code) = <[u8; 4]>::try_from(data) {
+            return Err(Error::BadStatus {
+                status: i32::from_le_bytes(code).wrapping_neg() as u32,
+            });
+        }
+
+        let len = data.len();
 
         Ok(UnpackedOffset {
             data_range: 4..4 + len,

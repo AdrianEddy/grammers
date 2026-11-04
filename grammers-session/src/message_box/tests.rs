@@ -1144,7 +1144,7 @@ fn account_difference_returns_both_boxes_updates() {
 fn pts_of(updates: &[(tl::enums::Update, State)]) -> Vec<i32> {
     updates
         .iter()
-        .filter_map(|(update, _)| PtsInfo::from_update(update))
+        .filter_map(|(update, _)| PtsInfo::from_update(update).ok().flatten())
         .map(|info| info.pts)
         .collect()
 }
@@ -2711,4 +2711,330 @@ proptest! {
     ) {
         run(ops);
     }
+}
+
+// Server data that breaks the protocol is handled, never a panic (TF3).
+
+/// `updates.channelDifferenceTooLong` for [`CHANNEL`] with the given `dialog`.
+fn channel_difference_too_long(dialog: tl::enums::Dialog) -> tl::enums::updates::ChannelDifference {
+    tl::types::updates::ChannelDifferenceTooLong {
+        r#final: true,
+        timeout: None,
+        dialog,
+        messages: Vec::new(),
+        chats: Vec::new(),
+        users: Vec::new(),
+    }
+    .into()
+}
+
+fn notify_settings() -> tl::enums::PeerNotifySettings {
+    tl::types::PeerNotifySettings {
+        show_previews: None,
+        silent: None,
+        mute_until: None,
+        ios_sound: None,
+        android_sound: None,
+        other_sound: None,
+        stories_muted: None,
+        stories_hide_sender: None,
+        stories_ios_sound: None,
+        stories_android_sound: None,
+        stories_other_sound: None,
+    }
+    .into()
+}
+
+/// [`CHANNEL`]'s dialog, with the given `pts`.
+fn channel_dialog(pts: Option<i32>) -> tl::enums::Dialog {
+    tl::types::Dialog {
+        pinned: false,
+        unread_mark: false,
+        view_forum_as_messages: false,
+        peer: tl::types::PeerChannel {
+            channel_id: CHANNEL,
+        }
+        .into(),
+        top_message: 1,
+        read_inbox_max_id: 0,
+        read_outbox_max_id: 0,
+        unread_count: 0,
+        unread_mentions_count: 0,
+        unread_reactions_count: 0,
+        unread_poll_votes_count: 0,
+        notify_settings: notify_settings(),
+        pts,
+        draft: None,
+        folder_id: None,
+        ttl_period: None,
+    }
+    .into()
+}
+
+fn folder_dialog() -> tl::enums::Dialog {
+    tl::types::DialogFolder {
+        pinned: false,
+        folder: tl::types::Folder {
+            autofill_new_broadcasts: false,
+            autofill_public_groups: false,
+            autofill_new_correspondents: false,
+            id: 1,
+            title: "Archive".into(),
+            photo: None,
+        }
+        .into(),
+        peer: tl::types::PeerChannel {
+            channel_id: CHANNEL,
+        }
+        .into(),
+        top_message: 1,
+        unread_muted_peers_count: 0,
+        unread_unmuted_peers_count: 0,
+        unread_muted_messages_count: 0,
+        unread_unmuted_messages_count: 0,
+    }
+    .into()
+}
+
+fn community_dialog() -> tl::enums::Dialog {
+    tl::types::DialogCommunity {
+        pinned: false,
+        community_id: 7,
+        notify_settings: notify_settings(),
+    }
+    .into()
+}
+
+/// `update` alone on the socket, in an `updateShort`.
+fn short(update: tl::enums::Update) -> UpdatesLike {
+    UpdatesLike::Updates(
+        tl::types::UpdateShort {
+            update,
+            date: NO_DATE,
+        }
+        .into(),
+    )
+}
+
+const NOTHING: Result<UpdateAndPeers, Gap> = Ok((Vec::new(), Vec::new(), Vec::new()));
+
+#[test]
+fn folder_dialog_in_channel_too_long_is_premature_end() {
+    // The channel at 20 gets its difference, and 21 and 24 arrive meanwhile.
+    let diffing = || {
+        let mut message_boxes = settled(T0);
+        assert!(message_boxes.begin_channel_difference(CHANNEL));
+        for pts in [24, 21] {
+            assert_eq!(
+                message_boxes.process_updates(channel_updates(CHANNEL, NO_DATE, NO_SEQ, pts), T0),
+                NOTHING
+            );
+        }
+        message_boxes
+    };
+
+    // A dialog with no `pts` to move the channel to ends the difference without moving it, as
+    // TDLib does: what follows on comes back, the rest is dropped, and no retry is armed.
+    for dialog in [folder_dialog(), community_dialog(), channel_dialog(None)] {
+        let mut message_boxes = diffing();
+        let (returned, users, chats) = message_boxes.apply_channel_difference(
+            CHANNEL,
+            channel_difference_too_long(dialog),
+            T0,
+        );
+        assert_eq!(pts_of(&returned), vec![21]);
+        assert!(users.is_empty() && chats.is_empty());
+        assert_eq!(message_boxes.take_delta(), channel_delta(21));
+        assert_eq!(message_boxes.difference_pending(), DiffPending::default());
+        assert_eq!(message_boxes.get_channel_difference(), None);
+        // The account's idle deadline is the next one: the channel waits for its next gap.
+        assert_eq!(
+            time_of_next_difference(&mut message_boxes, T0),
+            T0 + NO_UPDATES_TIMEOUT
+        );
+        assert!(message_boxes.difference_pending().account);
+        assert_eq!(message_boxes.difference_pending().channels, 0);
+    }
+
+    // Its next gap gets the difference again, from where it stopped.
+    let mut message_boxes = diffing();
+    let _ = message_boxes.apply_channel_difference(
+        CHANNEL,
+        channel_difference_too_long(folder_dialog()),
+        T0,
+    );
+    let _ = message_boxes.take_delta();
+    assert_eq!(
+        message_boxes.process_updates(channel_updates(CHANNEL, NO_DATE, NO_SEQ, 30), T0),
+        NOTHING
+    );
+    assert_eq!(
+        time_of_next_difference(&mut message_boxes, T0),
+        T0 + POSSIBLE_GAP_TIMEOUT
+    );
+    assert_eq!(
+        message_boxes.get_channel_difference(),
+        Some(get_channel_difference(CHANNEL, 21))
+    );
+
+    // A dialog with its `pts` still moves the channel there.
+    let mut message_boxes = diffing();
+    let (returned, _, _) = message_boxes.apply_channel_difference(
+        CHANNEL,
+        channel_difference_too_long(channel_dialog(Some(23))),
+        T0,
+    );
+    assert_eq!(pts_of(&returned), vec![24]);
+    assert_eq!(message_boxes.take_delta(), channel_delta(24));
+}
+
+#[test]
+fn wrong_pts_updates_are_dropped() {
+    let mut message_boxes = settled(T0);
+    let in_channel = tl::enums::Message::Empty(tl::types::MessageEmpty {
+        id: 1,
+        peer_id: Some(
+            tl::types::PeerChannel {
+                channel_id: CHANNEL,
+            }
+            .into(),
+        ),
+    });
+    let wrong: [tl::enums::Update; 7] = [
+        // Common-box updates about a channel, which has its own sequence.
+        tl::types::UpdateNewMessage {
+            message: in_channel.clone(),
+            pts: 101,
+            pts_count: 1,
+        }
+        .into(),
+        tl::types::UpdateEditMessage {
+            message: in_channel,
+            pts: 101,
+            pts_count: 1,
+        }
+        .into(),
+        tl::types::UpdatePinnedMessages {
+            pinned: true,
+            peer: tl::types::PeerChannel {
+                channel_id: CHANNEL,
+            }
+            .into(),
+            messages: vec![1],
+            pts: 101,
+            pts_count: 1,
+        }
+        .into(),
+        tl::types::UpdateReadHistoryOutbox {
+            peer: tl::types::PeerChannel {
+                channel_id: CHANNEL,
+            }
+            .into(),
+            max_id: 1,
+            pts: 101,
+            pts_count: 1,
+        }
+        .into(),
+        // A negative count, and a `pts` that isn't above its count.
+        tl::types::UpdateDeleteMessages {
+            messages: Vec::new(),
+            pts: 101,
+            pts_count: -1,
+        }
+        .into(),
+        channel_update(CHANNEL, 1),
+        qts_update(1),
+    ];
+    for update in wrong {
+        assert_eq!(message_boxes.process_updates(short(update), T0), NOTHING);
+        assert_eq!(message_boxes.take_delta(), StateDelta::default());
+    }
+    assert_eq!(message_boxes.difference_pending(), DiffPending::default());
+
+    // Each box's next update still follows on.
+    let (returned, _, _) = message_boxes
+        .process_updates(short(update(101)), T0)
+        .unwrap();
+    assert_eq!(pts_of(&returned), vec![101]);
+    let (returned, _, _) = message_boxes
+        .process_updates(channel_updates(CHANNEL, NO_DATE, NO_SEQ, 21), T0)
+        .unwrap();
+    assert_eq!(pts_of(&returned), vec![21]);
+}
+
+#[test]
+fn state_near_i32_max_does_not_overflow() {
+    let mut message_boxes = MessageBoxes::new();
+    message_boxes.set_state(state(10, i32::MAX, i32::MAX - 1, i32::MAX), T0);
+    message_boxes.try_set_channel_state(CHANNEL, i32::MAX);
+    let _ = message_boxes.take_delta();
+
+    // A `pts` and `count` whose sum would overflow: an update the box has already.
+    let far = tl::types::UpdateDeleteMessages {
+        messages: Vec::new(),
+        pts: i32::MAX,
+        pts_count: 5,
+    };
+    assert_eq!(
+        message_boxes.process_updates(short(far.into()), T0),
+        NOTHING
+    );
+    assert_eq!(
+        message_boxes.process_updates(channel_updates(CHANNEL, NO_DATE, NO_SEQ, i32::MAX), T0),
+        NOTHING
+    );
+    assert_eq!(
+        message_boxes.process_updates(qts_updates(i32::MAX), T0),
+        NOTHING
+    );
+    // A sequenced container after `seq` `i32::MAX`: handled already.
+    assert_eq!(
+        message_boxes.process_updates(updates(11, i32::MIN, i32::MAX), T0),
+        NOTHING
+    );
+    assert_eq!(message_boxes.take_delta(), StateDelta::default());
+}
+
+#[test]
+fn answers_for_a_box_not_getting_its_difference_are_dropped() {
+    let mut message_boxes = settled(T0);
+
+    // Nothing asked for the account's difference or the channel's: the answers change nothing.
+    let (returned, users, chats) = message_boxes.apply_difference(
+        tl::types::updates::DifferenceTooLong { pts: 500 }.into(),
+        T0,
+    );
+    assert!(returned.is_empty() && users.is_empty() && chats.is_empty());
+    let (returned, users, chats) =
+        message_boxes.apply_channel_difference(CHANNEL, channel_difference(21, 30, true), T0);
+    assert!(returned.is_empty() && users.is_empty() && chats.is_empty());
+    for reason in [
+        PrematureEndReason::TemporaryServerIssues,
+        PrematureEndReason::Banned,
+    ] {
+        assert!(
+            message_boxes
+                .end_channel_difference(CHANNEL, reason, T0)
+                .is_empty()
+        );
+    }
+    assert_eq!(message_boxes.take_delta(), StateDelta::default());
+    assert_eq!(message_boxes.difference_pending(), DiffPending::default());
+    assert_eq!(
+        message_boxes.session_state().channels,
+        vec![ChannelState {
+            id: CHANNEL,
+            pts: 20
+        }]
+    );
+
+    // A second answer to a channel request repeated while the first was in flight.
+    assert!(message_boxes.begin_channel_difference(CHANNEL));
+    let (returned, _, _) =
+        message_boxes.apply_channel_difference(CHANNEL, channel_difference(21, 30, true), T0);
+    assert_eq!(pts_of(&returned), (21..=30).collect::<Vec<_>>());
+    let (returned, _, _) =
+        message_boxes.apply_channel_difference(CHANNEL, channel_difference(21, 25, true), T0);
+    assert!(returned.is_empty());
+    assert_eq!(message_boxes.take_delta(), channel_delta(30));
 }

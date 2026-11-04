@@ -16,6 +16,17 @@
 //!
 //! [Mobile Transport Protocol]: https://core.telegram.org/mtproto/description
 
+// Both modes decode the server's messages: unexpected data is an error, never a panic.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::panic,
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing
+    )
+)]
+
 mod encrypted;
 mod plain;
 
@@ -145,6 +156,10 @@ pub enum DeserializeError {
     /// within this variant.
     UnexpectedConstructor { id: u32 },
 
+    /// The server's data nests objects deeper than [`tl::deserialize::MAX_DEPTH`], which would
+    /// exhaust the stack.
+    TooDeep,
+
     /// Attempting to decrypt the message failed in some way.
     DecryptionError(crypto::Error),
 
@@ -174,6 +189,11 @@ impl fmt::Display for DeserializeError {
             ),
             Self::DecompressionFailed => write!(f, "failed to decompress server's data"),
             Self::UnexpectedConstructor { id } => write!(f, "unexpected constructor: {id:08x}"),
+            Self::TooDeep => write!(
+                f,
+                "server data nests objects deeper than {} levels",
+                tl::deserialize::MAX_DEPTH
+            ),
             Self::DecryptionError(ref error) => write!(f, "failed to decrypt message: {error}"),
             Self::Transport(ref error) => {
                 write!(f, "deserialization failed at transport level: {error}")
@@ -189,6 +209,7 @@ impl From<tl::deserialize::Error> for DeserializeError {
         match error {
             Err::UnexpectedEof => DeserializeError::MessageBufferTooSmall,
             Err::UnexpectedConstructor { id } => DeserializeError::UnexpectedConstructor { id },
+            Err::TooDeep => DeserializeError::TooDeep,
         }
     }
 }

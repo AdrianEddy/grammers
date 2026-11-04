@@ -13,6 +13,17 @@
 //!
 //! [MTProto transports]: https://core.telegram.org/mtproto#mtproto-transport
 
+// The transports unpack the server's bytes: a bad length is an error, never a panic.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::panic,
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing
+    )
+)]
+
 mod abridged;
 mod full;
 mod intermediate;
@@ -106,6 +117,8 @@ pub trait Transport {
     fn pack(&mut self, buffer: &mut DequeBuffer<u8>);
 
     /// Unpacks the input buffer in-place.
+    ///
+    /// On success, both the returned `data_range` and `next_offset` lie within `buffer`.
     ///
     /// Subsequent calls to `unpack` should be made with the same buffer,
     /// with the data on the ranges from previous `UnpackedOffset` removed.

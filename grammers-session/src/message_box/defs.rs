@@ -99,9 +99,10 @@ pub(super) struct LiveEntry {
     pub(super) retry_delay: Duration,
 
     /// Updates for the channel that arrived while it got its difference, held until the difference
-    /// ends ([`MessageBoxes::process_updates`]). Empty while it gets none. The account's boxes
-    /// hold theirs in [`MessageBoxes::account_postponed`].
-    pub(super) postponed: Vec<tl::enums::Update>,
+    /// ends ([`MessageBoxes::process_updates`]), each with its place in the channel's sequence.
+    /// Empty while it gets none. The account's boxes hold theirs in
+    /// [`MessageBoxes::account_postponed`].
+    pub(super) postponed: Vec<(PtsInfo, tl::enums::Update)>,
 }
 
 /// Contains all live message boxes and is able to process incoming updates for each of them.
@@ -129,7 +130,7 @@ pub struct MessageBoxes {
     /// Updates for the account's boxes that arrived while the account got its difference, held
     /// until the difference ends ([`MessageBoxes::process_updates`]). Both boxes always get it
     /// together, so they share this, also while the secondary box has no entry yet.
-    pub(super) account_postponed: Vec<tl::enums::Update>,
+    pub(super) account_postponed: Vec<(PtsInfo, tl::enums::Update)>,
 
     /// The `seq_start` and `seq` of each sequenced container that arrived while the account got
     /// its difference. The difference replaces the local `seq`, so they are checked against the
@@ -172,11 +173,26 @@ impl DirtySet {
 }
 
 /// Represents the information needed to correctly handle a specific `tl::enums::Update`.
-#[derive(Debug)]
+///
+/// [`PtsInfo::from_update`] only returns one whose `pts` is above its `count`, and whose `count`
+/// isn't negative: the box's `pts` before the update ([`PtsInfo::start`]) is then positive.
+#[derive(Clone, Copy, Debug)]
 pub(super) struct PtsInfo {
     pub(super) key: Key,
     pub(super) pts: i32,
     pub(super) count: i32,
+}
+
+/// Why an update's `pts` breaks the protocol, TDLib's "wrong PTS update". The update is dropped,
+/// as TDLib drops it (`check_pts_update`, `add_pending_pts_update`); the box's state doesn't move.
+/// It holds what was wrong, never the update, so it can be logged: the update carries the user's
+/// messages and contacts.
+#[derive(Debug)]
+pub(super) enum WrongPts {
+    /// An update of the common box about a channel, whose own `pts` sequence has it.
+    CommonInChannel,
+    /// An update whose `count` is negative or not below its `pts`.
+    Count(PtsInfo),
 }
 
 // > ### Recovering gaps
@@ -190,8 +206,9 @@ pub(super) struct PtsInfo {
 #[derive(Debug)]
 pub(super) struct PossibleGap {
     pub(super) deadline: Now,
-    /// Pending updates (those with a larger PTS, producing the gap which may later be filled).
-    pub(super) updates: Vec<tl::enums::Update>,
+    /// Pending updates (those with a larger PTS, producing the gap which may later be filled),
+    /// each with its place in the box's sequence.
+    pub(super) updates: Vec<(PtsInfo, tl::enums::Update)>,
 }
 
 /// Error when a gap has been detected during update processing.

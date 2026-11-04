@@ -104,10 +104,14 @@ fn recursive_types_indirect_boxed() -> io::Result<()> {
     let (_, _, _, enums) = gen_rust_code(&definitions)?;
     eprintln!("{enums}");
     assert!(enums.contains("Media(Box<crate::types::MessageExtendedMedia>),"));
-    assert!(enums.contains("Box::new(crate::types::MessageExtendedMedia::deserialize("));
+    assert!(enums.contains(
+        "crate::types::MessageExtendedMedia::deserialize(buf).map(|x| Self::Media(Box::new(x)))"
+    ));
     assert!(enums.contains("MessageExtendedMedia::Media(Box::new("));
     assert!(enums.contains("Invoice(Box<crate::types::MessageMediaInvoice>),"));
-    assert!(enums.contains("Box::new(crate::types::MessageMediaInvoice::deserialize("));
+    assert!(enums.contains(
+        "crate::types::MessageMediaInvoice::deserialize(buf).map(|x| Self::Invoice(Box::new(x)))"
+    ));
     assert!(enums.contains("MessageMedia::Invoice(Box::new("));
     Ok(())
 }
@@ -139,6 +143,70 @@ fn recursive_types_vec_indirect_not_boxed() -> io::Result<()> {
     assert!(enums.contains("JsonObjectValue(crate::types::JsonObjectValue)"));
     assert!(enums.contains("JsonArray(crate::types::JsonArray)"));
     assert!(enums.contains("JsonObject(crate::types::JsonObject)"));
+    Ok(())
+}
+
+/// The `impl Deserializable` block for `name` in generated code.
+fn deserialize_impl<'a>(code: &'a str, name: &str) -> &'a str {
+    let start = code
+        .find(&format!("impl crate::Deserializable for {name} {{"))
+        .unwrap_or_else(|| panic!("no impl Deserializable for {name}"));
+    let end = code[start + 1..]
+        .find("\nimpl")
+        .map_or(code.len(), |end| start + 1 + end);
+    &code[start..end]
+}
+
+#[test]
+fn boxed_types_deserialize_nested() -> io::Result<()> {
+    let definitions = get_definitions(
+        "
+        inputPeerEmpty#7f3b18ea = InputPeer;
+        jsonNull#3f6d7b68 = JSONValue;
+        jsonArray#f7444763 value:Vector<JSONValue> = JSONValue;
+    ",
+    );
+    let (_, types, _, enums) = gen_rust_code(&definitions)?;
+    eprintln!("{enums}");
+    // Every boxed type, whether it recurses or not, and whether through a `Vector` or a `Box`.
+    for name in ["InputPeer", "Jsonvalue"] {
+        assert!(
+            deserialize_impl(&enums, name).contains("buf.nested(|buf| {"),
+            "{name}"
+        );
+    }
+    assert!(!types.contains("buf.nested("));
+    Ok(())
+}
+
+#[test]
+fn bare_recursive_types_deserialize_nested() -> io::Result<()> {
+    let definitions = get_definitions(
+        "
+        node#11111111 children:vector<node> = Node;
+        tree#22222222 root:node = Tree;
+        left#33333333 right:Vector<right> = Left;
+        right#44444444 flags:# left:flags.0?left = Right;
+        future_salt#0949d9dc valid_since:int valid_until:int salt:long = FutureSalt;
+        future_salts#ae500895 req_msg_id:long now:int salts:vector<future_salt> = FutureSalts;
+    ",
+    );
+    let (_, types, _, _) = gen_rust_code(&definitions)?;
+    eprintln!("{types}");
+    // A cycle of bare references passes through no boxed type, so its types are guarded themselves.
+    for name in ["Node", "Left", "Right"] {
+        assert!(
+            deserialize_impl(&types, name).contains("buf.nested(|buf| {"),
+            "{name}"
+        );
+    }
+    // Bare references that don't lead back are not.
+    for name in ["Tree", "FutureSalt", "FutureSalts"] {
+        assert!(
+            !deserialize_impl(&types, name).contains("buf.nested("),
+            "{name}"
+        );
+    }
     Ok(())
 }
 

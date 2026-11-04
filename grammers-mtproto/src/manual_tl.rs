@@ -8,15 +8,30 @@
 
 //! This module contains additional, manual structures for some TL types.
 
-use std::io::Write;
+// The messages are read from the server's bytes: a bad length is an error, never a panic.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::panic,
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing
+    )
+)]
+
+use std::io::{self, Read, Write};
 
 use flate2::Compression;
-use flate2::write::{GzDecoder, GzEncoder};
+use flate2::bufread::GzDecoder;
+use flate2::write::GzEncoder;
 use grammers_crypto::MAX_PADDING_LEN;
 use grammers_tl_types::{self as tl, Cursor, Deserializable, Identifiable, Serializable};
 
-use crate::mtp;
+use crate::mtp::DeserializeError;
 use crate::transport::MAX_TRANSPORT_BUFFER_SIZE;
+
+#[cfg(test)]
+mod server_data_tests;
 
 /// This struct represents the following TL definition:
 ///
@@ -80,24 +95,76 @@ impl Serializable for Message {
     }
 }
 
-impl Deserializable for Message {
-    fn deserialize(buf: &mut Cursor) -> Result<Self, tl::deserialize::Error> {
-        let msg_id = i64::deserialize(buf)?;
-        let seq_no = i32::deserialize(buf)?;
+impl Message {
+    /// Reads the message at the start of `bytes`, and returns it with the bytes after it.
+    ///
+    /// The body's length is checked against the bytes there are, before anything is allocated.
+    pub fn split_from(bytes: &[u8]) -> Result<(Self, &[u8]), DeserializeError> {
+        let (msg_id, bytes) = split_i64(bytes)?;
+        let (seq_no, bytes) = split_i32(bytes)?;
+        let (len, bytes) = split_i32(bytes)?;
+        let len = usize::try_from(len)
+            .map_err(|_| DeserializeError::NegativeMessageLength { got: len })?;
+        let (body, rest) =
+            bytes
+                .split_at_checked(len)
+                .ok_or(DeserializeError::TooLongMessageLength {
+                    got: len,
+                    max_length: bytes.len(),
+                })?;
 
-        let len = i32::deserialize(buf)?;
-        assert!(len >= 0);
-        let len = len as usize;
-        assert!(len < Message::MAX_BODY_SIZE);
-        let mut body = vec![0; len];
-        buf.read_exact(&mut body)?;
-
-        Ok(Message {
-            msg_id,
-            seq_no,
-            body,
-        })
+        Ok((
+            Message {
+                msg_id,
+                seq_no,
+                body: body.to_vec(),
+            },
+            rest,
+        ))
     }
+}
+
+/// Reads the `long` at the start of `bytes`, and returns it with the bytes after it.
+pub(crate) fn split_i64(bytes: &[u8]) -> Result<(i64, &[u8]), DeserializeError> {
+    let (value, rest) = bytes
+        .split_first_chunk()
+        .ok_or(DeserializeError::MessageBufferTooSmall)?;
+    Ok((i64::from_le_bytes(*value), rest))
+}
+
+/// Reads the `int` at the start of `bytes`, and returns it with the bytes after it.
+pub(crate) fn split_i32(bytes: &[u8]) -> Result<(i32, &[u8]), DeserializeError> {
+    let (value, rest) = bytes
+        .split_first_chunk()
+        .ok_or(DeserializeError::MessageBufferTooSmall)?;
+    Ok((i32::from_le_bytes(*value), rest))
+}
+
+/// Reads the `bytes` (a TL `string`) at the start of `bytes`, and returns its data with the bytes
+/// after it.
+///
+/// The length (one byte, or 254 and three more) is checked against the bytes there are, padding
+/// to a multiple of four included, and the data is borrowed: nothing is allocated for the length
+/// the server claims.
+fn split_bytes(bytes: &[u8]) -> Result<(&[u8], &[u8]), DeserializeError> {
+    let (header_len, len, rest) = match bytes {
+        [254, rest @ ..] => {
+            let (&[b0, b1, b2], rest) = rest
+                .split_first_chunk()
+                .ok_or(DeserializeError::MessageBufferTooSmall)?;
+            (4, u32::from_le_bytes([b0, b1, b2, 0]) as usize, rest)
+        }
+        [len, rest @ ..] => (1, usize::from(*len), rest),
+        [] => return Err(DeserializeError::MessageBufferTooSmall),
+    };
+    let padding = (header_len + len).next_multiple_of(4) - (header_len + len);
+    let (data, rest) = rest
+        .split_at_checked(len)
+        .ok_or(DeserializeError::MessageBufferTooSmall)?;
+    let rest = rest
+        .get(padding..)
+        .ok_or(DeserializeError::MessageBufferTooSmall)?;
+    Ok((data, rest))
 }
 
 /// This struct represents the following TL definition:
@@ -166,19 +233,26 @@ impl Identifiable for MessageContainer {
     const CONSTRUCTOR_ID: u32 = 0x73f1f8dc;
 }
 
-impl Deserializable for MessageContainer {
-    fn deserialize(buf: &mut Cursor) -> Result<Self, tl::deserialize::Error> {
-        let constructor_id = u32::deserialize(buf)?;
+impl MessageContainer {
+    /// Reads a container from a message's body.
+    ///
+    /// Each message's length is checked against the bytes left in the container.
+    pub fn from_body(body: &[u8]) -> Result<Self, DeserializeError> {
+        let (constructor_id, bytes) = split_i32(body)?;
+        let constructor_id = constructor_id as u32;
         if constructor_id != Self::CONSTRUCTOR_ID {
-            return Err(tl::deserialize::Error::UnexpectedConstructor { id: constructor_id });
+            return Err(DeserializeError::UnexpectedConstructor { id: constructor_id });
         }
 
-        let len = i32::deserialize(buf)?;
-        assert!(len >= 0);
-        let len = len as usize;
-        let mut messages = Vec::with_capacity(len.min(Self::MAXIMUM_LENGTH));
+        // A vector's length is unsigned: a "negative" one claims more messages than any body
+        // holds, and fails at the end of the bytes like any other count that is too large.
+        let (len, mut bytes) = split_i32(bytes)?;
+        let len = len as u32;
+        let mut messages = Vec::with_capacity((len as usize).min(Self::MAXIMUM_LENGTH));
         for _ in 0..len {
-            messages.push(Message::deserialize(buf)?);
+            let (message, rest) = Message::split_from(bytes)?;
+            messages.push(message);
+            bytes = rest;
         }
 
         Ok(Self { messages })
@@ -208,28 +282,68 @@ impl Identifiable for MessageCopy {
 /// ```tl
 /// gzip_packed#3072cfa1 packed_data:string = Object;
 /// ```
+///
+/// The client builds one with [`GzipPacked::new`]; one from the server is read in place by
+/// [`GzipPacked::decompress`].
 pub(crate) struct GzipPacked {
     pub packed_data: Vec<u8>,
 }
 
+/// How many bytes the `gzip_packed` objects in one packet from the server may inflate to in
+/// total: tdesktop's `kMaxUnpackedMessageLength`. A larger output is an error, so a small packet
+/// can't make the client allocate, or inflate, without bound.
+pub(crate) const MAX_UNPACKED_PER_PACKET: usize = 32 * 1024 * 1024;
+
+/// How many `gzip_packed` objects may be nested in one another: tdesktop's `kMaxGzipNesting`.
+/// Deeper nesting is an error, so a packet can't exhaust the stack.
+pub(crate) const MAX_GZIP_NESTING: u32 = 64;
+
 impl GzipPacked {
-    pub fn new(unpacked_data: &[u8]) -> Self {
+    /// Compresses `unpacked_data`.
+    ///
+    /// Compressing to memory doesn't fail in practice, but the encoder reports errors through
+    /// [`io::Error`] all the same; a caller can then send the data uncompressed.
+    pub fn new(unpacked_data: &[u8]) -> io::Result<Self> {
         let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
-        // Safe to unwrap, in-memory data should not fail
-        encoder.write_all(unpacked_data).unwrap();
-        let packed_data = encoder.finish().unwrap();
-        Self { packed_data }
+        encoder.write_all(unpacked_data)?;
+        let packed_data = encoder.finish()?;
+        Ok(Self { packed_data })
     }
 
-    pub fn decompress(&self) -> Result<Vec<u8>, mtp::DeserializeError> {
-        let writer = Vec::new();
-        let mut decoder = GzDecoder::new(writer);
-        decoder
-            .write_all(&self.packed_data[..])
-            .map_err(|_| mtp::DeserializeError::DecompressionFailed)?;
-        decoder
-            .finish()
-            .map_err(|_| mtp::DeserializeError::DecompressionFailed)
+    /// Reads the `gzip_packed` object `object` from the server (a message's body, or the result in
+    /// an `rpc_result`) and inflates its data, drawing what it inflates on `budget`, the bytes the
+    /// packet it came in may still inflate to ([`MAX_UNPACKED_PER_PACKET`]).
+    ///
+    /// The packed data is read in place. The output's buffer grows with what is inflated, never
+    /// from the size the gzip trailer states: that is the server's claim, and bytes after the gzip
+    /// member aren't read, so the last four bytes needn't even be the trailer. Inflating stops one
+    /// byte past the budget, so the buffer holds at most about twice the budget.
+    ///
+    /// Fails with [`DeserializeError::DecompressionFailed`] if the data isn't valid gzip, or if it
+    /// would inflate past the budget. A failure still draws what was inflated before it, and output
+    /// past the budget exhausts the budget, so failing objects can't repeat the work in one packet.
+    pub fn decompress(object: &[u8], budget: &mut usize) -> Result<Vec<u8>, DeserializeError> {
+        let (constructor_id, bytes) = split_i32(object)?;
+        let constructor_id = constructor_id as u32;
+        if constructor_id != Self::CONSTRUCTOR_ID {
+            return Err(DeserializeError::UnexpectedConstructor { id: constructor_id });
+        }
+        let (packed_data, _) = split_bytes(bytes)?;
+
+        // One byte past the budget, to tell output that fills it exactly from output that is too long.
+        let limit = (*budget as u64).saturating_add(1);
+        let mut unpacked = Vec::new();
+        // On an error, `unpacked` holds what was inflated before it.
+        let read = GzDecoder::new(packed_data)
+            .take(limit)
+            .read_to_end(&mut unpacked);
+
+        let within = unpacked.len() <= *budget;
+        *budget = budget.saturating_sub(unpacked.len());
+        if read.is_err() || !within {
+            return Err(DeserializeError::DecompressionFailed);
+        }
+        Ok(unpacked)
     }
 }
 
@@ -242,18 +356,6 @@ impl Serializable for GzipPacked {
     fn serialize(&self, sink: &mut impl FnMut(&[u8])) {
         Self::CONSTRUCTOR_ID.serialize(sink);
         self.packed_data.serialize(sink);
-    }
-}
-
-impl Deserializable for GzipPacked {
-    fn deserialize(buf: &mut Cursor) -> Result<Self, tl::deserialize::Error> {
-        let constructor_id = u32::deserialize(buf)?;
-        if constructor_id != Self::CONSTRUCTOR_ID {
-            return Err(tl::deserialize::Error::UnexpectedConstructor { id: constructor_id });
-        }
-
-        let packed_data = Vec::<u8>::deserialize(buf)?;
-        Ok(Self { packed_data })
     }
 }
 
@@ -290,7 +392,10 @@ mod tests {
         let _rpc_result_id = &rpc_result[0..4];
         let _msg_id = &rpc_result[4..12];
         let gzipped = &rpc_result[12..rpc_result.len()];
-        let gzip = GzipPacked::from_bytes(gzipped).unwrap();
-        assert_eq!(gzip.decompress().unwrap().len(), 984);
+        let mut budget = MAX_UNPACKED_PER_PACKET;
+        assert_eq!(
+            GzipPacked::decompress(gzipped, &mut budget).unwrap().len(),
+            984
+        );
     }
 }

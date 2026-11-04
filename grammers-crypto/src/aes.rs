@@ -18,10 +18,12 @@ use aes::cipher::{BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
 /// Encrypt the input plaintext in-place using the AES-IGE mode.
 /// The buffer length must be a multiple of 16.
 pub fn ige_encrypt(buffer: &mut [u8], key: &[u8; 32], iv: &[u8; 32]) {
+    // The client's own data, which it pads.
     assert_eq!(buffer.len() % 16, 0);
 
     let cipher = Aes256::new(key.into());
 
+    // The halves of the 32-byte IV, and below, 16-byte chunks: these can't fail.
     let mut iv1: [u8; 16] = iv[0..16].try_into().unwrap();
     let mut iv2: [u8; 16] = iv[16..32].try_into().unwrap();
 
@@ -54,10 +56,13 @@ pub fn ige_encrypt(buffer: &mut [u8], key: &[u8; 32], iv: &[u8; 32]) {
 /// Decrypt the input ciphertext in-place using the AES-IGE mode.
 /// The buffer length must be a multiple of 16.
 pub fn ige_decrypt(buffer: &mut [u8], key: &[u8; 32], iv: &[u8; 32]) {
+    // Callers check the length of the server's ciphertext first (`decrypt_data_v2`, and the key
+    // exchange's `encrypted_answer`), so server data can't reach this.
     assert_eq!(buffer.len() % 16, 0);
 
     let cipher = Aes256::new(key.into());
 
+    // The halves of the 32-byte IV, and below, 16-byte chunks: these can't fail.
     let mut iv1: [u8; 16] = iv[0..16].try_into().unwrap();
     let mut iv2: [u8; 16] = iv[16..32].try_into().unwrap();
 

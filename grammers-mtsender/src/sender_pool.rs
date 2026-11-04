@@ -6,6 +6,17 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+// The pool stores the server's configuration: an option it can't use is skipped, never a panic.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::panic,
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing
+    )
+)]
+
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use std::num::NonZeroU32;
 use std::ops::{ControlFlow, Deref};
@@ -182,7 +193,7 @@ impl SenderPoolHandle {
         dc_id: i32,
         request_body: Vec<u8>,
     ) -> Result<Vec<u8>, InvocationError> {
-        let mut fail_count = NonZeroU32::new(1).unwrap();
+        let mut fail_count = NonZeroU32::MIN;
         let mut slept_so_far = Duration::default();
 
         loop {
@@ -298,8 +309,8 @@ impl SenderPoolRunner {
         loop {
             tokio::select! {
                 biased;
-                completion = self.connection_pool.join_next(), if !self.connection_pool.is_empty() => {
-                    if let Err(err) = completion.unwrap()
+                Some(completion) = self.connection_pool.join_next(), if !self.connection_pool.is_empty() => {
+                    if let Err(err) = completion
                         && let Ok(reason) = err.try_into_panic()
                     {
                         panic::resume_unwind(reason);
@@ -400,12 +411,11 @@ impl SenderPoolRunner {
             self.updates_tx.clone(),
             dc_option.id == self.session.home_dc_id()?,
         ));
-        self.connections.push(ConnectionInfo {
+        Ok(self.connections.push_mut(ConnectionInfo {
             dc_id,
             rpc_tx,
             abort_handle,
-        });
-        Ok(self.connections.last().unwrap())
+        }))
     }
 
     async fn connect_sender(
@@ -464,21 +474,32 @@ impl SenderPoolRunner {
             Err(e) => return Err(e),
         };
 
-        self.update_config(remote_config).await?;
+        self.update_dc_options(&remote_config.dc_options).await?;
 
         Ok(sender)
     }
 
-    async fn update_config(
+    /// Store the addresses of the datacenters in the server's `dc_options`.
+    ///
+    /// An option whose address or port isn't valid is skipped, with a warning: the session keeps
+    /// what it knew of that datacenter.
+    async fn update_dc_options(
         &self,
-        config: tl::types::Config,
+        dc_options: &[tl::enums::DcOption],
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        for option in config
-            .dc_options
+        for option in dc_options
             .iter()
             .map(|tl::enums::DcOption::Option(option)| option)
             .filter(|option| !option.media_only && !option.tcpo_only && option.r#static)
         {
+            let Ok(port) = u16::try_from(option.port) else {
+                warn!(
+                    dc_id = option.id,
+                    port = option.port,
+                    "skipping a datacenter option with an invalid port"
+                );
+                continue;
+            };
             let mut dc_option = self
                 .session
                 .dc_option(option.id)?
@@ -489,23 +510,25 @@ impl SenderPoolRunner {
                     auth_key: None,
                 });
             if option.ipv6 {
-                dc_option.ipv6 = SocketAddrV6::new(
-                    option
-                        .ip_address
-                        .parse()
-                        .expect("Telegram to return a valid IPv6 address"),
-                    option.port as _,
-                    0,
-                    0,
-                );
+                let Ok(ip) = option.ip_address.parse::<Ipv6Addr>() else {
+                    warn!(
+                        dc_id = option.id,
+                        address = option.ip_address,
+                        "skipping a datacenter option with an invalid IPv6 address"
+                    );
+                    continue;
+                };
+                dc_option.ipv6 = SocketAddrV6::new(ip, port, 0, 0);
             } else {
-                dc_option.ipv4 = SocketAddrV4::new(
-                    option
-                        .ip_address
-                        .parse()
-                        .expect("Telegram to return a valid IPv4 address"),
-                    option.port as _,
-                );
+                let Ok(ip) = option.ip_address.parse::<Ipv4Addr>() else {
+                    warn!(
+                        dc_id = option.id,
+                        address = option.ip_address,
+                        "skipping a datacenter option with an invalid IPv4 address"
+                    );
+                    continue;
+                };
+                dc_option.ipv4 = SocketAddrV4::new(ip, port);
                 if dc_option.ipv6.ip().to_bits() == 0 {
                     dc_option.ipv6 = SocketAddrV6::new(
                         dc_option.ipv4.ip().to_ipv6_mapped(),
@@ -586,9 +609,9 @@ impl fmt::Debug for Request {
                 .field("dc_id", dc_id)
                 .field(
                     "request",
-                    &body[..4]
-                        .try_into()
-                        .map(|constructor_id| tl::name_for_id(u32::from_le_bytes(constructor_id)))
+                    &body
+                        .first_chunk()
+                        .map(|constructor_id| tl::name_for_id(u32::from_le_bytes(*constructor_id)))
                         .unwrap_or("?"),
                 )
                 .field("tx", tx)
@@ -612,3 +635,6 @@ impl fmt::Debug for Request {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

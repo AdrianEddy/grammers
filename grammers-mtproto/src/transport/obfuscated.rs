@@ -50,14 +50,19 @@ impl<T: Transport + Tagged> Obfuscated<T> {
             || init[0] == 0xef // Abridged
             || FORBIDDEN_FIRST_INTS.iter().any(|start| start == &init[..4])
         {
+            #[expect(
+                clippy::unwrap_used,
+                reason = "the operating system's random number generator, which nothing here works without; not server data"
+            )]
             getrandom::fill(&mut init).unwrap();
         }
 
+        // Constant ranges of the 64-byte array, which can't panic.
         init[56..60].copy_from_slice(&inner.init_tag());
 
         let mut cipher = ObfuscatedCipher::new(&init);
 
-        let mut encrypted_init = init.to_vec();
+        let mut encrypted_init = init;
         cipher.encrypt(&mut encrypted_init);
         init[56..64].copy_from_slice(&encrypted_init[56..64]);
 
@@ -86,16 +91,17 @@ impl<T: Transport + Tagged> Transport for Obfuscated<T> {
     }
 
     fn unpack(&mut self, buffer: &mut [u8]) -> Result<UnpackedOffset, Error> {
-        if buffer.len() < self.decrypt_tail {
-            panic!("buffer is smaller than what was decrypted");
+        // Only the bytes after those decrypted already. A buffer shorter than that breaks the
+        // trait's contract, and its bytes are then left as they are, to fail in the inner
+        // transport or in the MTP.
+        if let Some(fresh) = buffer.get_mut(self.decrypt_tail..) {
+            self.cipher.decrypt(fresh);
         }
-
-        self.cipher.decrypt(&mut buffer[self.decrypt_tail..]);
         self.decrypt_tail = buffer.len();
 
         match self.inner.unpack(buffer) {
             Ok(offset) => {
-                self.decrypt_tail -= offset.next_offset;
+                self.decrypt_tail = self.decrypt_tail.saturating_sub(offset.next_offset);
                 Ok(offset)
             }
             Err(e) => Err(e),

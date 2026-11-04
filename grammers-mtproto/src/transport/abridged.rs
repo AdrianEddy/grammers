@@ -66,40 +66,38 @@ impl Transport for Abridged {
     }
 
     fn unpack(&mut self, buffer: &mut [u8]) -> Result<UnpackedOffset, Error> {
-        if buffer.is_empty() {
+        let Some(&first) = buffer.first() else {
             return Err(Error::MissingBytes);
-        }
-
-        let header_len;
-        let len = buffer[0];
-        let len = if len < 127 {
-            header_len = 1;
-            len as i32
-        } else {
-            if buffer.len() < 4 {
-                return Err(Error::MissingBytes);
-            }
-
-            header_len = 4;
-            i32::from_le_bytes(buffer[0..4].try_into().unwrap()) >> 8
         };
 
-        let len = len * 4;
-        if (buffer.len() as i32) < header_len + len {
-            return Err(Error::MissingBytes);
-        }
+        // The length in 4-byte words: the first byte below 127, otherwise the three bytes after
+        // it, unsigned, so at most 2^24 - 1 words.
+        let (header_len, words) = if first < 127 {
+            (1, usize::from(first))
+        } else {
+            let Some(header) = buffer.first_chunk::<4>() else {
+                return Err(Error::MissingBytes);
+            };
+            (4, (u32::from_le_bytes(*header) >> 8) as usize)
+        };
 
-        if header_len == 1 && len >= 4 {
-            let data = i32::from_le_bytes(buffer[1..5].try_into().unwrap());
-            if data < 0 {
+        let len = words * 4;
+        let Some(data) = buffer.get(header_len..header_len + len) else {
+            return Err(Error::MissingBytes);
+        };
+
+        // A transport error is a packet of exactly one negative `int`, the error code (shorter
+        // than any MTProto message): the first `int` of a longer packet is just data.
+        if header_len == 1
+            && let Ok(code) = <[u8; 4]>::try_from(data)
+        {
+            let code = i32::from_le_bytes(code);
+            if code < 0 {
                 return Err(Error::BadStatus {
-                    status: (-data) as u32,
+                    status: code.wrapping_neg() as u32,
                 });
             }
         }
-
-        let header_len = header_len as usize;
-        let len = len as usize;
 
         Ok(UnpackedOffset {
             data_range: header_len..header_len + len,

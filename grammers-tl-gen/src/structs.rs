@@ -271,6 +271,10 @@ fn write_serializable<W: Write>(
 ///     }
 /// }
 /// ```
+///
+/// A bare type that can contain itself without a boxed type in between
+/// (`Metadata::is_bare_recursive_def`) runs its body one level deeper through `Cursor::nested`, as
+/// every boxed type does (`enums::write_deserializable`).
 fn write_deserializable<W: Write>(
     file: &mut W,
     indent: &str,
@@ -291,6 +295,14 @@ fn write_deserializable<W: Write>(
         indent,
         if def.params.is_empty() { "_" } else { "" }
     )?;
+    let outer = indent;
+    let nested = metadata.is_bare_recursive_def(def);
+    let indent = &if nested {
+        writeln!(file, "{outer}        buf.nested(|buf| {{")?;
+        format!("{outer}    ")
+    } else {
+        outer.to_owned()
+    };
 
     for param in def.params.iter() {
         write!(file, "{indent}        ")?;
@@ -363,8 +375,11 @@ fn write_deserializable<W: Write>(
         }
     }
     writeln!(file, "{indent}        }})")?;
-    writeln!(file, "{indent}    }}")?;
-    writeln!(file, "{indent}}}")?;
+    if nested {
+        writeln!(file, "{outer}        }})")?;
+    }
+    writeln!(file, "{outer}    }}")?;
+    writeln!(file, "{outer}}}")?;
     Ok(())
 }
 

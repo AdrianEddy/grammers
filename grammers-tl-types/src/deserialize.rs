@@ -12,6 +12,18 @@ use std::fmt;
 
 use crate::Identifiable;
 
+/// The deepest nesting of objects that deserialization accepts: each boxed object counts one
+/// level, and so does each bare object of a type that can contain itself without a boxed type in
+/// between.
+///
+/// Deserialization recurses on the native stack, and a stack overflow aborts the process, which no
+/// caller can catch: without a limit, a few kilobytes of nested `textBold` overflow a 2 MiB thread.
+/// At the limit, the costliest cycle measured (a `messageMediaPoll` whose `attached_media` is
+/// another one) needs about 1 MiB of stack in a debug build and 0.4 MiB in a release one, within
+/// the 2 MiB of a tokio worker. 100 is the limit protobuf and prost use; real data stays far below
+/// it (a deep Instant View page nests a few tens of objects).
+pub const MAX_DEPTH: u32 = 100;
+
 /// Errors that can be produced by [`Cursor`].
 #[derive(Clone, Debug, PartialEq)]
 pub enum Error {
@@ -36,6 +48,9 @@ pub enum Error {
         /// The unexpected constructor identifier.
         id: u32,
     },
+
+    /// The data nests objects deeper than [`MAX_DEPTH`].
+    TooDeep,
 }
 
 impl std::error::Error for Error {}
@@ -45,6 +60,7 @@ impl fmt::Display for Error {
         match *self {
             Self::UnexpectedEof => write!(f, "unexpected eof"),
             Self::UnexpectedConstructor { id } => write!(f, "unexpected constructor: {id:08x}"),
+            Self::TooDeep => write!(f, "objects nested deeper than {MAX_DEPTH} levels"),
         }
     }
 }
@@ -54,12 +70,36 @@ impl fmt::Display for Error {
 pub struct Cursor<'a> {
     buf: &'a [u8],
     pos: usize,
+    /// How many objects deep the deserialization is, at most [`MAX_DEPTH`].
+    depth: u32,
 }
 
 impl<'a> Cursor<'a> {
     /// Constructors a cursor from a slice of bytes.
     pub fn from_slice(buf: &'a [u8]) -> Self {
-        Self { buf, pos: 0 }
+        Self {
+            buf,
+            pos: 0,
+            depth: 0,
+        }
+    }
+
+    /// Runs `f`, which deserializes one object, one level deeper, or fails with
+    /// [`Error::TooDeep`] at [`MAX_DEPTH`].
+    ///
+    /// The generated deserializer of every boxed type runs its body in it, and so does that of a
+    /// bare type that can contain itself without a boxed type in between, so every recursion
+    /// through the definitions passes through it. A hand-written [`Deserializable`] of a type
+    /// that can contain itself must run its body in it too. The level is released on every exit,
+    /// so the items of a vector each start at their parent's depth.
+    pub fn nested<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        if self.depth >= MAX_DEPTH {
+            return Err(Error::TooDeep);
+        }
+        self.depth += 1;
+        let result = f(self);
+        self.depth -= 1;
+        result
     }
 
     // TODO not a fan we need to expose this (and a way to create `Cursor`),
@@ -350,7 +390,7 @@ impl<T: Deserializable> Deserializable for Vec<T> {
             return Err(Error::UnexpectedConstructor { id });
         }
         let len = u32::deserialize(buf)?;
-        (0..len).map(|_| T::deserialize(buf)).collect()
+        read_items(buf, len)
     }
 }
 
@@ -370,12 +410,21 @@ impl<T: Deserializable> Deserializable for crate::RawVec<T> {
     /// ```
     fn deserialize(buf: Buffer) -> Result<Self> {
         let len = u32::deserialize(buf)?;
-        Ok(Self(
-            (0..len)
-                .map(|_| T::deserialize(buf))
-                .collect::<Result<Vec<T>>>()?,
-        ))
+        read_items(buf, len).map(Self)
     }
+}
+
+/// Reads a vector's `len` items. A plain loop, because a vector of a type that can contain
+/// itself (`Vector<PageBlock>`) is on the recursion's path: a loop keeps one item's temporaries
+/// on the stack per level, where a `collect` through iterator adapters keeps several in a debug
+/// build. As that `collect` did, it doesn't reserve the `len` the data claims; the vector grows
+/// with the items read.
+fn read_items<T: Deserializable>(buf: Buffer, len: u32) -> Result<Vec<T>> {
+    let mut items = Vec::new();
+    for _ in 0..len {
+        items.push(T::deserialize(buf)?);
+    }
+    Ok(items)
 }
 
 impl Deserializable for String {

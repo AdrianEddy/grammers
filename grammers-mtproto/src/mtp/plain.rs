@@ -105,16 +105,18 @@ impl Mtp for Plain {
         if len <= 0 {
             return Err(DeserializeError::NegativeMessageLength { got: len });
         }
-        if (20 + len) as usize > payload.len() {
-            return Err(DeserializeError::TooLongMessageLength {
+        // The header is the 20 bytes `check_message_buffer` asked for; the length is the server's.
+        let data = payload.get(20..).unwrap_or_default();
+        let body = data
+            .get(..len as usize)
+            .ok_or(DeserializeError::TooLongMessageLength {
                 got: len as usize,
-                max_length: payload.len() - 20,
-            });
-        }
+                max_length: data.len(),
+            })?;
 
         Ok(vec![Deserialization::RpcResult(RpcResult {
             msg_id: MsgId(0),
-            body: payload[20..20 + len as usize].into(),
+            body: body.into(),
         })])
     }
 }

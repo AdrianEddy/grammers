@@ -34,6 +34,17 @@
 //! }
 //! ```
 
+// Every step reads the server's answer: unexpected values are an `Error`, never a panic.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::panic,
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing
+    )
+)]
+
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -85,6 +96,12 @@ pub enum Error {
     InvalidPqSize {
         /// The unexpected size that we got.
         size: usize,
+    },
+
+    /// The server's PQ number isn't the product of two factors that could be found.
+    InvalidPq {
+        /// The number that we got.
+        pq: u64,
     },
 
     /// None of the server fingerprints are known to us.
@@ -153,6 +170,10 @@ pub enum Error {
         /// The expected nonce.
         expected: [u8; 16],
     },
+
+    /// The operating system's random number generator failed, which the key exchange's secrets
+    /// need.
+    Random(getrandom::Error),
 }
 
 impl std::error::Error for Error {}
@@ -164,6 +185,7 @@ impl fmt::Display for Error {
                 write!(f, "invalid nonce: got {got:?}, expected {expected:?}")
             }
             Self::InvalidPqSize { size } => write!(f, "invalid pq size {size}"),
+            Self::InvalidPq { pq } => write!(f, "could not factorize pq {pq}"),
             Self::UnknownFingerprints { fingerprints } => {
                 write!(f, "all server fingerprints are unknown: {fingerprints:?}")
             }
@@ -194,6 +216,7 @@ impl fmt::Display for Error {
                 f,
                 "invalid new nonce hash: got {got:?}, expected {expected:?}"
             ),
+            Self::Random(error) => write!(f, "random number generation failed: {error}"),
         }
     }
 }
@@ -221,11 +244,8 @@ pub struct Step3 {
 
 /// The first step of the process to generate an Authorization Key.
 pub fn step1() -> Result<(tl::functions::ReqPqMulti, Step1), Error> {
-    let random_bytes = {
-        let mut buffer = [0; 16];
-        getrandom::fill(&mut buffer).expect("failed to generate secure data for auth key");
-        buffer
-    };
+    let mut random_bytes = [0; 16];
+    getrandom::fill(&mut random_bytes).map_err(Error::Random)?;
 
     if TRACE_AUTH_GEN {
         println!("r {}", hex::to_hex(&random_bytes));
@@ -254,17 +274,17 @@ pub fn step2(
         println!("< {}", hex::to_hex(&response.to_bytes()));
     }
 
-    let random_bytes = {
-        let mut buffer = [0; 32 + 224];
-        getrandom::fill(&mut buffer).expect("failed to generate secure data for auth key");
-        buffer
-    };
+    // The new nonce, then the random bytes the RSA padding takes.
+    let mut new_nonce = [0; 32];
+    let mut rsa_random = [0; 224];
+    getrandom::fill(&mut new_nonce).map_err(Error::Random)?;
+    getrandom::fill(&mut rsa_random).map_err(Error::Random)?;
 
     if TRACE_AUTH_GEN {
-        println!("r {}", hex::to_hex(&random_bytes));
+        println!("r {}{}", hex::to_hex(&new_nonce), hex::to_hex(&rsa_random));
     }
 
-    let res = do_step2(data, response, &random_bytes);
+    let res = do_step2(data, response, &new_nonce, &rsa_random);
     if TRACE_AUTH_GEN && let Ok((x, _)) = &res {
         println!("> {}", hex::to_hex(&x.to_bytes()));
     }
@@ -274,7 +294,8 @@ pub fn step2(
 fn do_step2(
     data: Step1,
     response: tl::enums::ResPq,
-    random_bytes: &[u8; 32 + 224],
+    new_nonce: &[u8; 32],
+    random_bytes: &[u8; 224],
 ) -> Result<(tl::functions::ReqDhParams, Step2), Error> {
     // Step 2. Validate the PQ response. Return `(p, q)` if it's valid.
     let Step1 { nonce } = data;
@@ -282,48 +303,20 @@ fn do_step2(
 
     check_nonce(&res_pq.nonce, &nonce)?;
 
-    if res_pq.pq.len() != 8 {
+    let Ok(pq) = <[u8; 8]>::try_from(res_pq.pq.as_slice()) else {
         return Err(Error::InvalidPqSize {
             size: res_pq.pq.len(),
         });
-    }
-
-    let pq = {
-        let mut buffer = [0; 8];
-        buffer.copy_from_slice(&res_pq.pq);
-        u64::from_be_bytes(buffer)
     };
+    let pq = u64::from_be_bytes(pq);
 
-    let (p, q) = factorize(pq);
-    let new_nonce = {
-        let mut buffer = [0; 32];
-        buffer.copy_from_slice(&random_bytes[..32]);
-        buffer
-    };
-
-    // Remove the now-used first part from our available random data.
-    let random_bytes = {
-        let mut buffer = [0; 224];
-        buffer.copy_from_slice(&random_bytes[32..]);
-        buffer
-    };
+    let (p, q) = factorize(pq).ok_or(Error::InvalidPq { pq })?;
+    let new_nonce = *new_nonce;
 
     // Convert (p, q) to bytes using the least amount of space possible.
     // If we don't do this, Telegram will respond with -404 as the message.
-    let p_bytes = {
-        let mut buffer = p.to_be_bytes().to_vec();
-        if let Some(pos) = buffer.iter().position(|&b| b != 0) {
-            buffer = buffer[pos..].to_vec();
-        }
-        buffer
-    };
-    let q_bytes = {
-        let mut buffer = q.to_be_bytes().to_vec();
-        if let Some(pos) = buffer.iter().position(|&b| b != 0) {
-            buffer = buffer[pos..].to_vec();
-        }
-        buffer
-    };
+    let p_bytes = minimal_be_bytes(p);
+    let q_bytes = minimal_be_bytes(q);
 
     // "pq is a representation of a natural number (in binary big endian format)"
     // https://core.telegram.org/mtproto/auth_key#dh-exchange-initiation
@@ -338,23 +331,17 @@ fn do_step2(
     .to_bytes();
 
     // sha_digest + data + random_bytes
-    let fingerprint = match res_pq
+    let Some((fingerprint, key)) = res_pq
         .server_public_key_fingerprints
         .iter()
-        .cloned()
-        .find(|&fingerprint| key_for_fingerprint(fingerprint).is_some())
-    {
-        Some(x) => x,
-        None => {
-            return Err(Error::UnknownFingerprints {
-                fingerprints: res_pq.server_public_key_fingerprints.clone(),
-            });
-        }
+        .find_map(|&fingerprint| key_for_fingerprint(fingerprint).map(|key| (fingerprint, key)))
+    else {
+        return Err(Error::UnknownFingerprints {
+            fingerprints: res_pq.server_public_key_fingerprints.clone(),
+        });
     };
 
-    // Safe to unwrap because we found it just above
-    let key = key_for_fingerprint(fingerprint).unwrap();
-    let ciphertext = rsa::encrypt_hashed(&pq_inner_data, &key, &random_bytes);
+    let ciphertext = rsa::encrypt_hashed(&pq_inner_data, &key, random_bytes);
 
     Ok((
         tl::functions::ReqDhParams {
@@ -382,22 +369,23 @@ pub fn step3(
         println!("< {}", hex::to_hex(&response.to_bytes()));
     }
 
-    let random_bytes = {
-        let mut buffer = [0; 256 + 16];
-        getrandom::fill(&mut buffer).expect("failed to generate secure data for auth key");
-        buffer
-    };
+    // The secret `b`, then the random bytes that pad the client's answer.
+    let mut b = [0; 256];
+    let mut padding = [0; 16];
+    getrandom::fill(&mut b).map_err(Error::Random)?;
+    getrandom::fill(&mut padding).map_err(Error::Random)?;
 
     if TRACE_AUTH_GEN {
-        println!("r {}", hex::to_hex(&random_bytes));
+        println!("r {}{}", hex::to_hex(&b), hex::to_hex(&padding));
     }
 
+    // A clock set before the epoch reads as the epoch; the time offset makes up for it.
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("system time is before epoch")
+        .unwrap_or_default()
         .as_secs() as i32;
 
-    let res = do_step3(data, response, &random_bytes, now);
+    let res = do_step3(data, response, &b, &padding, now);
     if TRACE_AUTH_GEN && let Ok((x, _)) = &res {
         println!("> {}", hex::to_hex(&x.to_bytes()));
     }
@@ -407,7 +395,8 @@ pub fn step3(
 fn do_step3(
     data: Step2,
     response: tl::enums::ServerDhParams,
-    random_bytes: &[u8; 256 + 16],
+    b: &[u8; 256],
+    padding: &[u8; 16],
     now: i32,
 ) -> Result<(tl::functions::SetClientDhParams, Step3), Error> {
     let Step2 {
@@ -425,16 +414,13 @@ fn do_step3(
             check_nonce(&server_dh_params.nonce, &nonce)?;
             check_server_nonce(&server_dh_params.server_nonce, &server_nonce)?;
 
-            let sha = {
+            let sha: [u8; 20] = {
                 let mut hasher = Sha1::new();
                 hasher.update(new_nonce);
-                hasher.finalize()
+                hasher.finalize().into()
             };
-            let new_nonce_hash = {
-                let mut buffer = [0; 16];
-                buffer.copy_from_slice(&sha[4..20]);
-                buffer
-            };
+            // The lower 128 bits of the hash.
+            let [_, _, _, _, new_nonce_hash @ ..] = sha;
             check_new_nonce_hash(&server_dh_params.new_nonce_hash, &new_nonce_hash)?;
 
             return Err(Error::DhParamsFail);
@@ -458,23 +444,30 @@ fn do_step3(
     grammers_crypto::aes::ige_decrypt(&mut server_dh_params.encrypted_answer, &key, &iv);
     let plain_text_answer = server_dh_params.encrypted_answer;
 
-    let got_answer_hash = {
-        let mut buffer = [0; 20];
-        buffer.copy_from_slice(&plain_text_answer[..20]);
-        buffer
+    let Some((got_answer_hash, answer)) = plain_text_answer.split_first_chunk::<20>() else {
+        return Err(Error::InvalidDhInnerData {
+            error: tl::deserialize::Error::UnexpectedEof,
+        });
     };
+    let got_answer_hash = *got_answer_hash;
 
     // Use a cursor explicitly so we know where it ends (and most importantly
     // where the padding starts).
-    let mut plain_text_cursor = Cursor::from_slice(&plain_text_answer[20..]);
+    let mut plain_text_cursor = Cursor::from_slice(answer);
     let server_dh_inner = match tl::enums::ServerDhInnerData::deserialize(&mut plain_text_cursor) {
         Ok(tl::enums::ServerDhInnerData::Data(x)) => x,
         Err(error) => return Err(Error::InvalidDhInnerData { error }),
     };
 
+    // The cursor read this many bytes of `answer`.
+    let Some((inner_data, _padding)) = answer.split_at_checked(plain_text_cursor.pos()) else {
+        return Err(Error::InvalidDhInnerData {
+            error: tl::deserialize::Error::UnexpectedEof,
+        });
+    };
     let expected_answer_hash = {
         let mut hasher = Sha1::new();
-        hasher.update(&plain_text_answer[20..20 + plain_text_cursor.pos()]);
+        hasher.update(inner_data);
         hasher.finalize().into()
     };
 
@@ -494,27 +487,21 @@ fn do_step3(
             return Err(Error::InvalidG(server_dh_inner.g));
         }
 
-        if !check_dh_prime(&dh_prime, server_dh_inner.g).unwrap() {
+        if !check_dh_prime(&dh_prime, server_dh_inner.g) {
             return Err(Error::InvalidDhPrime);
         }
     }
 
-    // Safe to unwrap because the numbers are valid
+    // `g` is in 2..=7 and `dh_prime` a 2048-bit number: the current ones, or checked above.
     let g = BigUint::from(server_dh_inner.g as u32);
     let g_a = BigUint::from_bytes_be(&server_dh_inner.g_a);
 
-    let time_offset = server_dh_inner.server_time - now;
+    // The server's time is its own; seconds wrap in message IDs anyway.
+    let time_offset = server_dh_inner.server_time.wrapping_sub(now);
 
-    let b = BigUint::from_bytes_be(&random_bytes[..256]);
+    let b = BigUint::from_bytes_be(b);
     let g_b = g.modpow(&b, &dh_prime);
     let gab = g_a.modpow(&b, &dh_prime);
-
-    // Remove the now-used first part from our available random data.
-    let random_bytes = {
-        let mut buffer = [0u8; 16];
-        buffer.copy_from_slice(&random_bytes[256..]);
-        buffer
-    };
 
     // IMPORTANT: Apart from the conditions on the Diffie-Hellman prime
     // dh_prime and generator g, both sides are to check that g, g_a and
@@ -551,7 +538,7 @@ fn do_step3(
         // Make sure we pad it ourselves, or else `encrypt_ige` will,
         // introducing randomness.
         let pad_len = (16 - (buffer.len() % 16)) % 16;
-        buffer.extend(&random_bytes[..pad_len]);
+        buffer.extend(padding.iter().take(pad_len));
 
         buffer
     };
@@ -635,8 +622,15 @@ pub fn create_key(
     let auth_key = {
         let mut buffer = [0; 256];
         let gab_bytes = gab.to_bytes_be();
-        let skip = buffer.len() - gab_bytes.len(); // gab might need less than 256 bytes
-        buffer[skip..].copy_from_slice(&gab_bytes);
+        // gab is below the 2048-bit `dh_prime`, but might need less than 256 bytes.
+        let Some(key) = buffer
+            .len()
+            .checked_sub(gab_bytes.len())
+            .and_then(|skip| buffer.get_mut(skip..))
+        else {
+            return Err(Error::InvalidDhPrime);
+        };
+        key.copy_from_slice(&gab_bytes);
         AuthKey::from_bytes(buffer)
     };
 
@@ -644,11 +638,12 @@ pub fn create_key(
     check_new_nonce_hash(&dh_gen.new_nonce_hash, &new_nonce_hash)?;
 
     let first_salt = {
+        // The first 8 bytes of each nonce, as many as `buffer` takes.
         let mut buffer = [0; 8];
         buffer
             .iter_mut()
-            .zip(&new_nonce[..8])
-            .zip(&server_nonce[..8])
+            .zip(&new_nonce)
+            .zip(&server_nonce)
             .for_each(|((x, a), b)| *x = a ^ b);
         i64::from_le_bytes(buffer)
     };
@@ -723,18 +718,36 @@ fn check_g_in_range(value: &BigUint, low: &BigUint, high: &BigUint) -> Result<()
     }
 }
 
+/// `n` in big-endian order, without its leading zero bytes.
+fn minimal_be_bytes(n: u64) -> Vec<u8> {
+    let leading_zero_bytes = (n.leading_zeros() / 8) as usize;
+    n.to_be_bytes()
+        .into_iter()
+        .skip(leading_zero_bytes)
+        .collect()
+}
+
 /// Find the RSA key's `(n, e)` pair for a certain fingerprint.
 #[allow(clippy::unreadable_literal)]
 fn key_for_fingerprint(fingerprint: i64) -> Option<rsa::Key> {
     Some(match fingerprint {
         // Production
-        -3414540481677951611 => rsa::Key::new("29379598170669337022986177149456128565388431120058863768162556424047512191330847455146576344487764408661701890505066208632169112269581063774293102577308490531282748465986139880977280302242772832972539403531316010870401287642763009136156734339538042419388722777357134487746169093539093850251243897188928735903389451772730245253062963384108812842079887538976360465290946139638691491496062099570836476454855996319192747663615955633778034897140982517446405334423701359108810182097749467210509584293428076654573384828809574217079944388301239431309115013843331317877374435868468779972014486325557807783825502498215169806323", "65537").unwrap(),
+        -3414540481677951611 => rsa::Key::new(
+            "29379598170669337022986177149456128565388431120058863768162556424047512191330847455146576344487764408661701890505066208632169112269581063774293102577308490531282748465986139880977280302242772832972539403531316010870401287642763009136156734339538042419388722777357134487746169093539093850251243897188928735903389451772730245253062963384108812842079887538976360465290946139638691491496062099570836476454855996319192747663615955633778034897140982517446405334423701359108810182097749467210509584293428076654573384828809574217079944388301239431309115013843331317877374435868468779972014486325557807783825502498215169806323",
+            "65537",
+        )?,
         // Test
-        -5595554452916591101 => rsa::Key::new("25342889448840415564971689590713473206898847759084779052582026594546022463853940585885215951168491965708222649399180603818074200620463776135424884632162512403163793083921641631564740959529419359595852941166848940585952337613333022396096584117954892216031229237302943701877588456738335398602461675225081791820393153757504952636234951323237820036543581047826906120927972487366805292115792231423684261262330394324750785450942589751755390156647751460719351439969059949569615302809050721500330239005077889855323917509948255722081644689442127297605422579707142646660768825302832201908302295573257427896031830742328565032949", "65537").unwrap(),
+        -5595554452916591101 => rsa::Key::new(
+            "25342889448840415564971689590713473206898847759084779052582026594546022463853940585885215951168491965708222649399180603818074200620463776135424884632162512403163793083921641631564740959529419359595852941166848940585952337613333022396096584117954892216031229237302943701877588456738335398602461675225081791820393153757504952636234951323237820036543581047826906120927972487366805292115792231423684261262330394324750785450942589751755390156647751460719351439969059949569615302809050721500330239005077889855323917509948255722081644689442127297605422579707142646660768825302832201908302295573257427896031830742328565032949",
+            "65537",
+        )?,
 
-        _ => return None
+        _ => return None,
     })
 }
+
+#[cfg(test)]
+mod server_data_tests;
 
 #[cfg(test)]
 mod tests {
@@ -750,14 +763,14 @@ mod tests {
         let step1_response = hex::from_hex(
             "632416054e44b426241e8b839153122d44585ac665ba0b393e1094329eda2c42d62833030819546f942a11278d00000015c4b51c0300000003268d20df9858b2029f4ba16d109296216be86c022bb4c3",
         );
-        let step2_random = hex::from_hex("b9dce68b05ef760fa7edfefeff45aaa8afbac11dc3d333bc3132fd16ab816d63ed93c5bef9d0452add8164a2d5df5804277ee5a06fd4523372707ddbd8106d03766d76fb8bec672bdcddcd225f7766b83663b32a0fda1055175c5582edd10430937666be4fd15510ba5f19aa645973b6e4e9270efac25b58741635fe84dd0af07a4686f750bf34de1073f1e7fa24e9b01a76e537504bd52b8195e5b78c9af2baa982454e1a99eeae0f35944089ad12726d2433a2c18c9698a725364f9c4e939ce4f1aee3891e58b85de90c88cc2eaef5db1841a594c0edc13cb4b7480a7e564fe892f82282d03ed07eb5ceac6644247bb137241166fe194756dfcffd68c6c345").as_slice().try_into().unwrap();
+        let step2_random: [u8; 256] = hex::from_hex("b9dce68b05ef760fa7edfefeff45aaa8afbac11dc3d333bc3132fd16ab816d63ed93c5bef9d0452add8164a2d5df5804277ee5a06fd4523372707ddbd8106d03766d76fb8bec672bdcddcd225f7766b83663b32a0fda1055175c5582edd10430937666be4fd15510ba5f19aa645973b6e4e9270efac25b58741635fe84dd0af07a4686f750bf34de1073f1e7fa24e9b01a76e537504bd52b8195e5b78c9af2baa982454e1a99eeae0f35944089ad12726d2433a2c18c9698a725364f9c4e939ce4f1aee3891e58b85de90c88cc2eaef5db1841a594c0edc13cb4b7480a7e564fe892f82282d03ed07eb5ceac6644247bb137241166fe194756dfcffd68c6c345").as_slice().try_into().unwrap();
         let step2_request = hex::from_hex(
             "bee412d74e44b426241e8b839153122d44585ac665ba0b393e1094329eda2c42d62833030444b2e50d000000045e63ac8100000003268d20df9858b2fe0001007ec37ca8a84aa1b26d21bc8ac28b261ffa57b44e29f0d6722261e9b436059cc80ae9768a3ae4fbefe46cfbb76b88a1f80a1ebd95ae5d17bf655ed1015755e04c483a01cf4094a0830864054a71a0ac8a5ec34d6b24a69bf66c9654b32a8c65b0302718351b28f72a9a49610d5259b6edb6da37acc5fedc47d1a09c58df2c7eccbfaf54dfe123ebc253d9069f74e8be128051e5d280b3c9a5e8d3c6da344cb7374a6d410d4e088cc0eda3d8b1108ba4f4a85d79fbd2758000723780bc5459f59fd1cea1b511b77cc1411781d3feb57b14a97726cf3d2146cf43e648a69ff9cb5d48a31f543bd5bc3a023cf382d86d36bbfbbcb5e4a136acee25fd8e3e597e714d",
         );
         let step2_response = hex::from_hex(
             "5c07e8d04e44b426241e8b839153122d44585ac665ba0b393e1094329eda2c42d6283303fe500200fd064e91012ade621b26a48ac7dc8b2c8670ed67092a00fe8c936483e4b02822c3cc655aaffe00542e311df5abdaa645b1da85ca50a6c7b0e7cc7cb2b23d42c84e288bb3b5cfe313e1ebafe19833916df4d1f58dba62e0ac49cac17a31b8b0d57d43eefda546d67e80e311c4b213adec9635c73f75a18ffb26fb71391523bd5ddfcc8be51b36d6b2552394c511ec935d53811a981baca62a2b58cbfe96f1b35e118e5e17456994aea931839925c4578f281f3f129d28026ec80224617a9ca8c615a12fba9c53e774476567f07b01a59d2e6635e39c16dc0a54679f3b54b0482f1cbeac821147d93d7365f4e23fb5794eb5fd4ffdc6456638ea32f641f49ee705e7b0da71cb75753e2f4f80d5af07edb017948f332e34a9c5886b0c86281e0e7228d5a652a9faaf819f7686c099186169aaa377c136fac57b69b7f7b383aaece652f8dcb14e0dfb23e2a65330307a74c31c508cc504450fa208eee14d8bbead1c1f90ccfc183ae1d3345c62424ea3477776204e8fe69efbb6a27b168913d3babaca30aa1c9589d6655b2ad4cd59f67e9b3957ab3270d70afab9bd488a6c5f39ca739ca8947def00cdb8812152731710f5108235775a019d3b4986d6b720b05167b4ee731a10a29fc1e03c42e99d8ff5cf64f45070c2f5ce485ea5fddc281728b6e4d0dea561c9097e3f8a54b055b0c069a9f8207520f6429eb5225c985e3379f2cf6754f56d414fcd00d502e69223b911b915978e0890a9ef128715b828bf3fda3fee6c7b9b2621d971a6f7820f89f4c4c2ab29dec00007c3ec6cead64f7f5802d5e6a4a16a185cfbfced5351fa68380e",
         );
-        let step3_random = hex::from_hex("8fc3605a4604cbb5461fdeff439c761150083cdd502550558e92c730d46c9caf0b1b2d64d2c264942c50d98694fff604fdd2bd87f2cafb719bc55e65a1f60b08809660a650721c40d56fc9c792df1d463aad1718c6924b7bdffbe395f14633d33fc38ce47c18a1561b83a5c66d29f9e292637127471c3baab0028ae42796b689e53a7f9ab5f0ee6d3fb658d847c1abca509fc4ed0d45edbb1c946488910d8d78fa0767255b57a7c3898da8d26625bde40c5a0e80b581408ecd95a17d396dc7574a8ed3cbc4c085197ffaad29c18e577eb292aa8b98caa92efd6f9536049b5a7defc861e270eca90c55b9585405cb96f3e6ea754850b09e7a59ba5fd92d357982915d39752aaa2ec16b6cbde6a6c33971").as_slice().try_into().unwrap();
+        let step3_random: [u8; 272] = hex::from_hex("8fc3605a4604cbb5461fdeff439c761150083cdd502550558e92c730d46c9caf0b1b2d64d2c264942c50d98694fff604fdd2bd87f2cafb719bc55e65a1f60b08809660a650721c40d56fc9c792df1d463aad1718c6924b7bdffbe395f14633d33fc38ce47c18a1561b83a5c66d29f9e292637127471c3baab0028ae42796b689e53a7f9ab5f0ee6d3fb658d847c1abca509fc4ed0d45edbb1c946488910d8d78fa0767255b57a7c3898da8d26625bde40c5a0e80b581408ecd95a17d396dc7574a8ed3cbc4c085197ffaad29c18e577eb292aa8b98caa92efd6f9536049b5a7defc861e270eca90c55b9585405cb96f3e6ea754850b09e7a59ba5fd92d357982915d39752aaa2ec16b6cbde6a6c33971").as_slice().try_into().unwrap();
         let step3_request = hex::from_hex(
             "1f5f04f54e44b426241e8b839153122d44585ac665ba0b393e1094329eda2c42d6283303fe500100def448d48c608480bab65df3f8990be8011f7b415a6f8113617bea749b8b0ea6a937987b18cc4dcce8197efdcf8d6ec6af7fc3364b4945df77e4a1ae9db7acea4abcd73247edb36bde20fc969c1d55717277afe0bc31a9ee99f7d822f91fa2dc69c868a19511b162d55e0814d0292b7708b67d57eb04569349d5a20ffe85c0141fc17e9bbbaf207bef56e66decda718c52c45273f868c2eff89bb06355cd515fbfe123d719b244234867d2889c9d0e4436ba644076e5014a78af60b2f0e1b30285f4f71539bcf8c506ccafd62cfcd1b040fe5e35bb30e519ad56d753100f604e3ea5d02409d74dd3ab0861227410f1e13591cf2a638347e6c6d0bcae14e0e8753313b51daee40a67407b5cc8b213856a290a0c7b6cda9ff9c58d69faaf6a748cff05512b69f1380f7a36843edecdc764048bc16d9808f353a9caf6d49ca8b717c8f6de037518a444931a7da2b80f16d0",
         );
@@ -772,12 +785,14 @@ mod tests {
         assert_eq!(request.to_bytes(), step1_request);
         let response = tl::enums::ResPq::from_bytes(&step1_response).unwrap();
 
-        let (request, data) = do_step2(data, response, &step2_random)?;
+        let (new_nonce, rsa_random) = step2_random.split_first_chunk::<32>().unwrap();
+        let (request, data) = do_step2(data, response, new_nonce, rsa_random.try_into().unwrap())?;
         assert_eq!(request.to_bytes(), step2_request);
         let response = tl::enums::ServerDhParams::from_bytes(&step2_response).unwrap();
 
         let step3_now = 1693436740;
-        let (request, data) = do_step3(data, response, &step3_random, step3_now)?;
+        let (b, padding) = step3_random.split_first_chunk::<256>().unwrap();
+        let (request, data) = do_step3(data, response, b, padding.try_into().unwrap(), step3_now)?;
         assert_eq!(request.to_bytes(), step3_request);
         let response = tl::enums::SetClientDhParamsAnswer::from_bytes(&step3_response).unwrap();
 

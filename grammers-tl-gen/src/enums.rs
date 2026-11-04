@@ -247,13 +247,32 @@ fn write_serializable<W: Write>(
 /// impl crate::Deserializable for Name {
 ///     fn deserialize(buf: crate::deserialize::Buffer) -> crate::deserialize::Result<Self> {
 ///         use crate::Identifiable;
-///         Ok(match u32::deserialize(buf)? {
-///             crate::types::Name::CONSTRUCTOR_ID => Self::Variant(crate::types::Name::deserialize(buf)?),
-///             _ => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, ...)),
+///         buf.nested(|buf| {
+///             let id = u32::deserialize(buf)?;
+///             match id {
+///                 crate::types::A::CONSTRUCTOR_ID => Ok(Self::A), // no parameters
+///                 crate::types::B::CONSTRUCTOR_ID => crate::types::B::deserialize(buf)
+///                     .map(Self::B),
+///                 crate::types::C::CONSTRUCTOR_ID => crate::types::C::deserialize(buf)
+///                     .map(|x| Self::C(Box::new(x))), // recursive
+///                 _ => Err(crate::deserialize::Error::UnexpectedConstructor { id }),
+///             }
 ///         })
 ///     }
 /// }
 /// ```
+///
+/// The body runs one level deeper through `Cursor::nested`, which fails at `MAX_DEPTH`, so nested
+/// objects can't exhaust the stack: every recursion through the definitions passes through a boxed
+/// type, or through a bare type that `structs::write_deserializable` guards the same way. Every
+/// boxed type is guarded, not only those `Metadata::is_recursive_def` boxes: a cycle through a
+/// `Vector` (`jsonArray value:Vector<JSONValue>`) needs no `Box`, so it isn't flagged there.
+///
+/// Each arm hands its result straight to the `match`'s value. A debug build keeps a stack slot for
+/// every temporary of every arm, and `Self::Name(...deserialize(buf)?)` inside `Ok(match ..)` holds
+/// the variant about four times over (the result, `?`'s branch, the value, the enum): in a debug
+/// build, `MAX_DEPTH` levels of `pageBlockCover` needed 1.5 MiB of stack that way, and need 0.8 MiB
+/// this way.
 fn write_deserializable<W: Write>(
     file: &mut W,
     indent: &str,
@@ -271,42 +290,37 @@ fn write_deserializable<W: Write>(
         "{indent}    fn deserialize(buf: crate::deserialize::Buffer) -> crate::deserialize::Result<Self> {{"
     )?;
     writeln!(file, "{indent}        use crate::Identifiable;")?;
-    writeln!(file, "{indent}        let id = u32::deserialize(buf)?;")?;
-    writeln!(file, "{indent}        Ok(match id {{")?;
+    writeln!(file, "{indent}        buf.nested(|buf| {{")?;
+    writeln!(file, "{indent}            let id = u32::deserialize(buf)?;")?;
+    writeln!(file, "{indent}            match id {{")?;
     for d in metadata.defs_with_type(ty) {
-        write!(
-            file,
-            "{}            {}::CONSTRUCTOR_ID => Self::{}",
-            indent,
-            rustifier::definitions::qual_name(d),
-            rustifier::definitions::variant_name(d),
-        )?;
-
+        let def = rustifier::definitions::qual_name(d);
+        let variant = rustifier::definitions::variant_name(d);
         if d.params.is_empty() {
-            writeln!(file, ",")?;
-            continue;
+            writeln!(
+                file,
+                "{indent}                {def}::CONSTRUCTOR_ID => Ok(Self::{variant}),"
+            )?;
+        } else if metadata.is_recursive_def(d) {
+            writeln!(
+                file,
+                "{indent}                {def}::CONSTRUCTOR_ID => \
+                 {def}::deserialize(buf).map(|x| Self::{variant}(Box::new(x))),"
+            )?;
         } else {
-            write!(file, "(")?;
+            writeln!(
+                file,
+                "{indent}                {def}::CONSTRUCTOR_ID => \
+                 {def}::deserialize(buf).map(Self::{variant}),"
+            )?;
         }
-
-        if metadata.is_recursive_def(d) {
-            write!(file, "Box::new(")?;
-        }
-        write!(
-            file,
-            "{}::deserialize(buf)?",
-            rustifier::definitions::qual_name(d)
-        )?;
-        if metadata.is_recursive_def(d) {
-            write!(file, ")")?;
-        }
-        writeln!(file, "),")?;
     }
     writeln!(
         file,
-        "{indent}            _ => return Err(\
-         crate::deserialize::Error::UnexpectedConstructor {{ id }}),"
+        "{indent}                _ => \
+         Err(crate::deserialize::Error::UnexpectedConstructor {{ id }}),"
     )?;
+    writeln!(file, "{indent}            }}")?;
     writeln!(file, "{indent}        }})")?;
     writeln!(file, "{indent}    }}")?;
     writeln!(file, "{indent}}}")?;

@@ -29,10 +29,6 @@ Used for calculating the AES key given an authorization key, and also for 2FA.
 
 Used for methods relied on by the 2-factor offered by Telegram.
 
-## hmac
-
-Used for methods relied on by the 2-factor offered by Telegram.
-
 ## glass_pumpkin
 
 Used for methods relied on by the 2-factor offered by Telegram.

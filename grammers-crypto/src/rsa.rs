@@ -52,6 +52,8 @@ pub fn encrypt_hashed(data: &[u8], key: &Key, random_bytes: &[u8; 224]) -> Vec<u
     // https://core.telegram.org/mtproto/auth_key#41-rsa-paddata-server-public-key-mentioned-above-is-implemented-as-follows
 
     // data_with_padding := data + random_padding_bytes; -- where random_padding_bytes are chosen so that the resulting length of data_with_padding is precisely 192 bytes, and data is the TL-serialized data to be encrypted as before. One has to check that data is not longer than 144 bytes.
+    // The key exchange's inner data, which the client builds from fixed-size fields; the
+    // server's `pq` is 8 bytes, and its factors are at most 8 each.
     assert!(data.len() <= 144);
     let data_with_padding = {
         let mut buffer = Vec::with_capacity(192);
@@ -64,6 +66,7 @@ pub fn encrypt_hashed(data: &[u8], key: &Key, random_bytes: &[u8; 224]) -> Vec<u
     let data_pad_reversed = data_with_padding.iter().copied().rev().collect::<Vec<u8>>();
 
     // a random 32-byte temp_key is generated.
+    // A fixed range of the 224 random bytes: this can't fail.
     let mut temp_key: [u8; 32] = random_bytes[192..192 + 32].try_into().unwrap();
 
     let key_aes_encrypted = loop {

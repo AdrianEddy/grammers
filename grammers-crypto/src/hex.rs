@@ -14,6 +14,7 @@ use std::fmt::Write;
 pub fn to_hex(bytes: &[u8]) -> String {
     let mut result = String::with_capacity(bytes.len() * 2);
     bytes.iter().for_each(|b| {
+        // Writing to a `String` doesn't fail.
         write!(result, "{b:02x}").unwrap();
     });
     result
@@ -49,5 +50,6 @@ pub fn opt_from_hex(hex: &str) -> Option<Vec<u8>> {
 
 /// Like `opt_from_hex`, but panics on invalid data.
 pub fn from_hex(hex: &str) -> Vec<u8> {
+    // Only for hex the caller wrote (tests, debugging traces), never for server data.
     opt_from_hex(hex).unwrap()
 }
