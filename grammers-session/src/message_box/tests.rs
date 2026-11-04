@@ -70,6 +70,16 @@ fn channel_update(channel_id: i64, pts: i32) -> tl::enums::Update {
     })
 }
 
+fn qts_updates(qts: i32) -> UpdatesLike {
+    UpdatesLike::Updates(tl::enums::Updates::Updates(tl::types::Updates {
+        updates: vec![qts_update(qts)],
+        users: Vec::new(),
+        chats: Vec::new(),
+        date: NO_DATE,
+        seq: NO_SEQ,
+    }))
+}
+
 fn channel_updates(channel_id: i64, date: i32, seq: i32, pts: i32) -> UpdatesLike {
     UpdatesLike::Updates(tl::enums::Updates::Updates(tl::types::Updates {
         updates: vec![channel_update(channel_id, pts)],
@@ -135,6 +145,14 @@ fn get_channel_difference(id: i64, pts: i32) -> tl::functions::updates::GetChann
     }
 }
 
+/// The channel an `updates.getChannelDifference` request asks about.
+fn channel_of(request: &tl::functions::updates::GetChannelDifference) -> i64 {
+    match &request.channel {
+        tl::enums::InputChannel::Channel(channel) => channel.channel_id,
+        _ => panic!("the message boxes ask for a channel"),
+    }
+}
+
 fn channel_difference_empty(pts: i32) -> tl::enums::updates::ChannelDifference {
     tl::types::updates::ChannelDifferenceEmpty {
         r#final: true,
@@ -171,7 +189,11 @@ fn settled(now: Now) -> MessageBoxes {
         now,
     );
     while let Some(request) = message_boxes.get_channel_difference() {
-        message_boxes.apply_channel_difference(channel_difference_empty(request.pts), now);
+        message_boxes.apply_channel_difference(
+            channel_of(&request),
+            channel_difference_empty(request.pts),
+            now,
+        );
     }
     assert_eq!(message_boxes.take_delta(), StateDelta::default());
     assert_eq!(message_boxes.difference_pending(), DiffPending::default());
@@ -255,10 +277,8 @@ fn test_connect_flow_with_data() {
         message_boxes.get_difference(),
         Some(get_difference(56, 12, 34))
     );
-    assert_eq!(
-        message_boxes.get_channel_difference(),
-        Some(get_channel_difference(43, 21))
-    );
+    // On startup, only the account's difference (TF7).
+    assert_eq!(message_boxes.get_channel_difference(), None);
     assert_eq!(message_boxes.session_state(), state)
 }
 
@@ -287,9 +307,9 @@ fn test_complete_login_flow() {
 fn test_iter_dialogs_flow() {
     let mut message_boxes = MessageBoxes::new();
 
-    message_boxes.try_set_channel_state(98, 76, T0);
-    message_boxes.try_set_channel_state(54, 32, T0);
-    message_boxes.try_set_channel_state(98, 10, T0);
+    message_boxes.try_set_channel_state(98, 76);
+    message_boxes.try_set_channel_state(54, 32);
+    message_boxes.try_set_channel_state(98, 10);
 
     assert_eq!(
         message_boxes.session_state(),
@@ -377,20 +397,27 @@ fn test_next_raw_update_flow_common_timeout() {
 fn test_next_raw_update_flow_channel_timeout() {
     let mut now = T0;
     let mut message_boxes = MessageBoxes::new();
-    message_boxes.try_set_channel_state(12, 34, now);
+    message_boxes.try_set_channel_state(12, 34);
 
     now += NO_UPDATES_TIMEOUT;
 
+    // A quiet channel doesn't time out (TF7); the caller asks for its difference.
+    assert_eq!(
+        message_boxes.check_deadlines(now),
+        next_updates_deadline(now)
+    );
     assert_eq!(message_boxes.get_channel_difference(), None);
+    assert!(message_boxes.begin_channel_difference(12));
     assert_eq!(message_boxes.check_deadlines(now), now);
     assert_eq!(
         message_boxes.get_channel_difference(),
         Some(get_channel_difference(12, 34))
     );
 
-    message_boxes.apply_channel_difference(channel_difference_empty(56), now);
+    message_boxes.apply_channel_difference(12, channel_difference_empty(56), now);
 
     assert_eq!(message_boxes.get_difference(), None);
+    assert_eq!(message_boxes.get_channel_difference(), None);
     assert_eq!(
         message_boxes.check_deadlines(now),
         next_updates_deadline(now)
@@ -406,17 +433,15 @@ fn test_next_raw_update_flow_channel_timeout() {
 
 #[test]
 fn test_next_raw_update_flow_channel_issues() {
-    let mut now = T0;
     let mut message_boxes = MessageBoxes::new();
-    message_boxes.try_set_channel_state(12, 34, now);
+    message_boxes.try_set_channel_state(12, 34);
 
-    now += NO_UPDATES_TIMEOUT;
-    assert_eq!(message_boxes.check_deadlines(now), now);
+    assert!(message_boxes.begin_channel_difference(12));
     assert!(message_boxes.get_channel_difference().is_some());
 
     assert!(
         message_boxes
-            .end_channel_difference(PrematureEndReason::TemporaryServerIssues, now)
+            .end_channel_difference(12, PrematureEndReason::TemporaryServerIssues, T0)
             .is_empty()
     );
     assert!(message_boxes.get_channel_difference().is_none());
@@ -431,17 +456,15 @@ fn test_next_raw_update_flow_channel_issues() {
 
 #[test]
 fn test_next_raw_update_flow_channel_ban() {
-    let mut now = T0;
     let mut message_boxes = MessageBoxes::new();
-    message_boxes.try_set_channel_state(12, 34, now);
+    message_boxes.try_set_channel_state(12, 34);
 
-    now += NO_UPDATES_TIMEOUT;
-    assert_eq!(message_boxes.check_deadlines(now), now);
+    assert!(message_boxes.begin_channel_difference(12));
     assert!(message_boxes.get_channel_difference().is_some());
 
     assert!(
         message_boxes
-            .end_channel_difference(PrematureEndReason::Banned, now)
+            .end_channel_difference(12, PrematureEndReason::Banned, T0)
             .is_empty()
     );
     assert!(message_boxes.get_channel_difference().is_none());
@@ -458,33 +481,42 @@ fn test_next_raw_update_flow_channel_ban() {
 fn test_next_raw_update_flow_no_new_get_diff_if_already_fetching() {
     let mut now = T0;
     let mut message_boxes = MessageBoxes::new();
+    message_boxes.try_set_channel_state(11, 12);
+    message_boxes.try_set_channel_state(21, 22);
+    message_boxes.try_set_channel_state(31, 32);
 
-    // t(0) = first channel registers timeout at t(3)
-    message_boxes.try_set_channel_state(11, 12, now);
+    // t(0) = first channel has a gap, which waits until t(5)
+    message_boxes
+        .process_updates(channel_updates(11, NO_DATE, NO_SEQ, 14), now)
+        .unwrap();
 
-    // t(2) = second and third channel register timeout at t(5)
-    now += 2 * (NO_UPDATES_TIMEOUT / 3);
-    message_boxes.try_set_channel_state(21, 22, now);
-    message_boxes.try_set_channel_state(31, 32, now);
+    // t(3) = second and third channel have gaps, which wait until t(8)
+    now += 3 * (POSSIBLE_GAP_TIMEOUT / 5);
+    message_boxes
+        .process_updates(channel_updates(21, NO_DATE, NO_SEQ, 24), now)
+        .unwrap();
+    message_boxes
+        .process_updates(channel_updates(31, NO_DATE, NO_SEQ, 34), now)
+        .unwrap();
 
-    // t(4) = first channel times out
-    now += 2 * (NO_UPDATES_TIMEOUT / 3);
+    // t(5) = first channel's gap times out
+    now += 2 * (POSSIBLE_GAP_TIMEOUT / 5);
     assert_eq!(message_boxes.check_deadlines(now), now);
     assert_eq!(
         message_boxes.get_channel_difference(),
         Some(get_channel_difference(11, 12))
     );
 
-    // t(6) = second and third channel should have timed out by now, but didn't yet
-    now += 2 * (NO_UPDATES_TIMEOUT / 3);
+    // t(10) = second and third channel's gaps should have timed out by now, but didn't yet
+    now += POSSIBLE_GAP_TIMEOUT;
     assert!(
         message_boxes
-            .end_channel_difference(PrematureEndReason::TemporaryServerIssues, now)
+            .end_channel_difference(11, PrematureEndReason::TemporaryServerIssues, now)
             .is_empty()
     );
     assert_eq!(message_boxes.get_channel_difference(), None);
 
-    // t(6) = checking deadlines now triggers difference for second and third
+    // t(10) = checking deadlines now triggers difference for second and third
     assert_eq!(message_boxes.check_deadlines(now), now);
     assert_eq!(
         message_boxes.get_channel_difference(),
@@ -492,7 +524,7 @@ fn test_next_raw_update_flow_no_new_get_diff_if_already_fetching() {
     );
     assert!(
         message_boxes
-            .end_channel_difference(PrematureEndReason::TemporaryServerIssues, now)
+            .end_channel_difference(21, PrematureEndReason::TemporaryServerIssues, now)
             .is_empty()
     );
     assert_eq!(
@@ -501,7 +533,7 @@ fn test_next_raw_update_flow_no_new_get_diff_if_already_fetching() {
     );
     assert!(
         message_boxes
-            .end_channel_difference(PrematureEndReason::TemporaryServerIssues, now)
+            .end_channel_difference(31, PrematureEndReason::TemporaryServerIssues, now)
             .is_empty()
     );
     assert_eq!(message_boxes.get_channel_difference(), None);
@@ -753,6 +785,7 @@ fn test_common_and_channel_difference_do_not_duplicate_message() {
             channel_id: 43,
         })),
     });
+    assert!(message_boxes.begin_channel_difference(43));
     assert!(message_boxes.getting_diff_for.contains(&Key::Channel(43)));
     let (updates, _, _) = message_boxes.apply_difference(
         tl::enums::updates::Difference::Difference(tl::types::updates::Difference {
@@ -780,6 +813,7 @@ fn test_common_and_channel_difference_do_not_duplicate_message() {
     assert_eq!(updates, vec![]);
 
     let (updates, _, _) = message_boxes.apply_channel_difference(
+        43,
         tl::enums::updates::ChannelDifference::Difference(tl::types::updates::ChannelDifference {
             r#final: true,
             pts: 23,
@@ -892,17 +926,15 @@ fn difference_empty_advances_date_seq() {
 
 #[test]
 fn channel_difference_empty_advances_pts() {
-    let mut message_boxes = MessageBoxes::load(loaded_state(), T0);
-    message_boxes.apply_difference(
-        tl::types::updates::DifferenceEmpty { date: 10, seq: 5 }.into(),
-        T0,
-    );
+    let mut message_boxes = settled(T0);
+    assert!(message_boxes.begin_channel_difference(CHANNEL));
     assert_eq!(
         message_boxes.get_channel_difference(),
         Some(get_channel_difference(CHANNEL, 20))
     );
 
-    let (updates, _, _) = message_boxes.apply_channel_difference(channel_difference_empty(25), T0);
+    let (updates, _, _) =
+        message_boxes.apply_channel_difference(CHANNEL, channel_difference_empty(25), T0);
     assert!(updates.is_empty());
     assert_eq!(
         message_boxes.take_delta(),
@@ -967,16 +999,12 @@ fn difference_too_long_delta_is_new_pts() {
 
 #[test]
 fn banned_channel_is_removed_in_delta() {
-    let mut message_boxes = MessageBoxes::load(loaded_state(), T0);
-    message_boxes.apply_difference(
-        tl::types::updates::DifferenceEmpty { date: 10, seq: 5 }.into(),
-        T0,
-    );
-    assert!(message_boxes.get_channel_difference().is_some());
+    let mut message_boxes = settled(T0);
+    assert!(message_boxes.begin_channel_difference(CHANNEL));
 
     assert!(
         message_boxes
-            .end_channel_difference(PrematureEndReason::Banned, T0)
+            .end_channel_difference(CHANNEL, PrematureEndReason::Banned, T0)
             .is_empty()
     );
     assert_eq!(
@@ -1025,14 +1053,11 @@ fn deadlines_follow_supplied_time() {
 
 #[test]
 fn final_channel_difference_returns_its_updates() {
-    let mut message_boxes = MessageBoxes::load(loaded_state(), T0);
-    message_boxes.apply_difference(
-        tl::types::updates::DifferenceEmpty { date: 10, seq: 5 }.into(),
-        T0,
-    );
-    message_boxes.take_delta();
+    let mut message_boxes = settled(T0);
+    assert!(message_boxes.begin_channel_difference(CHANNEL));
 
     let (updates, _, _) = message_boxes.apply_channel_difference(
+        CHANNEL,
         tl::types::updates::ChannelDifference {
             r#final: true,
             pts: 22,
@@ -1066,26 +1091,30 @@ fn final_channel_difference_returns_its_updates() {
 fn account_difference_returns_both_boxes_updates() {
     let mut message_boxes = settled(T0);
 
-    // The common box hears from the server; the secondary box doesn't, so its idle deadline
-    // passes first, and the difference that follows must still return the common box's updates.
-    let now = T0 + NO_UPDATES_TIMEOUT / 2;
+    // Only the secondary box finds a gap. Once its wait passes, the difference that follows must
+    // still return the common box's updates.
     assert_eq!(
-        message_boxes.process_updates(updates(NO_DATE, NO_SEQ, 101), now),
-        updates_ok(10, 5, 101)
+        message_boxes.process_updates(qts_updates(52), T0),
+        Ok((Vec::new(), Vec::new(), Vec::new()))
     );
-    message_boxes.take_delta();
-    let now = T0 + NO_UPDATES_TIMEOUT;
+    let now = T0 + POSSIBLE_GAP_TIMEOUT;
     assert_eq!(message_boxes.check_deadlines(now), now);
-    assert!(message_boxes.difference_pending().account);
+    assert_eq!(
+        message_boxes.difference_pending(),
+        DiffPending {
+            account: true,
+            channels: 0
+        }
+    );
 
     let (updates, _, _) = message_boxes.apply_difference(
         tl::types::updates::Difference {
             new_messages: Vec::new(),
             new_encrypted_messages: Vec::new(),
-            other_updates: vec![update(102), qts_update(51)],
+            other_updates: vec![update(101), qts_update(51), qts_update(52)],
             chats: Vec::new(),
             users: Vec::new(),
-            state: state(11, 6, 102, 51).into(),
+            state: state(11, 6, 101, 52).into(),
         }
         .into(),
         now,
@@ -1093,17 +1122,17 @@ fn account_difference_returns_both_boxes_updates() {
     // Returned in `pts - count` order.
     assert_eq!(
         updates.into_iter().map(|(u, _)| u).collect::<Vec<_>>(),
-        vec![qts_update(51), update(102)]
+        vec![qts_update(51), qts_update(52), update(101)]
     );
     assert_eq!(
         message_boxes.take_delta(),
         StateDelta {
             common: Some(CommonState {
-                pts: 102,
+                pts: 101,
                 date: 11,
                 seq: 6
             }),
-            qts: Some(51),
+            qts: Some(52),
             ..StateDelta::default()
         }
     );
@@ -1161,7 +1190,7 @@ fn socket_update_postponed_while_box_diffs() {
     let diffing = || {
         let mut message_boxes = settled(T0);
         message_boxes
-            .process_updates(channel_too_long(CHANNEL, None), T0)
+            .process_updates(channel_too_long(CHANNEL, Some(180)), T0)
             .unwrap();
         assert_eq!(
             message_boxes.process_updates(channel_updates(CHANNEL, NO_DATE, NO_SEQ, 181), T0),
@@ -1174,17 +1203,17 @@ fn socket_update_postponed_while_box_diffs() {
     // The difference returns it: it comes once, in its place, also across a partial answer.
     let mut message_boxes = diffing();
     let (returned, _, _) =
-        message_boxes.apply_channel_difference(channel_difference(21, 100, false), T0);
+        message_boxes.apply_channel_difference(CHANNEL, channel_difference(21, 100, false), T0);
     assert_eq!(pts_of(&returned), (21..=100).collect::<Vec<_>>());
     let (returned, _, _) =
-        message_boxes.apply_channel_difference(channel_difference(101, 181, true), T0);
+        message_boxes.apply_channel_difference(CHANNEL, channel_difference(101, 181, true), T0);
     assert_eq!(pts_of(&returned), (101..=181).collect::<Vec<_>>());
     assert_eq!(message_boxes.take_delta(), channel_delta(181));
 
     // The difference ends right before it: it follows the difference's updates.
     let mut message_boxes = diffing();
     let (returned, _, _) =
-        message_boxes.apply_channel_difference(channel_difference(21, 180, true), T0);
+        message_boxes.apply_channel_difference(CHANNEL, channel_difference(21, 180, true), T0);
     assert_eq!(pts_of(&returned), (21..=181).collect::<Vec<_>>());
     assert_eq!(message_boxes.take_delta(), channel_delta(181));
     assert_eq!(message_boxes.difference_pending(), DiffPending::default());
@@ -1193,7 +1222,7 @@ fn socket_update_postponed_while_box_diffs() {
     // channel's difference is due again.
     let mut message_boxes = diffing();
     let (returned, _, _) =
-        message_boxes.apply_channel_difference(channel_difference(21, 179, true), T0);
+        message_boxes.apply_channel_difference(CHANNEL, channel_difference(21, 179, true), T0);
     assert_eq!(pts_of(&returned), (21..=179).collect::<Vec<_>>());
     assert_eq!(message_boxes.take_delta(), channel_delta(179));
     assert_eq!(
@@ -1224,9 +1253,7 @@ fn postponed_updates_after_premature_end() {
     // The channel at 20 gets its difference, and 24, 21 and 22 arrive meanwhile.
     let diffing = || {
         let mut message_boxes = settled(T0);
-        message_boxes
-            .process_updates(channel_too_long(CHANNEL, None), T0)
-            .unwrap();
+        assert!(message_boxes.begin_channel_difference(CHANNEL));
         for pts in [24, 21, 22] {
             assert_eq!(
                 message_boxes.process_updates(channel_updates(CHANNEL, NO_DATE, NO_SEQ, pts), T0),
@@ -1236,16 +1263,19 @@ fn postponed_updates_after_premature_end() {
         message_boxes
     };
 
-    // A temporary failure returns those that follow on, and 24 waits on the gap as if it arrived
-    // now: once the wait passes, the channel's difference is due again.
+    // A temporary failure returns those that follow on, and drops 24: no gap gets the
+    // difference ahead of the backoff, and the retry returns 24 with 23.
     let mut message_boxes = diffing();
-    let returned =
-        message_boxes.end_channel_difference(PrematureEndReason::TemporaryServerIssues, T0);
+    let returned = message_boxes.end_channel_difference(
+        CHANNEL,
+        PrematureEndReason::TemporaryServerIssues,
+        T0,
+    );
     assert_eq!(pts_of(&returned), vec![21, 22]);
     assert_eq!(message_boxes.take_delta(), channel_delta(22));
     assert_eq!(
         time_of_next_difference(&mut message_boxes, T0),
-        T0 + POSSIBLE_GAP_TIMEOUT
+        T0 + Duration::from_secs(1)
     );
     assert_eq!(
         message_boxes.get_channel_difference(),
@@ -1256,7 +1286,7 @@ fn postponed_updates_after_premature_end() {
     let mut message_boxes = diffing();
     assert!(
         message_boxes
-            .end_channel_difference(PrematureEndReason::Banned, T0)
+            .end_channel_difference(CHANNEL, PrematureEndReason::Banned, T0)
             .is_empty()
     );
     assert_eq!(
@@ -1357,6 +1387,647 @@ fn socket_update_postponed_while_account_diffs() {
     assert_eq!(
         message_boxes.get_difference(),
         Some(get_difference(11, 104, 50))
+    );
+}
+
+// TF7: channel differences only on a gap, a server's request or the caller's.
+
+#[test]
+fn load_diffs_account_boxes_only() {
+    let mut state = loaded_state();
+    state.channels = (1..=300).map(|id| ChannelState { id, pts: 10 }).collect();
+    let mut message_boxes = MessageBoxes::load(state, T0);
+    assert_eq!(
+        message_boxes.difference_pending(),
+        DiffPending {
+            account: true,
+            channels: 0
+        }
+    );
+    message_boxes.apply_difference(
+        tl::types::updates::DifferenceEmpty { date: 10, seq: 5 }.into(),
+        T0,
+    );
+    assert_eq!(message_boxes.difference_pending(), DiffPending::default());
+    assert_eq!(message_boxes.get_channel_difference(), None);
+}
+
+#[test]
+fn quiet_channel_never_diffs() {
+    let mut state = loaded_state();
+    state.channels = (1..=300).map(|id| ChannelState { id, pts: 10 }).collect();
+    let mut message_boxes = MessageBoxes::load(state.clone(), T0);
+
+    // A day of a driver sleeping from deadline to deadline, with the account quiet too: only
+    // the account's idle difference ever falls due.
+    let mut now = T0;
+    let mut account_differences = Vec::new();
+    while now < T0 + Duration::from_secs(24 * 60 * 60) {
+        if message_boxes.get_difference().is_some() {
+            account_differences.push(now);
+            message_boxes.apply_difference(
+                tl::types::updates::DifferenceEmpty {
+                    date: state.date,
+                    seq: state.seq,
+                }
+                .into(),
+                now,
+            );
+        }
+        assert_eq!(message_boxes.difference_pending().channels, 0);
+        assert_eq!(message_boxes.get_channel_difference(), None);
+        let deadline = message_boxes.check_deadlines(now);
+        assert!(deadline > now || message_boxes.difference_pending().account);
+        now = deadline;
+    }
+    // The start-up difference, then one every 15 minutes.
+    assert_eq!(
+        account_differences,
+        (0..24 * 4)
+            .map(|i| T0 + i * NO_UPDATES_TIMEOUT)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(message_boxes.session_state(), state);
+}
+
+#[test]
+fn account_idle_deadline_fires() {
+    let mut message_boxes = settled(T0);
+    assert_eq!(
+        time_of_next_difference(&mut message_boxes, T0),
+        T0 + NO_UPDATES_TIMEOUT
+    );
+    assert_eq!(
+        message_boxes.difference_pending(),
+        DiffPending {
+            account: true,
+            channels: 0
+        }
+    );
+    assert_eq!(
+        message_boxes.get_difference(),
+        Some(get_difference(10, 100, 50))
+    );
+}
+
+#[test]
+fn active_account_runs_no_idle_difference() {
+    let mut message_boxes = settled(T0);
+
+    // A day of a driver sleeping from deadline to deadline, with a common box update every 10
+    // minutes and none on the secondary box: the account never goes 15 minutes without updates.
+    let every = Duration::from_secs(10 * 60);
+    let mut now = T0;
+    let mut next_update = T0 + every;
+    let mut pts = 100;
+    while now < T0 + Duration::from_secs(24 * 60 * 60) {
+        let deadline = message_boxes.check_deadlines(now);
+        assert_eq!(
+            message_boxes.difference_pending(),
+            DiffPending::default(),
+            "at {:?}",
+            now - T0
+        );
+        if next_update <= deadline {
+            now = next_update;
+            pts += 1;
+            assert_eq!(
+                message_boxes.process_updates(updates(NO_DATE, NO_SEQ, pts), now),
+                updates_ok(10, 5, pts)
+            );
+            next_update += every;
+        } else {
+            now = deadline;
+        }
+    }
+
+    // Once the updates stop, the difference is due 15 minutes after the last one.
+    let last_update = next_update - every;
+    assert_eq!(
+        time_of_next_difference(&mut message_boxes, now),
+        last_update + NO_UPDATES_TIMEOUT
+    );
+}
+
+#[test]
+fn qts_update_restarts_account_deadline() {
+    let mut message_boxes = settled(T0);
+
+    // Only the secondary box hears from the server, and that restarts the account's deadline.
+    let heard = T0 + Duration::from_secs(10 * 60);
+    assert_eq!(
+        message_boxes.check_deadlines(heard),
+        T0 + NO_UPDATES_TIMEOUT
+    );
+    let (updates, _, _) = message_boxes
+        .process_updates(qts_updates(51), heard)
+        .unwrap();
+    assert_eq!(updates.len(), 1);
+    assert_eq!(
+        time_of_next_difference(&mut message_boxes, heard),
+        heard + NO_UPDATES_TIMEOUT
+    );
+    assert_eq!(
+        message_boxes.get_difference(),
+        Some(get_difference(10, 100, 51))
+    );
+}
+
+#[test]
+fn channel_too_long_triggers_channel_diff() {
+    let mut message_boxes = settled(T0);
+
+    let too_long = UpdatesLike::Updates(
+        tl::types::UpdateShort {
+            update: tl::types::UpdateChannelTooLong {
+                channel_id: CHANNEL,
+                pts: None,
+            }
+            .into(),
+            date: 11,
+        }
+        .into(),
+    );
+    assert_eq!(
+        message_boxes.process_updates(too_long, T0),
+        Ok((Vec::new(), Vec::new(), Vec::new()))
+    );
+    assert_eq!(
+        message_boxes.difference_pending(),
+        DiffPending {
+            account: false,
+            channels: 1
+        }
+    );
+    assert_eq!(
+        message_boxes.get_channel_difference(),
+        Some(get_channel_difference(CHANNEL, 20))
+    );
+}
+
+#[test]
+fn channel_too_long_keeps_local_pts() {
+    let mut message_boxes = settled(T0);
+
+    // The channel is at 20; the server says it has too much to send, and is at 180.
+    let too_long = UpdatesLike::Updates(
+        tl::types::Updates {
+            updates: vec![
+                tl::types::UpdateChannelTooLong {
+                    channel_id: CHANNEL,
+                    pts: Some(180),
+                }
+                .into(),
+            ],
+            users: Vec::new(),
+            chats: Vec::new(),
+            date: NO_DATE,
+            seq: NO_SEQ,
+        }
+        .into(),
+    );
+    message_boxes.process_updates(too_long, T0).unwrap();
+    assert_eq!(message_boxes.take_delta(), StateDelta::default());
+    // The difference starts from the channel's own state.
+    assert_eq!(
+        message_boxes.get_channel_difference(),
+        Some(get_channel_difference(CHANNEL, 20))
+    );
+
+    // Updates up to 180 come back first, and only then the state moves past them.
+    let (updates, _, _) = message_boxes.apply_channel_difference(
+        CHANNEL,
+        tl::types::updates::ChannelDifference {
+            r#final: false,
+            pts: 100,
+            timeout: None,
+            new_messages: Vec::new(),
+            other_updates: (21..=100).map(|pts| channel_update(CHANNEL, pts)).collect(),
+            chats: Vec::new(),
+            users: Vec::new(),
+        }
+        .into(),
+        T0,
+    );
+    assert_eq!(updates.len(), 80);
+    assert_eq!(
+        message_boxes.take_delta().channels,
+        vec![ChannelState {
+            id: CHANNEL,
+            pts: 100
+        }]
+    );
+    assert_eq!(
+        message_boxes.get_channel_difference(),
+        Some(get_channel_difference(CHANNEL, 100))
+    );
+    let (updates, _, _) = message_boxes.apply_channel_difference(
+        CHANNEL,
+        tl::types::updates::ChannelDifference {
+            r#final: true,
+            pts: 180,
+            timeout: None,
+            new_messages: Vec::new(),
+            other_updates: (101..=180)
+                .map(|pts| channel_update(CHANNEL, pts))
+                .collect(),
+            chats: Vec::new(),
+            users: Vec::new(),
+        }
+        .into(),
+        T0,
+    );
+    assert_eq!(updates.len(), 80);
+    assert_eq!(
+        message_boxes.take_delta().channels,
+        vec![ChannelState {
+            id: CHANNEL,
+            pts: 180
+        }]
+    );
+    assert_eq!(message_boxes.get_channel_difference(), None);
+}
+
+#[test]
+fn channel_too_long_creates_unknown_entry() {
+    let mut message_boxes = settled(T0);
+    let unknown = CHANNEL + 1;
+
+    // Without a `pts`, there is nothing to get the difference from.
+    let too_long = |pts| {
+        UpdatesLike::Updates(
+            tl::types::UpdateShort {
+                update: tl::types::UpdateChannelTooLong {
+                    channel_id: unknown,
+                    pts,
+                }
+                .into(),
+                date: 11,
+            }
+            .into(),
+        )
+    };
+    message_boxes.process_updates(too_long(None), T0).unwrap();
+    assert_eq!(message_boxes.difference_pending(), DiffPending::default());
+    assert_eq!(message_boxes.take_delta(), StateDelta::default());
+
+    // With one, the channel starts there.
+    message_boxes
+        .process_updates(too_long(Some(500)), T0)
+        .unwrap();
+    assert_eq!(
+        message_boxes.take_delta(),
+        StateDelta {
+            channels: vec![ChannelState {
+                id: unknown,
+                pts: 500
+            }],
+            ..StateDelta::default()
+        }
+    );
+    assert_eq!(
+        message_boxes.get_channel_difference(),
+        Some(get_channel_difference(unknown, 500))
+    );
+}
+
+#[test]
+fn no_site_arms_a_channel_idle_deadline() {
+    // Channels have no idle deadline: only the account has one. Besides a possible gap's wait,
+    // the only deadline a channel has of its own is the retry after a temporary failure, and no
+    // other site arms it.
+    fn channel_retries(message_boxes: &MessageBoxes) -> Vec<(i64, Now)> {
+        message_boxes
+            .entries
+            .iter()
+            .filter_map(|entry| match entry.key {
+                Key::Channel(id) => entry.retry_at.map(|at| (id, at)),
+                _ => None,
+            })
+            .collect()
+    }
+    fn assert_no_channel_deadline(message_boxes: &MessageBoxes) {
+        assert_eq!(channel_retries(message_boxes), Vec::new());
+    }
+
+    // Every way a channel entry is made or touched: loaded, set from dialogs, created by its
+    // first update, created and diffed by `updateChannelTooLong`, updated in and out of order,
+    // returned by the account's and its own difference, final or not, and ended early.
+    let mut now = T0;
+    let mut message_boxes = MessageBoxes::load(loaded_state(), now);
+    message_boxes.try_set_channel_state(2000, 1);
+    message_boxes
+        .process_updates(channel_updates(3000, NO_DATE, NO_SEQ, 5), now)
+        .unwrap();
+    message_boxes
+        .process_updates(
+            UpdatesLike::Updates(
+                tl::types::UpdateShort {
+                    update: tl::types::UpdateChannelTooLong {
+                        channel_id: 4000,
+                        pts: Some(9),
+                    }
+                    .into(),
+                    date: 11,
+                }
+                .into(),
+            ),
+            now,
+        )
+        .unwrap();
+    assert_no_channel_deadline(&message_boxes);
+
+    message_boxes.apply_difference(
+        tl::types::updates::Difference {
+            new_messages: Vec::new(),
+            new_encrypted_messages: Vec::new(),
+            other_updates: vec![channel_update(CHANNEL, 21), channel_update(2000, 3)],
+            chats: Vec::new(),
+            users: Vec::new(),
+            state: state(10, 5, 100, 50).into(),
+        }
+        .into(),
+        now,
+    );
+    assert_no_channel_deadline(&message_boxes);
+
+    let with_timeout = |r#final, pts| {
+        tl::types::updates::ChannelDifference {
+            r#final,
+            pts,
+            timeout: Some(30),
+            new_messages: Vec::new(),
+            other_updates: vec![channel_update(4000, pts)],
+            chats: Vec::new(),
+            users: Vec::new(),
+        }
+        .into()
+    };
+    message_boxes.apply_channel_difference(4000, with_timeout(false, 10), now);
+    message_boxes.apply_channel_difference(4000, with_timeout(true, 11), now);
+    assert_no_channel_deadline(&message_boxes);
+
+    now += POSSIBLE_GAP_TIMEOUT;
+    message_boxes.check_deadlines(now);
+    while let Some(request) = message_boxes.get_channel_difference() {
+        message_boxes.apply_channel_difference(
+            channel_of(&request),
+            channel_difference_empty(request.pts + 1),
+            now,
+        );
+    }
+    assert_no_channel_deadline(&message_boxes);
+    // Nothing is armed but the account's idle deadline, from the end of its difference.
+    assert_eq!(message_boxes.check_deadlines(now), T0 + NO_UPDATES_TIMEOUT);
+
+    // Ended early: the retry, and nothing else.
+    assert!(message_boxes.begin_channel_difference(3000));
+    assert!(
+        message_boxes
+            .end_channel_difference(3000, PrematureEndReason::TemporaryServerIssues, now)
+            .is_empty()
+    );
+    message_boxes
+        .process_updates(channel_updates(CHANNEL, NO_DATE, NO_SEQ, 22), now)
+        .unwrap();
+    let retry = now + Duration::from_secs(1);
+    assert_eq!(channel_retries(&message_boxes), vec![(3000, retry)]);
+    assert_eq!(message_boxes.check_deadlines(now), retry);
+    assert_eq!(message_boxes.entries.len(), 2 + 4);
+}
+
+#[test]
+fn explicit_channel_diff_runs_once() {
+    let mut message_boxes = settled(T0);
+    assert!(!message_boxes.begin_channel_difference(CHANNEL + 1));
+    assert!(message_boxes.begin_channel_difference(CHANNEL));
+    // Asking again while it is pending changes nothing.
+    assert!(message_boxes.begin_channel_difference(CHANNEL));
+    assert_eq!(message_boxes.difference_pending().channels, 1);
+
+    assert_eq!(
+        message_boxes.get_channel_difference(),
+        Some(get_channel_difference(CHANNEL, 20))
+    );
+    message_boxes.apply_channel_difference(
+        CHANNEL,
+        tl::types::updates::ChannelDifferenceEmpty {
+            r#final: true,
+            pts: 20,
+            timeout: Some(5),
+        }
+        .into(),
+        T0,
+    );
+    assert_eq!(message_boxes.get_channel_difference(), None);
+
+    // The server's `timeout` is the caller's to act on: the channel isn't diffed again by itself.
+    let mut now = T0;
+    while now < T0 + Duration::from_secs(60 * 60) {
+        now = message_boxes.check_deadlines(now);
+        assert_eq!(message_boxes.difference_pending().channels, 0);
+        if message_boxes.get_difference().is_some() {
+            message_boxes.apply_difference(
+                tl::types::updates::DifferenceEmpty { date: 10, seq: 5 }.into(),
+                now,
+            );
+        }
+    }
+}
+
+#[test]
+fn explicit_channel_diff_goes_first() {
+    let (a, b, c) = (CHANNEL + 1, CHANNEL + 2, CHANNEL + 3);
+    let mut message_boxes = settled(T0);
+    message_boxes.try_set_channel_state(a, 10);
+    message_boxes.try_set_channel_state(b, 20);
+    message_boxes.try_set_channel_state(c, 30);
+    message_boxes.take_delta();
+
+    // The server has too much to send for `a` and `b`: they wait in that order.
+    let too_long = |channel_id| {
+        tl::types::UpdateChannelTooLong {
+            channel_id,
+            pts: None,
+        }
+        .into()
+    };
+    message_boxes
+        .process_updates(
+            UpdatesLike::Updates(
+                tl::types::Updates {
+                    updates: vec![too_long(a), too_long(b)],
+                    users: Vec::new(),
+                    chats: Vec::new(),
+                    date: NO_DATE,
+                    seq: NO_SEQ,
+                }
+                .into(),
+            ),
+            T0,
+        )
+        .unwrap();
+    assert_eq!(
+        message_boxes.get_channel_difference(),
+        Some(get_channel_difference(a, 10))
+    );
+
+    // The user opens a channel: it goes first, also if it was already waiting.
+    assert!(message_boxes.begin_channel_difference(c));
+    assert_eq!(
+        message_boxes.get_channel_difference(),
+        Some(get_channel_difference(c, 30))
+    );
+    assert!(message_boxes.begin_channel_difference(b));
+    assert_eq!(
+        message_boxes.get_channel_difference(),
+        Some(get_channel_difference(b, 20))
+    );
+    assert_eq!(message_boxes.difference_pending().channels, 3);
+
+    // `c` goes first while `b`'s request is in flight: the answer still goes to `b` alone.
+    let request = message_boxes.get_channel_difference().unwrap();
+    assert!(message_boxes.begin_channel_difference(c));
+    message_boxes.apply_channel_difference(channel_of(&request), channel_difference_empty(25), T0);
+    assert_eq!(
+        message_boxes.take_delta(),
+        StateDelta {
+            channels: vec![ChannelState { id: b, pts: 25 }],
+            ..StateDelta::default()
+        }
+    );
+    assert_eq!(
+        message_boxes.get_channel_difference(),
+        Some(get_channel_difference(c, 30))
+    );
+
+    // The same for a request that fails.
+    let request = message_boxes.get_channel_difference().unwrap();
+    assert!(message_boxes.begin_channel_difference(a));
+    assert!(
+        message_boxes
+            .end_channel_difference(
+                channel_of(&request),
+                PrematureEndReason::TemporaryServerIssues,
+                T0,
+            )
+            .is_empty()
+    );
+    assert_eq!(
+        message_boxes.get_channel_difference(),
+        Some(get_channel_difference(a, 10))
+    );
+    assert_eq!(message_boxes.difference_pending().channels, 1);
+    assert_eq!(message_boxes.take_delta(), StateDelta::default());
+}
+
+#[test]
+fn temporary_channel_failure_retries_with_backoff() {
+    let mut message_boxes = settled(T0);
+    let fail = |message_boxes: &mut MessageBoxes, now| {
+        let request = message_boxes.get_channel_difference().unwrap();
+        assert_eq!(channel_of(&request), CHANNEL);
+        assert!(
+            message_boxes
+                .end_channel_difference(CHANNEL, PrematureEndReason::TemporaryServerIssues, now,)
+                .is_empty()
+        );
+        assert_eq!(message_boxes.difference_pending(), DiffPending::default());
+    };
+    let pending = DiffPending {
+        account: false,
+        channels: 1,
+    };
+    let secs = Duration::from_secs;
+
+    // Each failure in a row waits twice as long as the one before, up to 64 s.
+    let mut now = T0;
+    assert!(message_boxes.begin_channel_difference(CHANNEL));
+    fail(&mut message_boxes, now);
+    for wait in [1, 2, 4, 8, 16, 32, 64, 64] {
+        let due = time_of_next_difference(&mut message_boxes, now);
+        assert_eq!(due, now + secs(wait));
+        assert_eq!(message_boxes.difference_pending(), pending);
+        now = due;
+        fail(&mut message_boxes, now);
+    }
+
+    // The server answers: the next failure waits 1 s again.
+    now = time_of_next_difference(&mut message_boxes, now);
+    message_boxes.apply_channel_difference(CHANNEL, channel_difference_empty(20), now);
+    assert!(message_boxes.begin_channel_difference(CHANNEL));
+    fail(&mut message_boxes, now);
+    assert_eq!(
+        time_of_next_difference(&mut message_boxes, now),
+        now + secs(1)
+    );
+    now += secs(1);
+    fail(&mut message_boxes, now);
+
+    // An answer that isn't final counts as well: the server works again.
+    now = time_of_next_difference(&mut message_boxes, now);
+    message_boxes.apply_channel_difference(
+        CHANNEL,
+        tl::types::updates::ChannelDifference {
+            r#final: false,
+            pts: 21,
+            timeout: None,
+            new_messages: Vec::new(),
+            other_updates: vec![channel_update(CHANNEL, 21)],
+            chats: Vec::new(),
+            users: Vec::new(),
+        }
+        .into(),
+        now,
+    );
+    assert_eq!(message_boxes.difference_pending(), pending);
+    fail(&mut message_boxes, now);
+    assert_eq!(message_boxes.check_deadlines(now), now + secs(1));
+
+    // The next difference to fall due is the account's idle one, at `account_due`: no channel
+    // retry is left. It ends empty, which restarts the account's deadline.
+    let next_is_account = |message_boxes: &mut MessageBoxes, now, account_due| {
+        assert_eq!(time_of_next_difference(message_boxes, now), account_due);
+        assert_eq!(
+            message_boxes.difference_pending(),
+            DiffPending {
+                account: true,
+                channels: 0
+            }
+        );
+        message_boxes.apply_difference(
+            tl::types::updates::DifferenceEmpty { date: 10, seq: 5 }.into(),
+            account_due,
+        );
+        account_due
+    };
+
+    // A gap begins the difference before the retry is due: the retry is spent, and doesn't fire.
+    let failed = now;
+    message_boxes
+        .process_updates(channel_updates(CHANNEL, NO_DATE, NO_SEQ, 23), now)
+        .unwrap();
+    now = time_of_next_difference(&mut message_boxes, now);
+    assert_eq!(now, failed + POSSIBLE_GAP_TIMEOUT);
+    message_boxes.apply_channel_difference(CHANNEL, channel_difference_empty(23), now);
+    now = next_is_account(&mut message_boxes, now, T0 + NO_UPDATES_TIMEOUT);
+
+    // The caller asks for the difference before the retry is due: the same.
+    assert!(message_boxes.begin_channel_difference(CHANNEL));
+    fail(&mut message_boxes, now);
+    assert!(message_boxes.begin_channel_difference(CHANNEL));
+    message_boxes.apply_channel_difference(CHANNEL, channel_difference_empty(23), now);
+    now = next_is_account(&mut message_boxes, now, now + NO_UPDATES_TIMEOUT);
+
+    // A spent retry doesn't reset the backoff: if the difference that spent it fails too, that
+    // is the next failure in a row.
+    assert!(message_boxes.begin_channel_difference(CHANNEL));
+    fail(&mut message_boxes, now);
+    assert!(message_boxes.begin_channel_difference(CHANNEL));
+    fail(&mut message_boxes, now);
+    assert_eq!(
+        time_of_next_difference(&mut message_boxes, now),
+        now + secs(2)
     );
 }
 
@@ -1537,12 +2208,31 @@ impl Server {
         self.wire.push(self.events.len() - 1);
     }
 
+    /// `updateChannelTooLong`, with the channel's current `pts`.
+    fn too_long(&self, channel_id: i64) -> UpdatesLike {
+        UpdatesLike::Updates(
+            tl::types::UpdateShort {
+                update: self.channel_too_long(channel_id),
+                date: self.state.date,
+            }
+            .into(),
+        )
+    }
+
+    fn channel_too_long(&self, channel_id: i64) -> tl::enums::Update {
+        tl::types::UpdateChannelTooLong {
+            channel_id,
+            pts: Some(self.pts(Key::Channel(channel_id))),
+        }
+        .into()
+    }
+
     /// Answer `updates.getDifference` from the state it asks from.
     fn difference(
         &self,
         request: &tl::functions::updates::GetDifference,
         slice: bool,
-        channel_updates: bool,
+        channels: Channels,
     ) -> tl::enums::updates::Difference {
         let pending = self
             .events
@@ -1581,17 +2271,28 @@ impl Server {
                 other_updates.push(event.update());
             }
         }
-        // The server may add channel updates from the same stretch of time.
-        if channel_updates {
-            other_updates.extend(
-                self.events
-                    .iter()
-                    .filter(|event| {
-                        matches!(event.key, Key::Channel(_))
-                            && (first.id..=last.id).contains(&event.id)
+        // The server may add something about the channels from the same stretch of time.
+        let channel_events = self.events.iter().filter(|event| {
+            matches!(event.key, Key::Channel(_)) && (first.id..=last.id).contains(&event.id)
+        });
+        match channels {
+            Channels::Nothing => {}
+            Channels::Updates => other_updates.extend(channel_events.map(Event::update)),
+            Channels::TooLong => {
+                let mut too_long = channel_events
+                    .filter_map(|event| match event.key {
+                        Key::Channel(channel_id) => Some(channel_id),
+                        _ => None,
                     })
-                    .map(Event::update),
-            );
+                    .collect::<Vec<_>>();
+                too_long.sort_unstable();
+                too_long.dedup();
+                other_updates.extend(
+                    too_long
+                        .into_iter()
+                        .map(|channel_id| self.channel_too_long(channel_id)),
+                );
+            }
         }
         if sliced {
             // The state after the slice's last event, but never behind the request: the client
@@ -1627,10 +2328,7 @@ impl Server {
         request: &tl::functions::updates::GetChannelDifference,
         limit: usize,
     ) -> tl::enums::updates::ChannelDifference {
-        let tl::enums::InputChannel::Channel(channel) = &request.channel else {
-            panic!("the message boxes ask for a channel");
-        };
-        let key = Key::Channel(channel.channel_id);
+        let key = Key::Channel(channel_of(request));
         let pending = self
             .events
             .iter()
@@ -1750,25 +2448,46 @@ impl Client {
         );
     }
 
-    fn serve_difference(&mut self, server: &Server, slice: bool, channel_updates: bool) -> bool {
+    fn serve_difference(&mut self, server: &Server, slice: bool, channels: Channels) -> bool {
         let Some(request) = self.message_boxes.get_difference() else {
             return false;
         };
-        let difference = server.difference(&request, slice, channel_updates);
+        let difference = server.difference(&request, slice, channels);
         let (returned, _, _) = self.message_boxes.apply_difference(difference, self.now);
         self.handed_out(server, &returned);
         true
     }
 
-    fn serve_channel_difference(&mut self, server: &Server, limit: usize) -> bool {
+    /// Fetch a channel difference, if one is due, at most `limit` events, or give up on it for
+    /// now (`fail`). With `open`, the user opens that channel while the request is in flight.
+    fn serve_channel_difference(
+        &mut self,
+        server: &Server,
+        limit: usize,
+        fail: bool,
+        open: Option<i64>,
+    ) -> bool {
         let Some(request) = self.message_boxes.get_channel_difference() else {
             return false;
         };
-        let difference = server.channel_difference(&request, limit);
-        let (returned, _, _) = self
-            .message_boxes
-            .apply_channel_difference(difference, self.now);
-        self.handed_out(server, &returned);
+        if let Some(channel) = open {
+            assert!(self.message_boxes.begin_channel_difference(channel));
+        }
+        let channel_id = channel_of(&request);
+        if fail {
+            let returned = self.message_boxes.end_channel_difference(
+                channel_id,
+                PrematureEndReason::TemporaryServerIssues,
+                self.now,
+            );
+            self.handed_out(server, &returned);
+        } else {
+            let difference = server.channel_difference(&request, limit);
+            let (returned, _, _) = self
+                .message_boxes
+                .apply_channel_difference(channel_id, difference, self.now);
+            self.handed_out(server, &returned);
+        }
         true
     }
 }
@@ -1801,9 +2520,28 @@ enum Op {
     /// Time passes and the client checks its deadlines.
     Wait { millis: u64 },
     /// The client fetches the account difference, if one is due.
-    ServeDifference { slice: bool, channel_updates: bool },
-    /// The client fetches a channel difference, if one is due, or gives up on it for now.
-    ServeChannelDifference { limit: usize, fail: bool },
+    ServeDifference { slice: bool, channels: Channels },
+    /// The client fetches a channel difference, if one is due, or gives up on it for now; the
+    /// user may open a channel meanwhile.
+    ServeChannelDifference {
+        limit: usize,
+        fail: bool,
+        open: Option<i64>,
+    },
+    /// The server says a channel has too many updates to send.
+    TooLong { channel: i64 },
+    /// The user opens a channel.
+    Open { channel: i64 },
+}
+
+/// What the server adds to an account difference about the channels.
+#[derive(Clone, Copy, Debug)]
+enum Channels {
+    Nothing,
+    /// Channel updates from the same stretch of time.
+    Updates,
+    /// `updateChannelTooLong` for the channels with updates in that stretch of time.
+    TooLong,
 }
 
 fn op() -> impl Strategy<Value = Op> {
@@ -1827,14 +2565,23 @@ fn op() -> impl Strategy<Value = Op> {
         1 => any::<usize>().prop_map(|index| Op::Lose { index }),
         2 => prop_oneof![0..400u64, 400..2_000u64, Just(16 * 60 * 1_000u64)]
             .prop_map(|millis| Op::Wait { millis }),
-        2 => (any::<bool>(), any::<bool>()).prop_map(|(slice, channel_updates)| {
-            Op::ServeDifference {
-                slice,
-                channel_updates,
-            }
-        }),
-        2 => (1..=3usize, prop::bool::weighted(0.1))
-            .prop_map(|(limit, fail)| Op::ServeChannelDifference { limit, fail }),
+        2 => (
+            any::<bool>(),
+            prop_oneof![
+                Just(Channels::Nothing),
+                Just(Channels::Updates),
+                Just(Channels::TooLong)
+            ]
+        )
+            .prop_map(|(slice, channels)| Op::ServeDifference { slice, channels }),
+        2 => (
+            1..=3usize,
+            prop::bool::weighted(0.1),
+            prop::option::weighted(0.2, prop_oneof![Just(CHANNEL_A), Just(CHANNEL_B)])
+        )
+            .prop_map(|(limit, fail, open)| Op::ServeChannelDifference { limit, fail, open }),
+        1 => prop_oneof![Just(CHANNEL_A), Just(CHANNEL_B)].prop_map(|channel| Op::TooLong { channel }),
+        1 => prop_oneof![Just(CHANNEL_A), Just(CHANNEL_B)].prop_map(|channel| Op::Open { channel }),
     ]
 }
 
@@ -1903,24 +2650,22 @@ fn run(ops: Vec<(Op, bool)>) {
                 let deadline = client.message_boxes.check_deadlines(client.now);
                 assert!(deadline >= client.now, "a deadline in the past spins");
             }
-            Op::ServeDifference {
-                slice,
-                channel_updates,
-            } => {
-                client.serve_difference(&server, slice, channel_updates);
+            Op::ServeDifference { slice, channels } => {
+                client.serve_difference(&server, slice, channels);
             }
-            Op::ServeChannelDifference { limit, fail } => {
-                if fail {
-                    if client.message_boxes.get_channel_difference().is_some() {
-                        let returned = client.message_boxes.end_channel_difference(
-                            PrematureEndReason::TemporaryServerIssues,
-                            client.now,
-                        );
-                        client.handed_out(&server, &returned);
-                    }
-                } else {
-                    client.serve_channel_difference(&server, limit);
-                }
+            Op::ServeChannelDifference { limit, fail, open } => {
+                client.serve_channel_difference(&server, limit, fail, open);
+            }
+            Op::TooLong { channel } => {
+                let too_long = server.too_long(channel);
+                let (returned, _, _) = client
+                    .message_boxes
+                    .process_updates(too_long, client.now)
+                    .expect("a lone updateChannelTooLong is no gap");
+                client.handed_out(&server, &returned);
+            }
+            Op::Open { channel } => {
+                assert!(client.message_boxes.begin_channel_difference(channel));
             }
         }
         client.check_pending();
@@ -1941,8 +2686,12 @@ fn run(ops: Vec<(Op, bool)>) {
     for _ in 0..3 {
         client.now += NO_UPDATES_TIMEOUT + POSSIBLE_GAP_TIMEOUT;
         client.message_boxes.check_deadlines(client.now);
-        while client.serve_difference(&server, false, false)
-            || client.serve_channel_difference(&server, usize::MAX)
+        // A quiet channel is never diffed by itself (TF7): the user opens it.
+        for channel in [CHANNEL_A, CHANNEL_B] {
+            assert!(client.message_boxes.begin_channel_difference(channel));
+        }
+        while client.serve_difference(&server, false, Channels::Nothing)
+            || client.serve_channel_difference(&server, usize::MAX, false, None)
         {}
     }
     client.store(&server, &base);

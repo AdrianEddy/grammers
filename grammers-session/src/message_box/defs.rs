@@ -52,7 +52,22 @@ pub(super) const POSSIBLE_GAP_TIMEOUT: Duration = Duration::from_millis(500);
 ///
 /// Documentation recommends 15 minutes without updates
 /// (<https://core.telegram.org/api/updates>).
+///
+/// Only the account has this deadline ([`MessageBoxes::account_deadline`]). A quiet channel isn't
+/// a sign of missed updates: the server asks for its difference with `updateChannelTooLong` when
+/// it has too many to send, and the documentation says not to get a channel's difference again
+/// after a final one "unless the user has opened the channel/supergroup", which is the caller's to
+/// decide ([`MessageBoxes::begin_channel_difference`]).
 pub(super) const NO_UPDATES_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+/// How long a channel waits to get its difference again after it failed for a temporary reason
+/// ([`super::PrematureEndReason::TemporaryServerIssues`]). The wait doubles with each failure in a
+/// row, up to [`CHANNEL_RETRY_MAX`], and starts over once the server answers. These are
+/// tdesktop's (`failDifferenceStartTimerFor`); TDLib's are close (1 s doubling to about 60 s,
+/// with jitter, `retry_get_channel_difference_later`). There is no jitter here: the message boxes
+/// stay deterministic, and one client's channels don't fail in step with other clients'.
+pub(super) const CHANNEL_RETRY_MIN: Duration = Duration::from_secs(1);
+pub(super) const CHANNEL_RETRY_MAX: Duration = Duration::from_secs(64);
 
 /// A sortable [`MessageBox`] entry key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -71,11 +86,17 @@ pub(super) struct LiveEntry {
     /// The local persistent timestamp value that this [`MessageBox`] has.
     pub(super) pts: i32,
 
-    /// When we would get the update difference if no updates arrived before then.
-    pub(super) deadline: Now,
-
     /// If the entry has a gap and may soon trigger the need to get difference.
     pub(super) possible_gap: Option<PossibleGap>,
+
+    /// When a channel whose difference failed for a temporary reason gets it again. It is cleared
+    /// once the channel's difference begins, by this deadline or any other way, so it fires at
+    /// most once per failure. Never set for the account's boxes.
+    pub(super) retry_at: Option<Now>,
+
+    /// The channel's last wait before getting its difference again ([`CHANNEL_RETRY_MIN`]):
+    /// zero until its difference fails, and again once the server answers.
+    pub(super) retry_delay: Duration,
 
     /// Updates for the channel that arrived while it got its difference, held until the difference
     /// ends ([`MessageBoxes::process_updates`]). Empty while it gets none. The account's boxes
@@ -97,6 +118,13 @@ pub struct MessageBoxes {
 
     /// Optimization field to quickly query all entries that are currently being fetched.
     pub(super) getting_diff_for: Vec<Key>,
+
+    /// When the account gets its difference if neither of its boxes hears from the server before
+    /// then ([`NO_UPDATES_TIMEOUT`]). Both boxes always get their difference together, so they
+    /// share one deadline: a box that is quiet while the other one isn't, like the secondary box
+    /// of an account without secret chats, doesn't make the account poll. `Duration::MAX` (never)
+    /// while the account has no state.
+    pub(super) account_deadline: Now,
 
     /// Updates for the account's boxes that arrived while the account got its difference, held
     /// until the difference ends ([`MessageBoxes::process_updates`]). Both boxes always get it
@@ -257,14 +285,13 @@ pub enum MessageBox {
 /// don't move the state: those waiting while a gap may still fill, and those postponed while their
 /// box gets its difference ([`MessageBoxes::process_updates`]). No update the boxes drop moves it
 /// either. So storing the delta together with the returned updates never stores state ahead of
-/// the updates it stands for, except where the state jumps past events no update returns. The
-/// caller reads those from the raw response before passing it in:
+/// the updates it stands for, except where the server itself skips events. The caller reads those
+/// from the raw response before passing it in:
 ///
 /// - `updates.differenceTooLong` moves the common `pts` to the server's and returns no update.
 /// - `updates.channelDifferenceTooLong` moves the channel's `pts` to its `dialog`'s, and its
 ///   `dialog` and `messages` are dropped.
-/// - `updateChannelTooLong` with a `pts` moves the channel's `pts` to it, also for a channel
-///   that has an entry.
+/// - `updateChannelTooLong` for a channel without an entry starts one at the update's `pts`.
 ///
 /// A call can also advance the state without returning an update or skipping an event:
 /// `updates.differenceEmpty` moves `date` and `seq`, and `updates.channelDifferenceEmpty` moves a

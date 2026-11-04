@@ -36,19 +36,22 @@ pub struct UpdatesReceiver {
     should_get_state: bool,
 }
 
+/// Fill in the channel's access hash and the limit, and return the request with its channel's id,
+/// or end the channel's difference and return `None` if its hash isn't known.
 async fn prepare_channel_difference(
     mut request: tl::functions::updates::GetChannelDifference,
     session: Arc<ErasedSession>,
     message_box: &mut MessageBoxes,
     now: Now,
 ) -> Result<
-    Option<tl::functions::updates::GetChannelDifference>,
+    Option<(i64, tl::functions::updates::GetChannelDifference)>,
     Box<dyn std::error::Error + Send + Sync>,
 > {
-    let id = match &request.channel {
-        tl::enums::InputChannel::Channel(channel) => PeerId::channel_unchecked(channel.channel_id),
+    let channel_id = match &request.channel {
+        tl::enums::InputChannel::Channel(channel) => channel.channel_id,
         _ => unreachable!(),
     };
+    let id = PeerId::channel_unchecked(channel_id);
 
     if let Some(PeerInfo::Channel {
         id,
@@ -74,14 +77,14 @@ async fn prepare_channel_difference(
             USER_CHANNEL_DIFF_LIMIT
         };
         trace!(?request, "requesting");
-        Ok(Some(request))
+        Ok(Some((channel_id, request)))
     } else {
         warn!(
             channel_id = ?id,
             "cannot getChannelDifference as we're missing its hash",
         );
         // Nothing comes back for a channel whose state is dropped.
-        let _ = message_box.end_channel_difference(PrematureEndReason::Banned, now);
+        let _ = message_box.end_channel_difference(channel_id, PrematureEndReason::Banned, now);
         Ok(None)
     }
 }
@@ -185,7 +188,7 @@ impl UpdatesReceiver {
                 continue;
             }
 
-            if let Some(request) = get_channel_diff {
+            if let Some((channel_id, request)) = get_channel_diff {
                 let maybe_response = self.invoke(&request).await;
 
                 let response = match maybe_response {
@@ -193,19 +196,14 @@ impl UpdatesReceiver {
                     Err(e) if e.is("PERSISTENT_TIMESTAMP_OUTDATED") => {
                         // According to Telegram's docs:
                         // "Channel internal replication issues, try again later (treat this like an RPC_CALL_FAIL)."
-                        // We can treat this as "empty difference" and not update the local pts.
-                        // Then this same call will be retried when another gap is detected or timeout expires.
-                        //
-                        // Another option would be to literally treat this like an RPC_CALL_FAIL and retry after a few
-                        // seconds, but if Telegram is having issues it's probably best to wait for it to send another
-                        // update (hinting it may be okay now) and retry then.
-                        //
-                        // This is a bit hacky because MessageBox doesn't really have a way to "not update" the pts.
-                        // Instead we manually extract the previously-known pts and use that.
+                        // End the difference without moving the channel's pts. The message boxes get it
+                        // again after a backoff, or sooner on the channel's next gap or
+                        // `updateChannelTooLong` (`PrematureEndReason::TemporaryServerIssues`).
                         warn!(
                             "Getting difference for channel updates caused PersistentTimestampOutdated; ending getting difference prematurely until server issues are resolved"
                         );
                         let updates = self.message_box.end_channel_difference(
+                            channel_id,
                             PrematureEndReason::TemporaryServerIssues,
                             self.now(),
                         );
@@ -218,14 +216,17 @@ impl UpdatesReceiver {
                             "Account is now banned so we can no longer fetch updates with request",
                         );
                         // Nothing comes back for a channel whose state is dropped.
-                        let _ = self
-                            .message_box
-                            .end_channel_difference(PrematureEndReason::Banned, self.now());
+                        let _ = self.message_box.end_channel_difference(
+                            channel_id,
+                            PrematureEndReason::Banned,
+                            self.now(),
+                        );
                         continue;
                     }
                     Err(InvocationError::Rpc(rpc_error)) if rpc_error.code == 500 => {
                         warn!("Telegram is having internal issues: {:#?}", rpc_error);
                         let updates = self.message_box.end_channel_difference(
+                            channel_id,
                             PrematureEndReason::TemporaryServerIssues,
                             self.now(),
                         );
@@ -235,9 +236,9 @@ impl UpdatesReceiver {
                     Err(e) => return Err(e),
                 };
 
-                let (updates, users, chats) = self
-                    .message_box
-                    .apply_channel_difference(response, self.now());
+                let (updates, users, chats) =
+                    self.message_box
+                        .apply_channel_difference(channel_id, response, self.now());
                 self.extend_update_queue(updates, users, chats);
                 continue;
             }
