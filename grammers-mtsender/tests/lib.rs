@@ -22,6 +22,7 @@ fn enable_tracing() {
 }
 
 #[test]
+#[ignore = "live: test DC"]
 fn test_invoke_encrypted_method() {
     use std::str::FromStr;
 
@@ -69,6 +70,7 @@ fn test_invoke_encrypted_method() {
 }
 
 #[test]
+#[ignore = "live: test DC"]
 #[cfg(feature = "proxy")]
 fn test_connection_through_proxy() {
     use std::str::FromStr;

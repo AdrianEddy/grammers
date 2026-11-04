@@ -1,0 +1,59 @@
+# CI of MultiChat's fork: the crates MultiChat uses, built the way it builds them (`grammers-session` without its
+# default `sqlite-storage`). The tests that dial Telegram are `#[ignore = "live: test DC"]`: live traffic never runs
+# from CI, they run only in the owner's own sessions.
+
+name: mc
+
+on:
+  push:
+    branches: ["mc/**"]
+  pull_request:
+    branches: ["mc/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CRATES: -p grammers-crypto -p grammers-mtproto -p grammers-mtsender -p grammers-session -p grammers-tl-types --no-default-features
+  # MultiChat's `rust-version`.
+  MSRV: "1.95"
+  # The fork keeps no Cargo.lock, so each job resolves afresh. Resolve as MultiChat's resolver 3 does: the newest
+  # versions the resolving toolchain can build (the fork declares no `rust-version`, so cargo takes the toolchain's).
+  CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: fallback
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install "$MSRV" --profile minimal --component clippy && rustup toolchain install stable --profile minimal && rustup default stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # Clippy at the MSRV, so new lints arrive only with an MSRV change. It runs first because the first command
+      # resolves: what the MSRV can build, stable can too.
+      - run: cargo "+$MSRV" clippy $CRATES --all-targets -- -D warnings
+      - run: cargo test $CRATES
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install "$MSRV" --profile minimal
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo "+$MSRV" build $CRATES

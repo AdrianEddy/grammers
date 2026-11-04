@@ -1261,11 +1261,9 @@ impl Mtp for Encrypted {
             })
             .to_bytes();
 
-            if self.try_serialize_msg(buffer, &body, false).is_none() {
-                // This should take priority during the next packet.
-                // Don't allow other requests through until this can be sent.
-                return None;
-            }
+            // This should take priority during the next packet.
+            // Don't allow other requests through until this can be sent.
+            self.try_serialize_msg(buffer, &body, false)?;
         }
 
         // Requests that are too large would cause Telegram to close the
