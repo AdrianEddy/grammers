@@ -15,6 +15,11 @@ Used to log messages during update processing.
 
 Used to test that this file lists all dependencies from `Cargo.toml`.
 
+## proptest
+
+Used to test update processing against a simulated server, with updates that arrive out of order,
+twice or never.
+
 ## libsql
 
 SQLite-based session storage.

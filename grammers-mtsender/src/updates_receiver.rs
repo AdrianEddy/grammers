@@ -12,11 +12,11 @@ use std::sync::Arc;
 use grammers_session::storages::ErasedSession;
 use grammers_session::types::{PeerId, PeerInfo, UpdateState, UpdatesState};
 use grammers_session::updates::{
-    MessageBoxes, PrematureEndReason, State, UpdateAndPeers, UpdatesLike,
+    MessageBoxes, Now, PrematureEndReason, State, UpdateAndPeers, UpdatesLike,
 };
 use grammers_tl_types::{self as tl, Deserializable};
 use tokio::sync::mpsc;
-use tokio::time::timeout_at;
+use tokio::time::{Instant, timeout_at};
 use tracing::{info, trace, warn};
 
 use crate::{InvocationError, SenderPoolHandle, UpdatesConfiguration};
@@ -28,6 +28,8 @@ const USER_CHANNEL_DIFF_LIMIT: i32 = 100;
 pub struct UpdatesReceiver {
     handle: SenderPoolHandle,
     session: Arc<ErasedSession>,
+    /// The origin of the time passed to `message_box`.
+    epoch: Instant,
     message_box: MessageBoxes,
     updates: mpsc::Receiver<UpdatesLike>,
     buffer: VecDeque<UpdateAndPeers>,
@@ -38,6 +40,7 @@ async fn prepare_channel_difference(
     mut request: tl::functions::updates::GetChannelDifference,
     session: Arc<ErasedSession>,
     message_box: &mut MessageBoxes,
+    now: Now,
 ) -> Result<
     Option<tl::functions::updates::GetChannelDifference>,
     Box<dyn std::error::Error + Send + Sync>,
@@ -77,7 +80,8 @@ async fn prepare_channel_difference(
             channel_id = ?id,
             "cannot getChannelDifference as we're missing its hash",
         );
-        message_box.end_channel_difference(PrematureEndReason::Banned);
+        // Nothing comes back for a channel whose state is dropped.
+        let _ = message_box.end_channel_difference(PrematureEndReason::Banned, now);
         Ok(None)
     }
 }
@@ -89,8 +93,9 @@ impl UpdatesReceiver {
         updates: mpsc::Receiver<UpdatesLike>,
         configuration: UpdatesConfiguration,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let epoch = Instant::now();
         let message_box = if configuration.catch_up {
-            MessageBoxes::load(session.updates_state().await?)
+            MessageBoxes::load(session.updates_state().await?, epoch.elapsed())
         } else {
             // If the user doesn't want to bother with catching up on previous update, start with
             // pristine state instead.
@@ -103,6 +108,7 @@ impl UpdatesReceiver {
         Ok(UpdatesReceiver {
             handle,
             session,
+            epoch,
             message_box,
             updates,
             buffer: VecDeque::new(),
@@ -137,7 +143,7 @@ impl UpdatesReceiver {
                             channels: Vec::new(),
                         }))
                         .await?;
-                    self.message_box.set_state(state);
+                    self.message_box.set_state(state, self.now());
                 }
                 Err(_err) => {
                     // The account may no longer actually be logged in, or it can rarely fail.
@@ -151,13 +157,20 @@ impl UpdatesReceiver {
                 if let Some(update) = self.buffer.pop_front() {
                     return Ok(update);
                 }
+                let now = self.now();
                 (
-                    self.message_box.check_deadlines(), // first, as it might trigger differences
+                    // first, as it might trigger differences
+                    self.epoch + self.message_box.check_deadlines(now),
                     self.message_box.get_difference(),
                     match self.message_box.get_channel_difference() {
                         Some(gd) => {
-                            prepare_channel_difference(gd, session.clone(), &mut self.message_box)
-                                .await?
+                            prepare_channel_difference(
+                                gd,
+                                session.clone(),
+                                &mut self.message_box,
+                                now,
+                            )
+                            .await?
                         }
                         None => None,
                     },
@@ -166,7 +179,8 @@ impl UpdatesReceiver {
 
             if let Some(request) = get_diff {
                 let response = self.invoke(&request).await?;
-                let (updates, users, chats) = self.message_box.apply_difference(response);
+                let (updates, users, chats) =
+                    self.message_box.apply_difference(response, self.now());
                 self.extend_update_queue(updates, users, chats);
                 continue;
             }
@@ -191,10 +205,11 @@ impl UpdatesReceiver {
                         warn!(
                             "Getting difference for channel updates caused PersistentTimestampOutdated; ending getting difference prematurely until server issues are resolved"
                         );
-                        {
-                            self.message_box
-                                .end_channel_difference(PrematureEndReason::TemporaryServerIssues);
-                        }
+                        let updates = self.message_box.end_channel_difference(
+                            PrematureEndReason::TemporaryServerIssues,
+                            self.now(),
+                        );
+                        self.extend_update_queue(updates, Vec::new(), Vec::new());
                         continue;
                     }
                     Err(e) if e.is("CHANNEL_PRIVATE") => {
@@ -202,29 +217,32 @@ impl UpdatesReceiver {
                             ?request,
                             "Account is now banned so we can no longer fetch updates with request",
                         );
-                        {
-                            self.message_box
-                                .end_channel_difference(PrematureEndReason::Banned);
-                        }
+                        // Nothing comes back for a channel whose state is dropped.
+                        let _ = self
+                            .message_box
+                            .end_channel_difference(PrematureEndReason::Banned, self.now());
                         continue;
                     }
                     Err(InvocationError::Rpc(rpc_error)) if rpc_error.code == 500 => {
                         warn!("Telegram is having internal issues: {:#?}", rpc_error);
-                        {
-                            self.message_box
-                                .end_channel_difference(PrematureEndReason::TemporaryServerIssues);
-                        }
+                        let updates = self.message_box.end_channel_difference(
+                            PrematureEndReason::TemporaryServerIssues,
+                            self.now(),
+                        );
+                        self.extend_update_queue(updates, Vec::new(), Vec::new());
                         continue;
                     }
                     Err(e) => return Err(e),
                 };
 
-                let (updates, users, chats) = self.message_box.apply_channel_difference(response);
+                let (updates, users, chats) = self
+                    .message_box
+                    .apply_channel_difference(response, self.now());
                 self.extend_update_queue(updates, users, chats);
                 continue;
             }
 
-            match timeout_at(deadline.into(), self.updates.recv()).await {
+            match timeout_at(deadline, self.updates.recv()).await {
                 Ok(Some(updates)) => self.process_socket_updates(updates).await,
                 Ok(None) => break Err(InvocationError::Dropped("updates channel was closed")),
                 Err(_) => {}
@@ -246,6 +264,11 @@ impl UpdatesReceiver {
         Ok(())
     }
 
+    /// The current time for `message_box`.
+    fn now(&self) -> Now {
+        self.epoch.elapsed()
+    }
+
     async fn invoke<R: tl::RemoteCall>(&self, request: &R) -> Result<R::Return, InvocationError> {
         let dc_id = self.session.clone().home_dc_id()?;
         self.handle
@@ -255,7 +278,7 @@ impl UpdatesReceiver {
     }
 
     async fn process_socket_updates(&mut self, updates: UpdatesLike) {
-        if let Ok((updates, users, chats)) = self.message_box.process_updates(updates) {
+        if let Ok((updates, users, chats)) = self.message_box.process_updates(updates, self.now()) {
             self.extend_update_queue(updates, users, chats);
         }
     }

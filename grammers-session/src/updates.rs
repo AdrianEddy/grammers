@@ -11,7 +11,8 @@
 use grammers_tl_types::{self as tl, Deserializable as _};
 
 pub use crate::message_box::{
-    Gap, MessageBox, MessageBoxes, PrematureEndReason, State, UpdateAndPeers, UpdatesLike,
+    CommonState, DiffPending, Gap, MessageBox, MessageBoxes, Now, PrematureEndReason, State,
+    StateDelta, UpdateAndPeers, UpdatesLike,
 };
 
 impl UpdatesLike {

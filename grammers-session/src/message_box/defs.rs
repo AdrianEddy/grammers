@@ -7,13 +7,19 @@
 // except according to those terms.
 
 use std::time::Duration;
-#[cfg(not(test))]
-use std::time::Instant;
 
 use grammers_tl_types as tl;
 
-#[cfg(test)]
-use super::tests::Instant;
+use crate::types::ChannelState;
+
+/// Monotonic time chosen by the caller: how long it has been since an origin of its choice,
+/// such as the client's start.
+///
+/// [`MessageBoxes`] never reads a clock. Every method that arms or checks a deadline takes the
+/// current time instead, so tests can drive the 0.5 s gap wait and the 15 minute idle deadline
+/// with a paused or simulated clock. It must never decrease between calls on the same
+/// [`MessageBoxes`].
+pub type Now = Duration;
 
 /// Telegram sends `seq` equal to `0` when "it doesn't matter", so we use that value too.
 pub(super) const NO_SEQ: i32 = 0;
@@ -65,11 +71,16 @@ pub(super) struct LiveEntry {
     /// The local persistent timestamp value that this [`MessageBox`] has.
     pub(super) pts: i32,
 
-    /// Next instant when we would get the update difference if no updates arrived before then.
-    pub(super) deadline: Instant,
+    /// When we would get the update difference if no updates arrived before then.
+    pub(super) deadline: Now,
 
     /// If the entry has a gap and may soon trigger the need to get difference.
     pub(super) possible_gap: Option<PossibleGap>,
+
+    /// Updates for the channel that arrived while it got its difference, held until the difference
+    /// ends ([`MessageBoxes::process_updates`]). Empty while it gets none. The account's boxes
+    /// hold theirs in [`MessageBoxes::account_postponed`].
+    pub(super) postponed: Vec<tl::enums::Update>,
 }
 
 /// Contains all live message boxes and is able to process incoming updates for each of them.
@@ -87,8 +98,49 @@ pub struct MessageBoxes {
     /// Optimization field to quickly query all entries that are currently being fetched.
     pub(super) getting_diff_for: Vec<Key>,
 
-    /// Optimization field holding the closest deadline instant.
-    pub(super) next_deadline: Instant,
+    /// Updates for the account's boxes that arrived while the account got its difference, held
+    /// until the difference ends ([`MessageBoxes::process_updates`]). Both boxes always get it
+    /// together, so they share this, also while the secondary box has no entry yet.
+    pub(super) account_postponed: Vec<tl::enums::Update>,
+
+    /// The `seq_start` and `seq` of each sequenced container that arrived while the account got
+    /// its difference. The difference replaces the local `seq`, so they are checked against the
+    /// difference's once it ends.
+    pub(super) postponed_seq: Vec<(i32, i32)>,
+
+    /// Optimization field: no deadline is earlier than this one. It can be earlier than the
+    /// closest deadline, because a deadline that moves later doesn't move it;
+    /// [`MessageBoxes::check_deadlines`] recomputes it once it passes.
+    pub(super) next_deadline: Now,
+
+    /// What changed since the last [`MessageBoxes::take_delta`].
+    pub(super) dirty: DirtySet,
+}
+
+/// The parts of the state that changed since the last [`MessageBoxes::take_delta`].
+#[derive(Debug, Default)]
+pub(super) struct DirtySet {
+    /// The common box's `pts`, the `date` or the `seq` changed.
+    pub(super) common: bool,
+    /// The secondary box's `qts` changed.
+    pub(super) qts: bool,
+    /// Channels whose entry was inserted, changed or removed. Sorted and without duplicates, so
+    /// it never names more channels than were ever seen, even if nobody takes the delta.
+    pub(super) channels: Vec<i64>,
+}
+
+impl DirtySet {
+    pub(super) fn mark(&mut self, key: Key) {
+        match key {
+            Key::Common => self.common = true,
+            Key::Secondary => self.qts = true,
+            Key::Channel(id) => {
+                if let Err(i) = self.channels.binary_search(&id) {
+                    self.channels.insert(i, id);
+                }
+            }
+        }
+    }
 }
 
 /// Represents the information needed to correctly handle a specific `tl::enums::Update`.
@@ -109,7 +161,7 @@ pub(super) struct PtsInfo {
 // the updates produced by the RPC request take a while to arrive (whereas the read update comes faster alone).
 #[derive(Debug)]
 pub(super) struct PossibleGap {
-    pub(super) deadline: Instant,
+    pub(super) deadline: Now,
     /// Pending updates (those with a larger PTS, producing the gap which may later be filled).
     pub(super) updates: Vec<tl::enums::Update>,
 }
@@ -196,4 +248,56 @@ pub enum MessageBox {
     ///
     /// This includes "megagroup", "broadcast" and "supergroup" channels.
     Channel { channel_id: i64, pts: i32 },
+}
+
+/// What the message boxes advanced since the previous [`MessageBoxes::take_delta`]: the current
+/// value of each part of the state that changed, and nothing else.
+///
+/// Taken right after a call, it covers exactly the updates that call returned. Updates held back
+/// don't move the state: those waiting while a gap may still fill, and those postponed while their
+/// box gets its difference ([`MessageBoxes::process_updates`]). No update the boxes drop moves it
+/// either. So storing the delta together with the returned updates never stores state ahead of
+/// the updates it stands for, except where the state jumps past events no update returns. The
+/// caller reads those from the raw response before passing it in:
+///
+/// - `updates.differenceTooLong` moves the common `pts` to the server's and returns no update.
+/// - `updates.channelDifferenceTooLong` moves the channel's `pts` to its `dialog`'s, and its
+///   `dialog` and `messages` are dropped.
+/// - `updateChannelTooLong` with a `pts` moves the channel's `pts` to it, also for a channel
+///   that has an entry.
+///
+/// A call can also advance the state without returning an update or skipping an event:
+/// `updates.differenceEmpty` moves `date` and `seq`, and `updates.channelDifferenceEmpty` moves a
+/// channel's `pts`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StateDelta {
+    /// The common box's state, if its `pts`, the `date` or the `seq` changed.
+    pub common: Option<CommonState>,
+    /// The secondary box's `qts`, if it changed.
+    pub qts: Option<i32>,
+    /// The channels whose state was set or changed, sorted by id.
+    pub channels: Vec<ChannelState>,
+    /// The channels whose state was dropped, sorted by id.
+    pub removed_channels: Vec<i64>,
+}
+
+/// The common box's state, with the `date` and `seq` that go with it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommonState {
+    /// Common box `pts`.
+    pub pts: i32,
+    /// Last `date` Telegram assigned.
+    pub date: i32,
+    /// Last `seq` Telegram assigned.
+    pub seq: i32,
+}
+
+/// The differences waiting to be fetched.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DiffPending {
+    /// `updates.getDifference` is due ([`MessageBoxes::get_difference`]).
+    pub account: bool,
+    /// How many channels wait for `updates.getChannelDifference`
+    /// ([`MessageBoxes::get_channel_difference`]).
+    pub channels: usize,
 }
