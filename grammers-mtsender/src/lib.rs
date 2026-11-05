@@ -20,6 +20,10 @@
 //! Generally, there will be a single `SenderPool` instance per client,
 //! although many tasks can share access to the same `SenderPool` via
 //! multiple [`SenderPoolHandle`]s.
+//!
+//! The library opens no socket of its own: every connection runs over a
+//! byte stream that a [`Dialer`] opens for its [`DialTarget`]. The default,
+//! [`TokioTcpDialer`], connects directly over TCP.
 
 #![deny(unsafe_code)]
 
@@ -34,7 +38,9 @@ pub use configuration::{
     AutoSleep, ConnectionParams, NoRetries, RetryContext, RetryPolicy, UpdatesConfiguration,
 };
 pub use errors::{InvocationError, ReadError, RpcError};
-pub use net::ServerAddr;
+#[cfg(feature = "proxy")]
+pub use net::Socks5Dialer;
+pub use net::{ConnKind, DialFuture, DialTarget, Dialer, MtStream, TokioTcpDialer};
 pub use sender::{Sender, connect, connect_with_auth, generate_auth_key};
 pub use sender_pool::{SenderPool, SenderPoolFatHandle, SenderPoolHandle, SenderPoolRunner};
 pub use updates_receiver::UpdatesReceiver;

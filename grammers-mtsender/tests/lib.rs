@@ -11,6 +11,16 @@ pub const TELEGRAM_TEST_DC_2: &str = "149.154.167.40:443";
 /// The default datacenter to connect to for testing.
 pub const TELEGRAM_DEFAULT_TEST_DC: &str = TELEGRAM_TEST_DC_2;
 
+/// The dial target of [`TELEGRAM_TEST_DC_2`].
+fn test_dc_2() -> grammers_mtsender::DialTarget {
+    grammers_mtsender::DialTarget {
+        dc_id: 2,
+        kind: grammers_mtsender::ConnKind::Main,
+        ipv4: Some(TELEGRAM_TEST_DC_2.parse().unwrap()),
+        ipv6: None,
+    }
+}
+
 fn enable_tracing() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -24,10 +34,8 @@ fn enable_tracing() {
 #[test]
 #[ignore = "live: test DC"]
 fn test_invoke_encrypted_method() {
-    use std::str::FromStr;
-
-    use grammers_mtproto::transport;
-    use grammers_mtsender::connect;
+    use grammers_mtproto::{authentication, transport};
+    use grammers_mtsender::{TokioTcpDialer, connect};
     use grammers_tl_types::{LAYER, enums, functions};
     use tokio::runtime;
 
@@ -40,9 +48,9 @@ fn test_invoke_encrypted_method() {
     rt.block_on(async {
         let mut sender = connect(
             transport::Full::new(),
-            grammers_mtsender::ServerAddr::Tcp {
-                address: std::net::SocketAddr::from_str(TELEGRAM_TEST_DC_2).unwrap(),
-            },
+            &TokioTcpDialer,
+            &test_dc_2(),
+            &authentication::telegram_rsa_keys(),
         )
         .await
         .unwrap();
@@ -73,13 +81,12 @@ fn test_invoke_encrypted_method() {
 #[ignore = "live: test DC"]
 #[cfg(feature = "proxy")]
 fn test_connection_through_proxy() {
-    use std::str::FromStr;
     use std::sync::Arc;
 
     use grammers_mtproto::authentication;
     use grammers_mtproto::mtp;
     use grammers_mtproto::transport;
-    use grammers_mtsender::Sender;
+    use grammers_mtsender::{Sender, Socks5Dialer};
     use socks5_server::{
         Command, Server,
         auth::Password,
@@ -128,13 +135,14 @@ fn test_connection_through_proxy() {
             }
         });
 
+        let dialer =
+            Socks5Dialer::new(&format!("socks5://grammers:6772616d6d657273@{socks5_addr}"))
+                .unwrap();
         let mut sender = Sender::connect(
             transport::Full::new(),
             mtp::Plain::new(),
-            grammers_mtsender::ServerAddr::Proxied {
-                address: std::net::SocketAddr::from_str(TELEGRAM_TEST_DC_2).unwrap(),
-                proxy: format!("socks5://grammers:6772616d6d657273@{socks5_addr}"),
-            },
+            &dialer,
+            &test_dc_2(),
         )
         .await
         .unwrap();
@@ -142,7 +150,7 @@ fn test_connection_through_proxy() {
         // Don't need to run the entire flow, just prove that we can send and receive data.
         let (request, data) = authentication::step1().unwrap();
         let response = sender.invoke(&request).await.unwrap();
-        authentication::step2(data, response).unwrap();
+        authentication::step2(data, response, &authentication::telegram_rsa_keys()).unwrap();
 
         drop(sender);
         socks5_task.await.unwrap(); // also make sure proxy finished handling a single connection cleanly

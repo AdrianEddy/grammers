@@ -3038,3 +3038,24 @@ fn answers_for_a_box_not_getting_its_difference_are_dropped() {
     assert!(returned.is_empty());
     assert_eq!(message_boxes.take_delta(), channel_delta(30));
 }
+
+#[test]
+fn lagged_updates_are_a_gap() {
+    // Updates dropped on a full channel: the account's difference begins at once, the state
+    // stays where it was.
+    let mut message_boxes = settled(T0);
+    assert_eq!(
+        message_boxes.process_updates(UpdatesLike::Lagged, T0),
+        Err(Gap)
+    );
+    assert_eq!(
+        message_boxes.difference_pending(),
+        DiffPending {
+            account: true,
+            channels: 0
+        }
+    );
+    assert_eq!(message_boxes.check_deadlines(T0), T0);
+    assert_eq!(message_boxes.take_delta(), StateDelta::default());
+    assert_eq!(message_boxes.session_state(), loaded_state());
+}

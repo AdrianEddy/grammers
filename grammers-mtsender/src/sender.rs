@@ -18,25 +18,29 @@
     )
 )]
 
+use std::future::poll_fn;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::task::Poll;
 use std::time::{Duration, SystemTime};
 use std::{io, thread};
 
+use grammers_crypto::rsa;
 use grammers_mtproto::transport::Transport;
 use grammers_mtproto::{MAX_REQUEST_SIZE, mtp};
 use grammers_mtproto::{MsgId, authentication, connection};
 use grammers_session::updates::UpdatesLike;
 use grammers_tl_types::{self as tl, Deserializable, RemoteCall};
 use tl::Serializable;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncWriteExt, ReadBuf};
 use tokio::sync::oneshot;
 use tokio::sync::oneshot::error::TryRecvError;
-use tokio::time::{Instant, sleep_until};
+use tokio::time::{Instant, Sleep, sleep};
 use tracing::{debug, error, info, trace, warn};
 
 use crate::RpcError;
 use crate::errors::{InvocationError, ReadError};
-use crate::net::{NetStream, ServerAddr};
+use crate::net::{DialTarget, Dialer, MtStream};
 
 /// Every how often are pings sent?
 const PING_DELAY: Duration = Duration::from_secs(60);
@@ -75,11 +79,21 @@ pub(crate) fn generate_random_id() -> i64 {
 
 /// Manages enqueuing requests, matching them to their response, and IO.
 pub struct Sender<T: Transport, M: mtp::Mtp> {
-    stream: NetStream,
-    addr: ServerAddr,
+    stream: Box<dyn MtStream>,
+    /// Whether the stream took bytes it hasn't flushed: `AsyncWrite` lets it hold them until then.
+    unflushed: bool,
     state: connection::State<T, M>,
     requests: Vec<Request>,
-    next_ping: Instant,
+    /// Fires when the next keepalive ping is due.
+    ping: Pin<Box<Sleep>>,
+}
+
+/// What was ready in one [`Sender::step`]: the bytes written and read, if the stream took or had
+/// any, and whether the ping timer fired. `written` also carries a failed flush.
+struct Ready {
+    written: Option<io::Result<usize>>,
+    read: Option<io::Result<usize>>,
+    ping: bool,
 }
 
 struct Request {
@@ -110,18 +124,24 @@ impl MsgIdPair {
 }
 
 impl<T: Transport, M: mtp::Mtp> Sender<T, M> {
-    /// Create a new connection using the specified transport, MTP state and server address.
+    /// Create a new connection using the specified transport and MTP state, over the stream
+    /// `dialer` opens to `target`.
     ///
     /// Note that this does not attempt to invoke [`tl::functions::InitConnection`].
-    /// It will simply open a new socket connection to the provided address.
-    pub async fn connect(transport: T, mtp: M, addr: ServerAddr) -> Result<Self, io::Error> {
-        let stream = NetStream::connect(&addr).await?;
+    /// It will simply open a new stream to the provided target.
+    pub async fn connect(
+        transport: T,
+        mtp: M,
+        dialer: &dyn Dialer,
+        target: &DialTarget,
+    ) -> Result<Self, io::Error> {
+        let stream = dialer.dial(target).await?;
         Ok(Self {
             stream,
-            addr,
+            unflushed: false,
             state: connection::State::new(transport, mtp),
             requests: vec![],
-            next_ping: Instant::now() + PING_DELAY,
+            ping: Box::pin(sleep(PING_DELAY)),
         })
     }
 
@@ -130,7 +150,7 @@ impl<T: Transport, M: mtp::Mtp> Sender<T, M> {
     /// Any further [`Self::invoke`] or [`Self::step`] will return an error.
     /// This method is useful if one wants to explicitly handle on-close errors.
     pub async fn disconnect(&mut self) -> io::Result<()> {
-        self.stream.disconnect().await
+        self.stream.shutdown().await
     }
 
     /// Serializes the given request, enqueues it to the internal buffer,
@@ -203,29 +223,11 @@ impl<T: Transport, M: mtp::Mtp> Sender<T, M> {
     pub async fn step(&mut self) -> Result<Vec<UpdatesLike>, ReadError> {
         self.try_fill_write();
 
-        let (mut reader, mut writer) = self.stream.split();
-        let sleep = sleep_until(self.next_ping);
-        let (read, write) = self.state.io_buffers();
-
-        trace!(
-            "reading bytes and sending up to {} bytes via network",
-            write.len()
-        );
-        let res = tokio::select! {
-            n = reader.read(read) => {
-                n.map_err(ReadError::Io).and_then(|n| self.on_net_read(n))
-            }
-            n = writer.write(write), if !write.is_empty() => {
-                n.map_err(ReadError::Io).map(|n| {
-                    self.on_net_write(n);
-                    Vec::new()
-                })
-            }
-            _ = sleep => {
-                self.on_ping_timeout();
-                Ok(Vec::new())
-            }
-        };
+        let ready = self.ready().await;
+        if ready.ping {
+            self.on_ping_timeout();
+        }
+        let res = self.on_ready(ready);
 
         match res {
             Ok(ok) => Ok(ok),
@@ -234,6 +236,82 @@ impl<T: Transport, M: mtp::Mtp> Sender<T, M> {
                 Err(err)
             }
         }
+    }
+
+    /// Wait until the stream takes bytes or has bytes, or the ping timer fires, and do all of
+    /// these that are ready in one poll: the stream's read and write halves are polled together,
+    /// so it needs no split and no lock.
+    ///
+    /// While the stream holds bytes it took (`unflushed`), each poll also flushes it. A finished
+    /// flush is no reason to return, and a failed one is reported as a failed write.
+    fn ready(&mut self) -> impl Future<Output = Ready> {
+        trace!(
+            "reading bytes and sending up to {} bytes via network",
+            self.state.io_buffers().1.len()
+        );
+        poll_fn(|cx| {
+            let (read, write) = self.state.io_buffers();
+            let mut stream = Pin::new(&mut *self.stream);
+
+            // The flush goes first, so that it never fails in the poll of a write: `on_ready` needs
+            // that write's count to match an answer read in this poll. A step that wrote ends, so
+            // the next poll, which flushes it, comes at once.
+            let mut written = None;
+            if self.unflushed {
+                match stream.as_mut().poll_flush(cx) {
+                    Poll::Ready(Ok(())) => self.unflushed = false,
+                    Poll::Ready(Err(error)) => written = Some(Err(error)),
+                    Poll::Pending => {}
+                }
+            }
+
+            if written.is_none() && !write.is_empty() {
+                written = match stream.as_mut().poll_write(cx, write) {
+                    // A stream that takes none of a non-empty buffer can't take more.
+                    Poll::Ready(Ok(0)) => Some(Err(io::ErrorKind::WriteZero.into())),
+                    Poll::Ready(n) => {
+                        self.unflushed = true;
+                        Some(n)
+                    }
+                    Poll::Pending => None,
+                };
+            }
+
+            let mut buf = ReadBuf::new(read);
+            let read = match stream.poll_read(cx, &mut buf) {
+                Poll::Ready(result) => Some(result.map(|()| buf.filled().len())),
+                Poll::Pending => None,
+            };
+
+            let ping = self.ping.as_mut().poll(cx).is_ready();
+
+            if written.is_none() && read.is_none() && !ping {
+                Poll::Pending
+            } else {
+                Poll::Ready(Ready {
+                    written,
+                    read,
+                    ping,
+                })
+            }
+        })
+    }
+
+    /// Handle what [`Self::ready`] found: first the bytes written, so that a request whose
+    /// bytes left is marked sent before any answer is read, then the bytes read. A failed write
+    /// or flush is returned last: the answers that arrived with it still reach their requests.
+    fn on_ready(&mut self, ready: Ready) -> Result<Vec<UpdatesLike>, ReadError> {
+        let written = ready.written.transpose().map_err(ReadError::Io);
+        if let Ok(Some(n)) = written {
+            self.on_net_write(n);
+        }
+        let updates = match ready.read {
+            Some(read) => read
+                .map_err(ReadError::Io)
+                .and_then(|n| self.on_net_read(n)),
+            None => Ok(Vec::new()),
+        };
+        written.and(updates)
     }
 
     /// Setup the write buffer for the transport, unless a write is already pending.
@@ -313,7 +391,7 @@ impl<T: Transport, M: mtp::Mtp> Sender<T, M> {
             .to_bytes(),
             tx,
         );
-        self.next_ping = Instant::now() + PING_DELAY;
+        self.ping.as_mut().reset(Instant::now() + PING_DELAY);
     }
 
     /// Handle errors that occured while performing I/O.
@@ -579,26 +657,33 @@ impl<T: Transport> Sender<T, mtp::Encrypted> {
     }
 }
 
-/// Helper function to [`Sender::connect`] a plain transport and [`generate_auth_key`] on it.
+/// Helper function to [`Sender::connect`] a plain transport and [`generate_auth_key`] on it,
+/// with whichever of `rsa_keys` the server names.
 pub async fn connect<T: Transport>(
     transport: T,
-    addr: ServerAddr,
+    dialer: &dyn Dialer,
+    target: &DialTarget,
+    rsa_keys: &[rsa::Key],
 ) -> Result<Sender<T, mtp::Encrypted>, InvocationError> {
-    let sender = Sender::connect(transport, mtp::Plain::new(), addr).await?;
-    generate_auth_key(sender).await
+    let sender = Sender::connect(transport, mtp::Plain::new(), dialer, target).await?;
+    generate_auth_key(sender, rsa_keys).await
 }
 
 /// Uses the input plain sender to carry the Authorization Key generation process,
 /// and returns an encrypted sender reusing the same connection, transport and buffers.
+///
+/// The key is encrypted to whichever of `rsa_keys` the server names by its fingerprint
+/// ([`authentication::telegram_rsa_keys`] for Telegram's servers).
 pub async fn generate_auth_key<T: Transport>(
     mut sender: Sender<T, mtp::Plain>,
+    rsa_keys: &[rsa::Key],
 ) -> Result<Sender<T, mtp::Encrypted>, InvocationError> {
     info!("generating new authorization key...");
     let (request, data) = authentication::step1()?;
     debug!("gen auth key: sending step 1");
     let response = sender.invoke(&request).await?;
     debug!("gen auth key: starting step 2");
-    let (request, data) = authentication::step2(data, response)?;
+    let (request, data) = authentication::step2(data, response, rsa_keys)?;
     debug!("gen auth key: sending step 2");
     let response = sender.invoke(&request).await?;
     debug!("gen auth key: starting step 3");
@@ -609,23 +694,32 @@ pub async fn generate_auth_key<T: Transport>(
     let auth = authentication::create_key(data, response)?;
     info!("authorization key generated successfully");
 
+    let mut ping = sender.ping;
+    ping.as_mut().reset(Instant::now() + PING_DELAY);
     Ok(Sender {
         stream: sender.stream,
-        addr: sender.addr,
+        unflushed: sender.unflushed,
         state: sender.state.into_encrypted(auth),
         requests: sender.requests,
-        next_ping: Instant::now() + PING_DELAY,
+        ping,
     })
 }
 
 /// Helper function to [`Sender::connect`] an encrypted transport with a previous Authorization Key.
 pub async fn connect_with_auth<T: Transport>(
     transport: T,
-    addr: ServerAddr,
+    dialer: &dyn Dialer,
+    target: &DialTarget,
     auth_key: [u8; 256],
 ) -> Result<Sender<T, mtp::Encrypted>, io::Error> {
-    Sender::connect(transport, mtp::Encrypted::build().finish(auth_key), addr).await
+    Sender::connect(
+        transport,
+        mtp::Encrypted::build().finish(auth_key),
+        dialer,
+        target,
+    )
+    .await
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -22,7 +22,8 @@
 //!     let (request, data) = authentication::step1()?;
 //!     let response = send_data_to_server(&request)?;
 //!
-//!     let (request, data) = authentication::step2(data, response)?;
+//!     let keys = authentication::telegram_rsa_keys();
+//!     let (request, data) = authentication::step2(data, response, &keys)?;
 //!     let response = send_data_to_server(&request)?;
 //!
 //!     let (request, data) = authentication::step3(data, response)?;
@@ -266,9 +267,14 @@ fn do_step1(random_bytes: &[u8; 16]) -> Result<(tl::functions::ReqPqMulti, Step1
 }
 
 /// The second step of the process to generate an Authorization Key.
+///
+/// The server's answer lists the fingerprints of the RSA keys it holds; the request is encrypted
+/// to the first one `keys` has a key for. [`telegram_rsa_keys`] are the keys of Telegram's
+/// servers.
 pub fn step2(
     data: Step1,
     response: tl::enums::ResPq,
+    keys: &[rsa::Key],
 ) -> Result<(tl::functions::ReqDhParams, Step2), Error> {
     if TRACE_AUTH_GEN {
         println!("< {}", hex::to_hex(&response.to_bytes()));
@@ -284,7 +290,7 @@ pub fn step2(
         println!("r {}{}", hex::to_hex(&new_nonce), hex::to_hex(&rsa_random));
     }
 
-    let res = do_step2(data, response, &new_nonce, &rsa_random);
+    let res = do_step2(data, response, keys, &new_nonce, &rsa_random);
     if TRACE_AUTH_GEN && let Ok((x, _)) = &res {
         println!("> {}", hex::to_hex(&x.to_bytes()));
     }
@@ -294,6 +300,7 @@ pub fn step2(
 fn do_step2(
     data: Step1,
     response: tl::enums::ResPq,
+    keys: &[rsa::Key],
     new_nonce: &[u8; 32],
     random_bytes: &[u8; 224],
 ) -> Result<(tl::functions::ReqDhParams, Step2), Error> {
@@ -331,17 +338,22 @@ fn do_step2(
     .to_bytes();
 
     // sha_digest + data + random_bytes
-    let Some((fingerprint, key)) = res_pq
-        .server_public_key_fingerprints
-        .iter()
-        .find_map(|&fingerprint| key_for_fingerprint(fingerprint).map(|key| (fingerprint, key)))
+    let Some((fingerprint, key)) =
+        res_pq
+            .server_public_key_fingerprints
+            .iter()
+            .find_map(|&fingerprint| {
+                keys.iter()
+                    .find(|key| key.fingerprint() == fingerprint)
+                    .map(|key| (fingerprint, key))
+            })
     else {
         return Err(Error::UnknownFingerprints {
             fingerprints: res_pq.server_public_key_fingerprints.clone(),
         });
     };
 
-    let ciphertext = rsa::encrypt_hashed(&pq_inner_data, &key, random_bytes);
+    let ciphertext = rsa::encrypt_hashed(&pq_inner_data, key, random_bytes);
 
     Ok((
         tl::functions::ReqDhParams {
@@ -727,25 +739,29 @@ fn minimal_be_bytes(n: u64) -> Vec<u8> {
         .collect()
 }
 
-/// Find the RSA key's `(n, e)` pair for a certain fingerprint.
-#[allow(clippy::unreadable_literal)]
-fn key_for_fingerprint(fingerprint: i64) -> Option<rsa::Key> {
-    Some(match fingerprint {
-        // Production
-        -3414540481677951611 => rsa::Key::new(
-            "29379598170669337022986177149456128565388431120058863768162556424047512191330847455146576344487764408661701890505066208632169112269581063774293102577308490531282748465986139880977280302242772832972539403531316010870401287642763009136156734339538042419388722777357134487746169093539093850251243897188928735903389451772730245253062963384108812842079887538976360465290946139638691491496062099570836476454855996319192747663615955633778034897140982517446405334423701359108810182097749467210509584293428076654573384828809574217079944388301239431309115013843331317877374435868468779972014486325557807783825502498215169806323",
-            "65537",
-        )?,
-        // Test
-        -5595554452916591101 => rsa::Key::new(
-            "25342889448840415564971689590713473206898847759084779052582026594546022463853940585885215951168491965708222649399180603818074200620463776135424884632162512403163793083921641631564740959529419359595852941166848940585952337613333022396096584117954892216031229237302943701877588456738335398602461675225081791820393153757504952636234951323237820036543581047826906120927972487366805292115792231423684261262330394324750785450942589751755390156647751460719351439969059949569615302809050721500330239005077889855323917509948255722081644689442127297605422579707142646660768825302832201908302295573257427896031830742328565032949",
-            "65537",
-        )?,
-
-        _ => return None,
-    })
+/// The RSA keys of Telegram's servers, production and test, for [`step2`].
+#[expect(
+    clippy::expect_used,
+    reason = "the constants below, which `telegram_rsa_keys_have_their_fingerprints` pins; not server data"
+)]
+pub fn telegram_rsa_keys() -> Vec<rsa::Key> {
+    [TELEGRAM_PRODUCTION_RSA_N, TELEGRAM_TEST_RSA_N]
+        .into_iter()
+        .map(|n| rsa::Key::new(n, TELEGRAM_RSA_E).expect("valid constant"))
+        .collect()
 }
 
+/// The modulus of the RSA key of Telegram's production datacenters, in decimal.
+const TELEGRAM_PRODUCTION_RSA_N: &str = "29379598170669337022986177149456128565388431120058863768162556424047512191330847455146576344487764408661701890505066208632169112269581063774293102577308490531282748465986139880977280302242772832972539403531316010870401287642763009136156734339538042419388722777357134487746169093539093850251243897188928735903389451772730245253062963384108812842079887538976360465290946139638691491496062099570836476454855996319192747663615955633778034897140982517446405334423701359108810182097749467210509584293428076654573384828809574217079944388301239431309115013843331317877374435868468779972014486325557807783825502498215169806323";
+
+/// The modulus of the RSA key of Telegram's test datacenters, in decimal.
+const TELEGRAM_TEST_RSA_N: &str = "25342889448840415564971689590713473206898847759084779052582026594546022463853940585885215951168491965708222649399180603818074200620463776135424884632162512403163793083921641631564740959529419359595852941166848940585952337613333022396096584117954892216031229237302943701877588456738335398602461675225081791820393153757504952636234951323237820036543581047826906120927972487366805292115792231423684261262330394324750785450942589751755390156647751460719351439969059949569615302809050721500330239005077889855323917509948255722081644689442127297605422579707142646660768825302832201908302295573257427896031830742328565032949";
+
+/// The public exponent of both of Telegram's RSA keys.
+const TELEGRAM_RSA_E: &str = "65537";
+
+#[cfg(test)]
+mod rsa_key_tests;
 #[cfg(test)]
 mod server_data_tests;
 
@@ -786,7 +802,13 @@ mod tests {
         let response = tl::enums::ResPq::from_bytes(&step1_response).unwrap();
 
         let (new_nonce, rsa_random) = step2_random.split_first_chunk::<32>().unwrap();
-        let (request, data) = do_step2(data, response, new_nonce, rsa_random.try_into().unwrap())?;
+        let (request, data) = do_step2(
+            data,
+            response,
+            &telegram_rsa_keys(),
+            new_nonce,
+            rsa_random.try_into().unwrap(),
+        )?;
         assert_eq!(request.to_bytes(), step2_request);
         let response = tl::enums::ServerDhParams::from_bytes(&step2_response).unwrap();
 

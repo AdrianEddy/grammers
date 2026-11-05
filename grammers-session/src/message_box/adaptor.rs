@@ -379,7 +379,9 @@ pub(super) fn adapt(updates: UpdatesLike) -> Result<tl::types::UpdatesCombined, 
         })),
         UpdatesLike::InvitedUsers(invited) => adapt_updates(invited.updates),
         UpdatesLike::ChatInviteJoinResult(result) => adapt_updates(result.updates),
-        UpdatesLike::ConnectionClosed | UpdatesLike::MalformedUpdates => Err(Gap),
+        UpdatesLike::ConnectionClosed | UpdatesLike::MalformedUpdates | UpdatesLike::Lagged => {
+            Err(Gap)
+        }
     }
 }
 

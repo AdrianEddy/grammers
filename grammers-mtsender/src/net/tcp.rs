@@ -6,112 +6,25 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
-pub use tokio::net::tcp::{ReadHalf, WriteHalf};
 use tracing::info;
 
-use super::ServerAddr;
+use super::{DialFuture, DialTarget, Dialer, MtStream};
 
-pub enum NetStream {
-    Tcp(TcpStream),
-    #[cfg(feature = "proxy")]
-    ProxySocks5(tokio_socks::tcp::Socks5Stream<TcpStream>),
-}
+/// Dials a direct TCP connection with tokio, to the target's IPv4 address first and to its IPv6
+/// address if that fails ([`DialTarget::connect_any`]), with Nagle's algorithm off.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TokioTcpDialer;
 
-impl NetStream {
-    pub(crate) fn split(&mut self) -> (ReadHalf<'_>, WriteHalf<'_>) {
-        match self {
-            Self::Tcp(stream) => stream.split(),
-            #[cfg(feature = "proxy")]
-            Self::ProxySocks5(stream) => stream.split(),
-        }
-    }
-
-    pub(crate) async fn connect(addr: &ServerAddr) -> Result<Self, std::io::Error> {
-        info!("connecting...");
-        match addr {
-            ServerAddr::Tcp { address } => Ok(NetStream::Tcp(TcpStream::connect(address).await?)),
-            #[cfg(feature = "proxy")]
-            ServerAddr::Proxied { address, proxy } => {
-                Self::connect_proxy_stream(address, proxy).await
-            }
-        }
-    }
-
-    #[cfg(feature = "proxy")]
-    async fn connect_proxy_stream(
-        addr: &std::net::SocketAddr,
-        proxy_url: &str,
-    ) -> Result<NetStream, std::io::Error> {
-        use std::{
-            io::{self, ErrorKind},
-            net::{IpAddr, SocketAddr},
-        };
-
-        use hickory_resolver::Resolver;
-        use url::Host;
-
-        let proxy = url::Url::parse(proxy_url)
-            .map_err(|err| io::Error::new(ErrorKind::InvalidData, err))?;
-        let scheme = proxy.scheme();
-        let host = proxy.host().ok_or(io::Error::new(
-            ErrorKind::NotFound,
-            format!("proxy host is missing from url: {}", proxy_url),
-        ))?;
-        let port = proxy.port().ok_or(io::Error::new(
-            ErrorKind::NotFound,
-            format!("proxy port is missing from url: {}", proxy_url),
-        ))?;
-        let username = proxy.username();
-        let password = proxy.password().unwrap_or("");
-        let socks_addr = match host {
-            Host::Domain(domain) => {
-                let resolver = Resolver::builder_tokio().unwrap().build().unwrap();
-                let response = resolver
-                    .lookup_ip(domain)
-                    .await
-                    .map_err(|err| io::Error::new(ErrorKind::Other, err))?;
-                let socks_ip_addr = response.iter().next().ok_or(io::Error::new(
-                    ErrorKind::NotFound,
-                    format!("proxy host did not return any ip address: {}", domain),
-                ))?;
-                SocketAddr::new(socks_ip_addr, port)
-            }
-            Host::Ipv4(v4) => SocketAddr::new(IpAddr::from(v4), port),
-            Host::Ipv6(v6) => SocketAddr::new(IpAddr::from(v6), port),
-        };
-
-        match scheme {
-            "socks5" => {
-                if username.is_empty() {
-                    Ok(NetStream::ProxySocks5(
-                        tokio_socks::tcp::Socks5Stream::connect(socks_addr, addr)
-                            .await
-                            .map_err(|err| io::Error::new(ErrorKind::ConnectionAborted, err))?,
-                    ))
-                } else {
-                    Ok(NetStream::ProxySocks5(
-                        tokio_socks::tcp::Socks5Stream::connect_with_password(
-                            socks_addr, addr, username, password,
-                        )
-                        .await
-                        .map_err(|err| io::Error::new(ErrorKind::ConnectionAborted, err))?,
-                    ))
-                }
-            }
-            scheme => Err(io::Error::new(
-                ErrorKind::ConnectionAborted,
-                format!("proxy scheme not supported: {}", scheme),
-            )),
-        }
-    }
-
-    pub(crate) async fn disconnect(&mut self) -> std::io::Result<()> {
-        match self {
-            Self::Tcp(stream) => stream.shutdown().await,
-            #[cfg(feature = "proxy")]
-            Self::ProxySocks5(stream) => stream.shutdown().await,
-        }
+impl Dialer for TokioTcpDialer {
+    fn dial<'a>(&'a self, target: &'a DialTarget) -> DialFuture<'a> {
+        Box::pin(async move {
+            info!(dc_id = target.dc_id, kind = ?target.kind, "connecting...");
+            let stream = target.connect_any(TcpStream::connect).await?;
+            // A request is written whole: holding a small one back until the server acknowledges
+            // the last would only delay it.
+            stream.set_nodelay(true)?;
+            Ok(Box::new(stream) as Box<dyn MtStream>)
+        })
     }
 }

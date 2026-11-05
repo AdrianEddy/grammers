@@ -12,21 +12,62 @@
 
 use num_bigint::BigUint;
 
-use crate::{aes, sha256};
+use crate::{aes, sha1, sha256};
 
-/// RSA key.
+/// A server's RSA public key, the one the client encrypts its part of the auth-key handshake to.
 pub struct Key {
     n: BigUint,
     e: BigUint,
+    fingerprint: i64,
 }
 
 impl Key {
+    /// The key with the modulus `n` and the public exponent `e`, both in decimal.
+    ///
+    /// `None` if either doesn't parse, `n` doesn't take exactly 256 bytes, or `e` isn't between
+    /// 1 and `n`, exclusive. MTProto's RSA padding is defined for 256 bytes: [`encrypt_hashed`]
+    /// draws 256-byte values until one is below `n`, and its result is 256 bytes long.
     pub fn new(n: &str, e: &str) -> Option<Self> {
-        Some(Self {
-            n: BigUint::parse_bytes(n.as_bytes(), 10)?,
-            e: BigUint::parse_bytes(e.as_bytes(), 10)?,
-        })
+        let n = BigUint::parse_bytes(n.as_bytes(), 10)?;
+        let e = BigUint::parse_bytes(e.as_bytes(), 10)?;
+        if n.bits().div_ceil(8) != 256 || e <= BigUint::from(1u8) || e >= n {
+            return None;
+        }
+        let fingerprint = fingerprint(&n, &e);
+        Some(Self { n, e, fingerprint })
     }
+
+    /// The key's fingerprint, the identifier the server lists in `resPQ`'s
+    /// `server_public_key_fingerprints`: the 64 lower-order bits of the SHA-1 of the bare TL
+    /// `rsa_public_key n:bytes e:bytes`, little-endian, as Telegram's clients compute it.
+    pub fn fingerprint(&self) -> i64 {
+        self.fingerprint
+    }
+}
+
+/// [`Key::fingerprint`] of the key `(n, e)`.
+fn fingerprint(n: &BigUint, e: &BigUint) -> i64 {
+    let mut serialized = Vec::with_capacity(264);
+    push_tl_bytes(&mut serialized, &n.to_bytes_be());
+    push_tl_bytes(&mut serialized, &e.to_bytes_be());
+    let [_, _, _, _, _, _, _, _, _, _, _, _, low @ ..] = sha1!(&serialized);
+    i64::from_le_bytes(low)
+}
+
+/// Append `data` as a TL `bytes`: its length (one byte, or 254 and three bytes), the data, and
+/// zeros up to a multiple of 4. `data` is shorter than 2^24 bytes: [`Key::new`] keeps `n` and `e`
+/// within 256.
+fn push_tl_bytes(buffer: &mut Vec<u8>, data: &[u8]) {
+    let header = if data.len() <= 253 {
+        buffer.push(data.len() as u8);
+        1
+    } else {
+        let [b0, b1, b2, _] = (data.len() as u32).to_le_bytes();
+        buffer.extend_from_slice(&[254, b0, b1, b2]);
+        4
+    };
+    buffer.extend_from_slice(data);
+    buffer.resize(buffer.len() + (4 - (header + data.len()) % 4) % 4, 0);
 }
 
 /// Increment data by 1 when interpreted as a big-endian big int.

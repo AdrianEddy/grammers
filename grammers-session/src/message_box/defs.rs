@@ -260,6 +260,10 @@ pub enum UpdatesLike {
     /// update) or the updates were cut short during deserialization (very unlikely).
     /// This should be treated as a gap.
     MalformedUpdates,
+    /// Indicates that received updates were dropped because the bounded channel
+    /// carrying them was full. Sent once there is room again, before any later
+    /// update from the same connection. This should be treated as a gap.
+    Lagged,
 }
 
 // Public interface around the more tightly-packed internal state.

@@ -47,6 +47,10 @@ jobs:
       # resolves: what the MSRV can build, stable can too.
       - run: cargo "+$MSRV" clippy $CRATES --all-targets -- -D warnings
       - run: cargo test $CRATES
+      # What MultiChat doesn't build: `grammers-mtsender`'s default `os-detect` (the OS probes behind
+      # `ConnectionParams::default()`) and `proxy` (`Socks5Dialer`), linted, and the proxy dialer tested offline.
+      - run: cargo "+$MSRV" clippy -p grammers-mtsender --all-features --all-targets -- -D warnings
+      - run: cargo test -p grammers-mtsender --no-default-features --features proxy --test seam
 
   msrv:
     runs-on: ubuntu-latest

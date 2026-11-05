@@ -8,11 +8,15 @@
 
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::ops::ControlFlow;
+use std::sync::Arc;
 use std::time::Duration;
 
+use grammers_crypto::rsa;
+use grammers_mtproto::authentication;
 use grammers_mtproto::transport::{self, Transport};
 
 use crate::errors::{InvocationError, RpcError};
+use crate::net::{Dialer, TokioTcpDialer};
 
 const DEFAULT_LOCALE: &str = "en";
 
@@ -42,20 +46,15 @@ pub struct ConnectionParams {
     /// a [language pack link](https://core.telegram.org/api/links#language-pack-links).
     pub lang_code: String,
 
-    /// URL of the proxy to use. Requires the `proxy` feature to be enabled.
-    ///
-    /// The scheme must be `socks5`. Username and password are optional, e.g.:
-    /// - socks5://127.0.0.1:1234
-    /// - socks5://username:password@example.com:5678
-    ///
-    /// Both a host and port must be provided. If a domain is used for the host, its address will be looked up,
-    /// and the first IP address found will be used. If a different IP address should be used, consider resolving
-    /// the host manually and selecting an IP address of your choice.
-    #[cfg(feature = "proxy")]
-    pub proxy_url: Option<String>,
+    /// Opens the byte stream of every connection, for the datacenter and kind of connection it
+    /// is for. A [`TokioTcpDialer`] by default; with the `proxy` feature, a `Socks5Dialer`
+    /// connects through a SOCKS5 proxy.
+    pub dialer: Arc<dyn Dialer>,
 
-    /// Whether to connect via IPv6 instead of defaulting to IPv4.
-    pub use_ipv6: bool,
+    /// The servers' RSA public keys, one of which a new authorization key is encrypted to: the
+    /// one whose fingerprint the server names. Telegram's
+    /// ([`authentication::telegram_rsa_keys`]) by default; a test server supplies its own.
+    pub server_rsa_keys: Arc<[rsa::Key]>,
 
     /// The retry policy to use when encountering errors after invoking a request.
     pub retry_policy: Box<dyn RetryPolicy>,
@@ -63,7 +62,9 @@ pub struct ConnectionParams {
     /// Maximum number of updates that can be buffered in the internal channel
     /// between the network senders and the updates receiver.
     ///
-    /// When the channel is full, newly received updates are **dropped**.
+    /// When the channel is full, newly received updates are **dropped**, and an
+    /// [`grammers_session::updates::UpdatesLike::Lagged`] is sent once there is room again, so that
+    /// the receiver can fetch what it missed.
     pub updates_channel_capacity: NonZeroUsize,
 
     pub transport: Box<TransportFactory>,
@@ -121,11 +122,47 @@ pub struct AutoSleep {
 }
 
 impl Default for ConnectionParams {
-    /// Returns an instance with an [`AutoSleep::default`] retry policy,
-    /// with a capacity of 100 updates.
+    /// Returns an instance with an [`AutoSleep::default`] retry policy, a capacity of 100
+    /// updates, a [`TokioTcpDialer`] and Telegram's RSA keys.
+    ///
+    /// With the `os-detect` feature (on by default), the device model, system version and
+    /// language codes come from the operating system. Without it, they are static: the device
+    /// model is the operating system and the architecture the crate was built for (as
+    /// [`std::env::consts::OS`] and [`std::env::consts::ARCH`] name them), the system version
+    /// that operating system, and both language codes `en`. Either way, an application sets its
+    /// own.
     ///
     /// [`AutoSleep::default`]: super::AutoSleep::default
     fn default() -> Self {
+        let device = DeviceFields::new();
+        Self {
+            device_model: device.device_model,
+            system_version: device.system_version,
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            system_lang_code: device.system_lang_code,
+            lang_code: device.lang_code,
+            dialer: Arc::new(TokioTcpDialer),
+            server_rsa_keys: authentication::telegram_rsa_keys().into(),
+            retry_policy: Box::new(super::AutoSleep::default()),
+            updates_channel_capacity: NonZeroUsize::new(100).unwrap(),
+            transport: Box::new(|| Box::new(transport::Full::new())),
+            __non_exhaustive: (),
+        }
+    }
+}
+
+/// The fields of [`ConnectionParams`] that describe the device.
+struct DeviceFields {
+    device_model: String,
+    system_version: String,
+    system_lang_code: String,
+    lang_code: String,
+}
+
+impl DeviceFields {
+    /// Read from the operating system.
+    #[cfg(feature = "os-detect")]
+    fn new() -> Self {
         let info = os_info::get();
 
         let mut system_lang_code = String::new();
@@ -146,16 +183,21 @@ impl Default for ConnectionParams {
         Self {
             device_model: format!("{} {}", info.os_type(), info.bitness()),
             system_version: info.version().to_string(),
-            app_version: env!("CARGO_PKG_VERSION").to_string(),
             system_lang_code,
             lang_code,
-            use_ipv6: false,
-            #[cfg(feature = "proxy")]
-            proxy_url: None,
-            retry_policy: Box::new(super::AutoSleep::default()),
-            updates_channel_capacity: NonZeroUsize::new(100).unwrap(),
-            transport: Box::new(|| Box::new(transport::Full::new())),
-            __non_exhaustive: (),
+        }
+    }
+
+    /// Static: the build's operating system and architecture, and [`DEFAULT_LOCALE`].
+    #[cfg(not(feature = "os-detect"))]
+    fn new() -> Self {
+        use std::env::consts::{ARCH, OS};
+
+        Self {
+            device_model: format!("{OS} {ARCH}"),
+            system_version: OS.to_owned(),
+            system_lang_code: DEFAULT_LOCALE.to_owned(),
+            lang_code: DEFAULT_LOCALE.to_owned(),
         }
     }
 }

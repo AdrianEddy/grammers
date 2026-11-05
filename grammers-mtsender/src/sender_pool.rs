@@ -22,7 +22,7 @@ use std::num::NonZeroU32;
 use std::ops::{ControlFlow, Deref};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use std::{fmt, panic};
+use std::{fmt, io, panic};
 
 use grammers_mtproto::{MAX_REQUEST_SIZE, mtp, transport};
 use grammers_session::Session;
@@ -30,20 +30,28 @@ use grammers_session::storages::{ErasedSession, erase};
 use grammers_session::types::DcOption;
 use grammers_session::updates::UpdatesLike;
 use grammers_tl_types::{self as tl, Deserializable, enums};
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::AbortHandle;
 use tokio::{
     sync::{mpsc, oneshot},
     task::JoinSet,
-    time::sleep,
+    time::{sleep, timeout},
 };
 use tracing::{debug, info, warn};
 
 use crate::configuration::{ConnectionParams, RetryContext};
-use crate::errors::{InvocationError, ReadError};
-use crate::{Sender, ServerAddr, connect, connect_with_auth};
+use crate::errors::InvocationError;
+use crate::net::{ConnKind, DialTarget};
+use crate::{Sender, connect, connect_with_auth};
 
-/// How long to wait after warning the user that the updates was dropped.
+/// How long to wait after warning the user that updates were dropped before warning again.
 const UPDATES_DROPPED_LOG_COOLDOWN: Duration = Duration::from_secs(300);
+
+/// How long a new connection has to answer `initConnection`, from the dial on. The runner waits
+/// for it, so a peer that accepts and then says nothing can't hold the pool for longer. It leaves
+/// room for the slowest dial through [`DialTarget::connect_any`], 10 s on each of a target's two
+/// addresses, and for the handshake, including the second dial and handshake a `-404` asks for.
+const SETUP_TIMEOUT: Duration = Duration::from_secs(60);
 
 type InvokeResponse = Vec<u8>;
 
@@ -127,7 +135,12 @@ pub struct SenderPoolRunner {
     request_rx: mpsc::UnboundedReceiver<Request>,
     updates_tx: mpsc::Sender<UpdatesLike>,
     connections: Vec<ConnectionInfo>,
-    connection_pool: JoinSet<Result<(), ReadError>>,
+    /// The connections' tasks, each ending with the gap signal it still owed the updates
+    /// channel ([`UpdatesForwarder::finish`]).
+    connection_pool: JoinSet<Option<UpdatesLike>>,
+    /// A gap signal an ended connection owed the updates channel, sent once it has room. One
+    /// covers any number: each makes the receiver fetch the difference.
+    owed_signal: Option<UpdatesLike>,
 }
 
 impl Deref for SenderPoolFatHandle {
@@ -183,6 +196,9 @@ impl SenderPoolHandle {
 
     /// Communicate with the running [`SenderPoolRunner`] instance
     /// to drop all active connections and gracefully stop running.
+    ///
+    /// The runner takes it after the request it is handling, and a new connection's dial and
+    /// `initConnection` can take up to 60 seconds.
     pub fn quit(&self) -> bool {
         self.0.send(Request::Quit).is_ok()
     }
@@ -290,6 +306,7 @@ impl SenderPool {
                 updates_tx,
                 connections: Vec::new(),
                 connection_pool: JoinSet::new(),
+                owed_signal: None,
             },
             handle: SenderPoolFatHandle {
                 thin: SenderPoolHandle(request_tx),
@@ -310,14 +327,21 @@ impl SenderPoolRunner {
             tokio::select! {
                 biased;
                 Some(completion) = self.connection_pool.join_next(), if !self.connection_pool.is_empty() => {
-                    if let Err(err) = completion
-                        && let Ok(reason) = err.try_into_panic()
-                    {
-                        panic::resume_unwind(reason);
+                    match completion {
+                        Ok(Some(signal)) => {
+                            self.owed_signal.get_or_insert(signal);
+                        }
+                        Ok(None) => {}
+                        Err(err) => {
+                            if let Ok(reason) = err.try_into_panic() {
+                                panic::resume_unwind(reason);
+                            }
+                        }
                     }
                     self.connections
                         .retain(|connection| !connection.abort_handle.is_finished());
                 }
+                () = send_owed_signal(&self.updates_tx, &mut self.owed_signal), if self.owed_signal.is_some() => {}
                 request = self.request_rx.recv() => {
                     let flow = if let Some(request) = request {
                         self.process_request(request).await
@@ -379,14 +403,9 @@ impl SenderPoolRunner {
                 ControlFlow::Continue(())
             }
             Request::Disconnect { dc_id } => {
-                self.connections.retain(|connection| {
-                    if connection.dc_id == dc_id {
-                        connection.abort_handle.abort();
-                        false
-                    } else {
-                        true
-                    }
-                });
+                // Dropping `rpc_tx` ends `run_sender`, which hands back the signal it owes.
+                self.connections
+                    .retain(|connection| connection.dc_id != dc_id);
                 ControlFlow::Continue(())
             }
             Request::Quit => ControlFlow::Break(()),
@@ -394,13 +413,15 @@ impl SenderPoolRunner {
     }
 
     async fn create_connection(&mut self, dc_id: i32) -> Result<&ConnectionInfo, InvocationError> {
-        let mut dc_option = match self.session.dc_option(dc_id)? {
+        let dc_option = match self.session.dc_option(dc_id)? {
             Some(x) => x,
             None => return Err(InvocationError::InvalidDc),
         };
 
         let sender = self.connect_sender(&dc_option).await?;
 
+        // `connect_sender` stored the addresses the server gave for this datacenter.
+        let mut dc_option = self.session.dc_option(dc_id)?.unwrap_or(dc_option);
         dc_option.auth_key = Some(sender.auth_key());
         self.session.set_dc_option(&dc_option).await?;
 
@@ -408,7 +429,7 @@ impl SenderPoolRunner {
         let abort_handle = self.connection_pool.spawn(run_sender(
             sender,
             rpc_rx,
-            self.updates_tx.clone(),
+            UpdatesForwarder::new(self.updates_tx.clone()),
             dc_option.id == self.session.home_dc_id()?,
         ));
         Ok(self.connections.push_mut(ConnectionInfo {
@@ -423,23 +444,9 @@ impl SenderPoolRunner {
         dc_option: &DcOption,
     ) -> Result<Sender<Box<dyn transport::Transport + Send>, mtp::Encrypted>, InvocationError> {
         let transport = &self.connection_params.transport;
-
-        let address = if self.connection_params.use_ipv6 {
-            dc_option.ipv6.into()
-        } else {
-            dc_option.ipv4.into()
-        };
-
-        #[cfg(feature = "proxy")]
-        let addr = || {
-            if let Some(proxy) = self.connection_params.proxy_url.clone() {
-                ServerAddr::Proxied { address, proxy }
-            } else {
-                ServerAddr::Tcp { address }
-            }
-        };
-        #[cfg(not(feature = "proxy"))]
-        let addr = || ServerAddr::Tcp { address };
+        let dialer = &*self.connection_params.dialer;
+        let rsa_keys = &self.connection_params.server_rsa_keys;
+        let target = DialTarget::new(dc_option, ConnKind::Main);
 
         let init_connection = tl::functions::InvokeWithLayer {
             layer: tl::LAYER,
@@ -457,22 +464,28 @@ impl SenderPoolRunner {
             },
         };
 
-        let mut sender = if let Some(auth_key) = dc_option.auth_key {
-            connect_with_auth(transport(), addr(), auth_key)
-                .await
-                .map_err(InvocationError::Io)?
-        } else {
-            connect(transport(), addr()).await?
-        };
+        // Only the network part has a deadline: a session write is never cancelled.
+        let (sender, enums::Config::Config(remote_config)) = timeout(SETUP_TIMEOUT, async {
+            let mut sender = if let Some(auth_key) = dc_option.auth_key {
+                connect_with_auth(transport(), dialer, &target, auth_key)
+                    .await
+                    .map_err(InvocationError::Io)?
+            } else {
+                connect(transport(), dialer, &target, rsa_keys).await?
+            };
 
-        let enums::Config::Config(remote_config) = match sender.invoke(&init_connection).await {
-            Ok(config) => config,
-            Err(InvocationError::Transport(transport::Error::BadStatus { status: 404 })) => {
-                sender = connect(transport(), addr()).await?;
-                sender.invoke(&init_connection).await?
-            }
-            Err(e) => return Err(e),
-        };
+            let config = match sender.invoke(&init_connection).await {
+                Ok(config) => config,
+                Err(InvocationError::Transport(transport::Error::BadStatus { status: 404 })) => {
+                    sender = connect(transport(), dialer, &target, rsa_keys).await?;
+                    sender.invoke(&init_connection).await?
+                }
+                Err(e) => return Err(e),
+            };
+            Ok((sender, config))
+        })
+        .await
+        .map_err(|_| InvocationError::Io(io::ErrorKind::TimedOut.into()))??;
 
         self.update_dc_options(&remote_config.dc_options).await?;
 
@@ -544,60 +557,152 @@ impl SenderPoolRunner {
     }
 }
 
-async fn run_sender(
-    mut sender: Sender<Box<dyn transport::Transport + Send>, grammers_mtproto::mtp::Encrypted>,
-    mut rpc_rx: mpsc::UnboundedReceiver<Rpc>,
-    updates: mpsc::Sender<UpdatesLike>,
-    home_sender: bool,
-) -> Result<(), ReadError> {
-    let mut dropped: usize = 0;
-    let mut last_update_limit_warn = Instant::now();
-    let mut updates_closed = false;
+/// Wait for room in `updates`, then send it the `owed` signal. Without a receiver, the signal has
+/// nobody to reach, and is dropped.
+async fn send_owed_signal(updates: &mpsc::Sender<UpdatesLike>, owed: &mut Option<UpdatesLike>) {
+    let permit = updates.reserve().await;
+    if let (Ok(permit), Some(signal)) = (permit, owed.take()) {
+        permit.send(signal);
+    }
+}
 
+/// Drive `sender`, feeding it the requests from `rpc_rx` and forwarding its updates, until its
+/// connection fails or the runner drops the other end of `rpc_rx`. Returns the gap signal the
+/// updates channel is still owed ([`UpdatesForwarder::finish`]), for the runner to send.
+async fn run_sender<T: transport::Transport, M: mtp::Mtp>(
+    mut sender: Sender<T, M>,
+    mut rpc_rx: mpsc::UnboundedReceiver<Rpc>,
+    mut updates: UpdatesForwarder,
+    home_sender: bool,
+) -> Option<UpdatesLike> {
     loop {
         tokio::select! {
             step = sender.step() => match step {
                 Ok(all_new_updates) => {
-                    if updates_closed {
-                        continue;
-                    }
                     for new_updates in all_new_updates {
-                        if let Err(e) = updates.try_send(new_updates) {
-                            match e {
-                                mpsc::error::TrySendError::Full(_) => {
-                                    dropped += 1;
-                                    if last_update_limit_warn.elapsed() >= UPDATES_DROPPED_LOG_COOLDOWN {
-                                        warn!(
-                                            capacity = updates.max_capacity(),
-                                            dropped_count = dropped,
-                                            last_time = ?last_update_limit_warn.elapsed(),
-                                            "updates channel full",
-                                        );
-                                        dropped = 0;
-                                        last_update_limit_warn = Instant::now();
-                                    }
-                                }
-                                mpsc::error::TrySendError::Closed(_) => {
-                                    debug!("updates channel closed, stopping update forwarding");
-                                    updates_closed = true;
-                                    break;
-                                }
-                            }
-                        }
+                        updates.forward(new_updates);
                     }
-                },
-                Err(err) => {
-                    if home_sender {
-                        let _ = updates.try_send(UpdatesLike::ConnectionClosed);
-                    }
-                    break Err(err)
-                },
+                }
+                // `Sender::step` logged the error and failed the requests with it.
+                Err(_) => break updates.finish(home_sender),
             },
+            () = updates.send_lagged(), if updates.owes_lagged() => {}
             rpc = rpc_rx.recv() => match rpc {
                 Some(rpc) => sender.enqueue_body(rpc.body, rpc.tx),
-                None => break Ok(()),
+                None => break updates.finish(false),
             },
         }
+    }
+}
+
+/// Forwards one connection's updates into the bounded updates channel.
+///
+/// An update that finds the channel full is dropped, and the receiver is owed an
+/// [`UpdatesLike::Lagged`]: it is sent as soon as the channel has room
+/// ([`UpdatesForwarder::send_lagged`]), and always before this connection's next update, so the
+/// receiver fetches the difference instead of waiting for the next gap to show.
+struct UpdatesForwarder {
+    tx: mpsc::Sender<UpdatesLike>,
+    /// Updates were dropped since the last [`UpdatesLike::Lagged`] went out.
+    lagged: bool,
+    /// The receiver is gone: nothing more is forwarded.
+    closed: bool,
+    /// Updates dropped since the last warning.
+    dropped: usize,
+    last_warning: Option<Instant>,
+}
+
+impl UpdatesForwarder {
+    fn new(tx: mpsc::Sender<UpdatesLike>) -> Self {
+        Self {
+            tx,
+            lagged: false,
+            closed: false,
+            dropped: 0,
+            last_warning: None,
+        }
+    }
+
+    /// Forward `updates`, after the [`UpdatesLike::Lagged`] owed, if one is.
+    fn forward(&mut self, updates: UpdatesLike) {
+        if self.closed {
+            return;
+        }
+        if self.lagged {
+            match self.tx.try_send(UpdatesLike::Lagged) {
+                Ok(()) => self.lagged = false,
+                Err(TrySendError::Full(_)) => {
+                    self.count_dropped();
+                    return;
+                }
+                Err(TrySendError::Closed(_)) => {
+                    self.close();
+                    return;
+                }
+            }
+        }
+        match self.tx.try_send(updates) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                self.lagged = true;
+                self.count_dropped();
+            }
+            Err(TrySendError::Closed(_)) => self.close(),
+        }
+    }
+
+    /// Whether an [`UpdatesLike::Lagged`] is owed to a receiver that is still there.
+    fn owes_lagged(&self) -> bool {
+        self.lagged && !self.closed
+    }
+
+    /// Wait for room in the channel, then send the [`UpdatesLike::Lagged`] owed. Call only while
+    /// [`Self::owes_lagged`]; cancelling it loses nothing.
+    async fn send_lagged(&mut self) {
+        if let Ok(permit) = self.tx.reserve().await {
+            permit.send(UpdatesLike::Lagged);
+            self.lagged = false;
+            return;
+        }
+        self.close();
+    }
+
+    /// End forwarding as the connection ends, and return the gap signal the channel is still
+    /// owed, which only the runner can send now. If `closed_connection`, that is an
+    /// [`UpdatesLike::ConnectionClosed`] that found the channel full (it also covers a
+    /// [`UpdatesLike::Lagged`] owed); otherwise, the `Lagged` owed, if one is.
+    fn finish(self, closed_connection: bool) -> Option<UpdatesLike> {
+        if self.closed {
+            return None;
+        }
+        if closed_connection {
+            return match self.tx.try_send(UpdatesLike::ConnectionClosed) {
+                Ok(()) | Err(TrySendError::Closed(_)) => None,
+                Err(TrySendError::Full(signal)) => Some(signal),
+            };
+        }
+        self.lagged.then_some(UpdatesLike::Lagged)
+    }
+
+    fn count_dropped(&mut self) {
+        self.dropped += 1;
+        if self
+            .last_warning
+            .is_none_or(|last| last.elapsed() >= UPDATES_DROPPED_LOG_COOLDOWN)
+        {
+            warn!(
+                capacity = self.tx.max_capacity(),
+                dropped_count = self.dropped,
+                "updates channel full; the receiver will be told to fetch the difference",
+            );
+            self.dropped = 0;
+            self.last_warning = Some(Instant::now());
+        }
+    }
+
+    fn close(&mut self) {
+        debug!("updates channel closed, stopping update forwarding");
+        self.closed = true;
     }
 }
 

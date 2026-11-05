@@ -7,32 +7,56 @@
 // except according to those terms.
 
 //! Answers from the server that match no sent request, or can't be read, never panic the sender.
-//! The sender talks to a local socket that never answers: the tests feed it what the MTP returns.
+//! The sender talks to an in-memory stream that never answers: the tests feed it what the MTP
+//! returns.
 
-use std::net::Ipv4Addr;
+use std::sync::Mutex;
 
 use grammers_mtproto::mtp::{BadMessage, Deserialization, DeserializeError, Encrypted, RpcResult};
 use grammers_mtproto::transport::Full;
-use tokio::net::TcpListener;
+use tokio::io::DuplexStream;
 use tokio::sync::oneshot::Receiver;
 
 use super::*;
+use crate::net::{ConnKind, DialFuture};
 
 type TestSender = Sender<Full, Encrypted>;
 type Answer = Receiver<Result<Vec<u8>, InvocationError>>;
 
-/// A sender connected to a local listener, which is returned to keep the connection open.
-async fn sender() -> (TestSender, TcpListener) {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-    let address = listener.local_addr().unwrap();
+/// Dials the one stream it holds.
+pub(crate) struct Pipe(Mutex<Option<Box<dyn MtStream>>>);
+
+impl Pipe {
+    pub(crate) fn new(stream: impl MtStream) -> Self {
+        Self(Mutex::new(Some(Box::new(stream))))
+    }
+}
+
+impl Dialer for Pipe {
+    fn dial<'a>(&'a self, _: &'a DialTarget) -> DialFuture<'a> {
+        let stream = self.0.lock().unwrap().take().unwrap();
+        Box::pin(async move { Ok(stream) })
+    }
+}
+
+/// A sender connected to an in-memory stream, whose other end is returned to keep it open.
+async fn sender() -> (TestSender, DuplexStream) {
+    let (client, server) = tokio::io::duplex(1 << 16);
+    let target = DialTarget {
+        dc_id: 2,
+        kind: ConnKind::Main,
+        ipv4: None,
+        ipv6: None,
+    };
     let sender = Sender::connect(
         Full::new(),
         Encrypted::build().finish([0; 256]),
-        ServerAddr::Tcp { address },
+        &Pipe::new(client),
+        &target,
     )
     .await
     .unwrap();
-    (sender, listener)
+    (sender, server)
 }
 
 /// Enqueue a request and serialize it, as [`Sender::step`] does before it writes; not sent yet.
@@ -85,7 +109,7 @@ fn pong(msg_id: MsgId) -> Vec<u8> {
 
 #[tokio::test]
 async fn bad_msg_for_unsent_request_is_ignored() {
-    let (mut sender, _listener) = sender().await;
+    let (mut sender, _server) = sender().await;
     let (msg_id, mut answer) = serialized(&mut sender);
 
     // > The client must check that it has, in fact, recently sent a message with the specified
@@ -114,7 +138,7 @@ async fn bad_msg_for_unsent_request_is_ignored() {
 
 #[tokio::test]
 async fn response_for_unsent_request_is_ignored() {
-    let (mut sender, _listener) = sender().await;
+    let (mut sender, _server) = sender().await;
     let (msg_id, mut answer) = serialized(&mut sender);
 
     // An answer to a request not sent yet can't be one.
@@ -152,7 +176,7 @@ async fn response_for_unsent_request_is_ignored() {
 #[tokio::test]
 async fn short_rpc_result_is_error() {
     for len in 0..4 {
-        let (mut sender, _listener) = sender().await;
+        let (mut sender, _server) = sender().await;
         let (msg_id, mut answer) = serialized(&mut sender);
         sent(&mut sender);
 
@@ -170,7 +194,7 @@ async fn short_rpc_result_is_error() {
 
 #[tokio::test]
 async fn request_body_that_is_not_a_tl_object_is_dropped() {
-    let (mut sender, _listener) = sender().await;
+    let (mut sender, _server) = sender().await;
     for body in [Vec::new(), vec![1, 2, 3], vec![1, 2, 3, 4, 5]] {
         let (tx, mut rx) = oneshot::channel();
         sender.enqueue_body(body, tx);

@@ -79,20 +79,41 @@ fn bad_pq_is_error() {
     // A prime, or a number too small, has no two factors to find; the search gives up.
     for pq in [PRIME_PQ, 0, 1, 2, 3] {
         assert_eq!(
-            do_step2(step1(), res_pq(&pq.to_be_bytes()), &NEW_NONCE, &[0; 224]).err(),
+            do_step2(
+                step1(),
+                res_pq(&pq.to_be_bytes()),
+                &telegram_rsa_keys(),
+                &NEW_NONCE,
+                &[0; 224]
+            )
+            .err(),
             Some(Error::InvalidPq { pq })
         );
     }
     for size in [0, 7, 9] {
         assert_eq!(
-            do_step2(step1(), res_pq(&vec![1; size]), &NEW_NONCE, &[0; 224]).err(),
+            do_step2(
+                step1(),
+                res_pq(&vec![1; size]),
+                &telegram_rsa_keys(),
+                &NEW_NONCE,
+                &[0; 224]
+            )
+            .err(),
             Some(Error::InvalidPqSize { size })
         );
     }
 
     // A product of two primes goes through.
     let pq = 1470626929934143021u64;
-    let (request, _) = do_step2(step1(), res_pq(&pq.to_be_bytes()), &NEW_NONCE, &[0; 224]).unwrap();
+    let (request, _) = do_step2(
+        step1(),
+        res_pq(&pq.to_be_bytes()),
+        &telegram_rsa_keys(),
+        &NEW_NONCE,
+        &[0; 224],
+    )
+    .unwrap();
     assert_eq!(request.p, 1206429347u32.to_be_bytes());
     assert_eq!(request.q, 1218991343u32.to_be_bytes());
 }
