@@ -40,7 +40,7 @@ use grammers_crypto as crypto;
 use grammers_tl_types as tl;
 pub use plain::Plain;
 
-use crate::{DequeBuffer, MsgId, transport};
+use crate::{DequeBuffer, MsgId};
 
 /// Manual implementation of Telegram's `rpc_result`.
 #[derive(Debug)]
@@ -162,9 +162,6 @@ pub enum DeserializeError {
 
     /// Attempting to decrypt the message failed in some way.
     DecryptionError(crypto::Error),
-
-    /// Deserialization failed at the earlier transport level.
-    Transport(transport::Error),
 }
 
 impl std::error::Error for DeserializeError {}
@@ -195,9 +192,6 @@ impl fmt::Display for DeserializeError {
                 tl::deserialize::MAX_DEPTH
             ),
             Self::DecryptionError(ref error) => write!(f, "failed to decrypt message: {error}"),
-            Self::Transport(ref error) => {
-                write!(f, "deserialization failed at transport level: {error}")
-            }
         }
     }
 }

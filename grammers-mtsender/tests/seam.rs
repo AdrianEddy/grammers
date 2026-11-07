@@ -8,9 +8,11 @@
 
 //! The byte-stream seam: every connection runs over a stream the caller's dialer opens, and the
 //! auth-key handshake encrypts to the server RSA keys the caller supplies. The pool's connects
-//! over it: one to a peer that never answers fails in time, and one whose server gives the
-//! datacenter a new address keeps it. A dial gives up on an address that never answers and tries
-//! the next. The tests play the server on in-memory streams; nothing leaves the machine.
+//! over it: one to a peer that never answers fails in time, one whose server gives the datacenter
+//! a new address keeps it, and one whose server forgot the session's key makes a new one. A
+//! transport error code fails a request as a transport error. A dial gives up on an address that
+//! never answers and tries the next. The tests play the server on in-memory streams; nothing
+//! leaves the machine.
 
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
@@ -21,7 +23,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use grammers_crypto::{AuthKey, aes, rsa};
 use grammers_mtproto::mtp::Plain;
-use grammers_mtproto::transport::Intermediate;
+use grammers_mtproto::transport::{self, Intermediate};
 use grammers_mtsender::{
     ConnKind, ConnectionParams, DialFuture, DialTarget, Dialer, InvocationError, MtStream,
     NoRetries, Sender, SenderPool, TokioTcpDialer,
@@ -79,6 +81,13 @@ impl Server {
     /// Send `body` as a plain message.
     async fn write_message(&mut self, body: &[u8]) {
         self.stream.write_all(&plain_frame(body)).await.unwrap();
+    }
+
+    /// Send the transport error `code`: a packet of one `int`, the code negated.
+    async fn write_transport_error(&mut self, code: i32) {
+        let mut frame = 4u32.to_le_bytes().to_vec();
+        frame.extend((-code).to_le_bytes());
+        self.stream.write_all(&frame).await.unwrap();
     }
 
     /// Answer the client's next message, encrypted with [`AUTH_KEY`], with `result` in an
@@ -721,6 +730,79 @@ async fn own_address_change_is_kept() {
     assert!(stored.auth_key == Some(AUTH_KEY));
     // So the next run dials the new one.
     assert_eq!(connect_to_dc2(&session, &config).await, new);
+}
+
+#[tokio::test]
+async fn transport_error_is_reported_as_one() {
+    let (client, server) = tokio::io::duplex(1 << 10);
+    let mut sender = sender_over(Box::new(client)).await;
+    let mut server = Server {
+        stream: server,
+        tag_read: false,
+    };
+
+    // The server answers with a transport error code, as it does for a key it doesn't know: the
+    // request fails with it as a transport error, the one the pool and retry policies match.
+    let answers = tokio::spawn(async move {
+        server.read_message().await;
+        server.write_transport_error(404).await;
+        server
+    });
+    let call = sender.invoke(&tl::functions::ReqPqMulti { nonce: [7; 16] });
+    let response = timeout(Duration::from_secs(10), call).await.unwrap();
+    assert!(
+        matches!(
+            response,
+            Err(InvocationError::Transport(transport::Error::BadStatus {
+                status: 404
+            }))
+        ),
+        "{response:?}"
+    );
+    drop(answers.await.unwrap());
+}
+
+#[tokio::test(start_paused = true)]
+async fn forgotten_key_starts_a_new_handshake() {
+    let session = Arc::new(MemorySession::default());
+    let mut dc2 = session.dc_option(2).unwrap().unwrap();
+    dc2.auth_key = Some(AUTH_KEY);
+    session.set_dc_option(&dc2).await.unwrap();
+    let (dialer, mut servers) = TestDialer::new(1 << 16);
+    let params = params(Arc::clone(&dialer), Vec::new());
+    let pool = SenderPool::with_configuration(Arc::clone(&session), 1, params);
+    let runner = tokio::spawn(pool.runner.run());
+    let handle = pool.handle.clone();
+    let call = tokio::spawn(async move {
+        handle
+            .invoke_in_dc(2, &tl::functions::help::GetNearestDc {})
+            .await
+    });
+
+    // The connection opens under the session's key, which the server doesn't know.
+    let mut first = servers.recv().await.unwrap();
+    first.read_packet().await;
+    first.write_transport_error(404).await;
+    // So the pool connects again and makes a new key: the new connection starts the handshake.
+    let mut second = timeout(Duration::from_secs(3600), servers.recv())
+        .await
+        .expect("no second connection: the -404 made no new key")
+        .unwrap();
+    tl::functions::ReqPqMulti::from_boxed_bytes(&second.read_message().await).unwrap();
+    // This server can't finish a handshake, so the request fails with the handshake.
+    drop(second);
+
+    assert!(call.await.unwrap().is_err());
+    assert!(pool.handle.quit());
+    runner.await.unwrap();
+    let dialed: Vec<_> = dialer
+        .targets
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|target| target.dc_id)
+        .collect();
+    assert_eq!(dialed, [2, 2]);
 }
 
 #[tokio::test]

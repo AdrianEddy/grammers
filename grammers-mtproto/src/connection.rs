@@ -8,7 +8,7 @@
 
 //! Sans-IO state that a connection needs to hold.
 
-use std::io;
+use std::{fmt, io};
 
 use grammers_tl_types as tl;
 use tracing::{debug, trace};
@@ -35,6 +35,29 @@ const LEADING_BUFFER_SPACE: usize = mtp::MAX_TRANSPORT_HEADER_LEN
     + mtp::ENCRYPTED_PACKET_HEADER_LEN
     + mtp::PLAIN_PACKET_HEADER_LEN
     + mtp::MESSAGE_CONTAINER_HEADER_LEN;
+
+/// The error type of [`State::unpack_next`]: the layer that refused what was received.
+#[derive(Clone, Debug, PartialEq)]
+pub enum UnpackError {
+    /// The transport refused the bytes received, or they carried a transport error code from
+    /// the server, such as [`transport::Error::BadStatus`] 404 for an authorization key it
+    /// doesn't know.
+    Transport(transport::Error),
+
+    /// The MTP couldn't decrypt or deserialize a packet the transport unpacked.
+    Deserialize(DeserializeError),
+}
+
+impl std::error::Error for UnpackError {}
+
+impl fmt::Display for UnpackError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Transport(error) => write!(f, "{error}"),
+            Self::Deserialize(error) => write!(f, "{error}"),
+        }
+    }
+}
 
 /// Glues together the transport and MTP state, and coordinates them to manage
 /// the I/O buffers to send packed requests and iterate unpacked responses.
@@ -178,7 +201,7 @@ impl<T: Transport, M: Mtp> State<T, M> {
     /// If there is not enough data to unpack anything, `None` is returned.
     ///
     /// This should be called in a loop until `None` is returned.
-    pub fn unpack_next(&mut self) -> Option<Result<Vec<Deserialization>, DeserializeError>> {
+    pub fn unpack_next(&mut self) -> Option<Result<Vec<Deserialization>, UnpackError>> {
         if self.read_head != self.read_tail {
             match self
                 .transport
@@ -191,10 +214,10 @@ impl<T: Transport, M: Mtp> State<T, M> {
                         .deserialize(&mut self.read_buffer[self.read_head..][offset.data_range]);
 
                     self.read_head += offset.next_offset;
-                    return Some(result);
+                    return Some(result.map_err(UnpackError::Deserialize));
                 }
                 Err(transport::Error::MissingBytes) => {}
-                Err(err) => return Some(Err(DeserializeError::Transport(err))),
+                Err(err) => return Some(Err(UnpackError::Transport(err))),
             }
         }
 
