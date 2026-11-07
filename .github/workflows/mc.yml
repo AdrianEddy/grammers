@@ -51,6 +51,11 @@ jobs:
       # `ConnectionParams::default()`) and `proxy` (`Socks5Dialer`), linted, and the proxy dialer tested offline.
       - run: cargo "+$MSRV" clippy -p grammers-mtsender --all-features --all-targets -- -D warnings
       - run: cargo test -p grammers-mtsender --no-default-features --features proxy --test seam
+      # The generator's own tests, and serde for the generated code (`impl-serde`, which MultiChat's fake server reads
+      # and writes its transcripts with): binary fields serialized as bytes.
+      - run: cargo "+$MSRV" clippy -p grammers-tl-gen -p grammers-tl-types --all-features --all-targets -- -D warnings
+      - run: cargo test -p grammers-tl-gen
+      - run: cargo test -p grammers-tl-types --features impl-serde,tl-mtproto --test serde
 
   msrv:
     runs-on: ubuntu-latest

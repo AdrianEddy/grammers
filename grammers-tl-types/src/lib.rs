@@ -73,6 +73,12 @@
 
 pub mod deserialize;
 mod generated;
+#[cfg(feature = "impl-serde")]
+#[cfg_attr(
+    not(feature = "tl-api"),
+    expect(dead_code, reason = "only `api.tl` has vectors of binary")
+)]
+mod serde_bytes_vec;
 pub mod serialize;
 
 pub use deserialize::{Cursor, Deserializable};

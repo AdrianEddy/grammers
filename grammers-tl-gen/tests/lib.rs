@@ -221,7 +221,67 @@ fn generic_bytes_with_serde_bytes() -> io::Result<()> {
 
     let (_, types, _, _) = gen_rust_code(&definitions)?;
     eprintln!("{types}");
-    assert!(types.contains(r#"#[serde(with = "serde_bytes")]"#));
+    assert!(types.contains(r#"#[serde(default, with = "serde_bytes")]"#));
     assert!(types.contains("pub stripped_thumb: Option<Vec<u8>>,"));
+    Ok(())
+}
+
+/// The module the field `name` is serialized `with`, as the attribute before it names one, and
+/// whether the attribute has `default` too.
+fn serde_with<'a>(code: &'a str, name: &str) -> Option<(&'a str, bool)> {
+    let field = format!("pub {name}: ");
+    let lines: Vec<&str> = code.lines().collect();
+    let at = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with(&field))
+        .unwrap_or_else(|| panic!("no field {name}"));
+    let attribute = lines[at - 1].trim().strip_prefix("#[serde(")?;
+    let (attribute, default) = match attribute.strip_prefix("default, ") {
+        Some(attribute) => (attribute, true),
+        None => (attribute, false),
+    };
+    let with = attribute.strip_prefix("with = \"")?.strip_suffix("\")]")?;
+    Some((with, default))
+}
+
+#[test]
+fn binary_fields_serialized_as_bytes() -> io::Result<()> {
+    let definitions = get_definitions(
+        "
+        binary#1 flags:# a:bytes b:int128 c:int256 d:flags.0?bytes e:flags.1?int256 f:Vector<bytes> g:flags.2?Vector<bytes> h:Vector<int128> i:Vector<int256> j:Vector<long> k:Vector<int> l:string m:int n:flags.3?Vector<int> o:flags.4?true = Binary;
+        ",
+    );
+    let (_, types, _, _) = gen_rust_code(&definitions)?;
+    eprintln!("{types}");
+
+    // Binary, plain and optional: `serde_bytes` takes both. An optional field has `default` too,
+    // as serde's derive reads the absent key of a field `with` a module as `None` only then.
+    for (name, optional) in [
+        ("a", false),
+        ("b", false),
+        ("c", false),
+        ("d", true),
+        ("e", true),
+    ] {
+        assert_eq!(
+            serde_with(&types, name),
+            Some(("serde_bytes", optional)),
+            "{name}"
+        );
+    }
+    // A vector of binary, plain and optional.
+    for (name, optional) in [("f", false), ("g", true), ("h", false), ("i", false)] {
+        assert_eq!(
+            serde_with(&types, name),
+            Some(("crate::serde_bytes_vec", optional)),
+            "{name}"
+        );
+    }
+    // Anything else is serde's derive's, a flag of `true` (a `bool`) among them.
+    for name in ["j", "k", "l", "m", "n", "o"] {
+        assert_eq!(serde_with(&types, name), None, "{name}");
+    }
+    assert!(types.contains("pub g: Option<Vec<Vec<u8>>>,"));
+    assert!(types.contains("pub i: Vec<[u8; 32]>,"));
     Ok(())
 }

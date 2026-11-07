@@ -10,7 +10,7 @@
 
 use std::io::{self, Write};
 
-use grammers_tl_parser::tl::{Category, Definition, ParameterType};
+use grammers_tl_parser::tl::{Category, Definition, ParameterType, Type};
 
 use crate::grouper;
 use crate::metadata::Metadata;
@@ -44,6 +44,27 @@ fn get_generic_param_list(def: &Definition, trait_bounds: &str) -> String {
         result.push('>');
     }
     result
+}
+
+/// Whether `ty` is binary: `bytes`, `int128` or `int256`, which become `Vec<u8>`, `[u8; 16]` and
+/// `[u8; 32]`.
+fn is_binary(ty: &Type) -> bool {
+    matches!(ty.name.as_str(), "bytes" | "int128" | "int256")
+}
+
+/// The module a field of type `ty` is serialized `with` by serde, if serde's derive would write it
+/// as a sequence of numbers: binary as bytes ([`serde_bytes`]), and a `Vector` of binary as a
+/// sequence of bytes (`crate::serde_bytes_vec`). Either module takes the field optional too.
+///
+/// [`serde_bytes`]: https://docs.rs/serde_bytes
+fn serde_with(ty: &Type) -> Option<&'static str> {
+    if is_binary(ty) {
+        Some("serde_bytes")
+    } else if ty.name == "Vector" && ty.generic_arg.as_deref().is_some_and(is_binary) {
+        Some("crate::serde_bytes_vec")
+    } else {
+        None
+    }
 }
 
 /// Defines the `struct` corresponding to the definition:
@@ -103,9 +124,14 @@ fn write_struct<W: Write>(
             ParameterType::Flags => {
                 // Flags are computed on-the-fly, not stored
             }
-            ParameterType::Normal { ty, .. } => {
-                if config.impl_serde && ty.name.as_str() == "bytes" {
-                    writeln!(file, "{}    #[serde(with = \"serde_bytes\")]", indent)?;
+            ParameterType::Normal { ty, flag } => {
+                if config.impl_serde
+                    && let Some(with) = serde_with(ty)
+                {
+                    // Under a flag the field is an `Option`, whose absent key serde's derive reads
+                    // as `None` by itself only without `with`: with it, only through `default`.
+                    let default = if flag.is_some() { "default, " } else { "" };
+                    writeln!(file, "{indent}    #[serde({default}with = \"{with}\")]")?;
                 }
                 writeln!(
                     file,

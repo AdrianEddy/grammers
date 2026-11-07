@@ -24,6 +24,7 @@ grammers-tl-gen = { path = "../grammers-tl-gen", version = "0.11.0" }
 grammers-tl-parser = { path = "../grammers-tl-parser", version = "1.2.2" }
 
 [dev-dependencies]
+serde_test = "1.0.177"
 toml = "1.1.8"
 
 [features]

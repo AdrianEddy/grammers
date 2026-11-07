@@ -23,3 +23,7 @@ Macros that auto generate serde code.
 ## serde_bytes
 
 Use better bytes encode/decode pattern in serde.
+
+## serde_test
+
+Used to test that binary fields serialize as bytes with serde.
