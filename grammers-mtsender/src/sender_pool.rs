@@ -569,6 +569,10 @@ async fn send_owed_signal(updates: &mpsc::Sender<UpdatesLike>, owed: &mut Option
 /// Drive `sender`, feeding it the requests from `rpc_rx` and forwarding its updates, until its
 /// connection fails or the runner drops the other end of `rpc_rx`. Returns the gap signal the
 /// updates channel is still owed ([`UpdatesForwarder::finish`]), for the runner to send.
+///
+/// A new session ([`UpdatesLike::NewSession`]) is a gap in the account's updates only on the home
+/// connection, which they come on, so only the home sender forwards it, as only it reports its
+/// closing (TDLib also fetches the difference on the main session's new session alone).
 async fn run_sender<T: transport::Transport, M: mtp::Mtp>(
     mut sender: Sender<T, M>,
     mut rpc_rx: mpsc::UnboundedReceiver<Rpc>,
@@ -580,7 +584,9 @@ async fn run_sender<T: transport::Transport, M: mtp::Mtp>(
             step = sender.step() => match step {
                 Ok(all_new_updates) => {
                     for new_updates in all_new_updates {
-                        updates.forward(new_updates);
+                        if home_sender || !matches!(new_updates, UpdatesLike::NewSession) {
+                            updates.forward(new_updates);
+                        }
                     }
                 }
                 // `Sender::step` logged the error and failed the requests with it.

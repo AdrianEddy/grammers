@@ -93,6 +93,21 @@ pub enum Deserialization {
     BadMessage(BadMessage),
     /// Generic deserialization failure of a received message.
     Failure(DeserializationFailure),
+    /// `new_session_created`: the server made a new session for this client's messages, and the
+    /// updates it sent to an earlier one don't come in this one, so some may be missing: a gap,
+    /// which the caller fills by fetching the difference ([New Session Creation Notification]:
+    /// "for the client to understand that there is, in fact, a 'gap' in the stream of long poll
+    /// notifications").
+    ///
+    /// [New Session Creation Notification]: https://core.telegram.org/mtproto/service_messages#new-session-creation-notification
+    NewSession,
+    /// The MTP started a new session, to correct its clock once the server had taken messages of
+    /// the old one: the server answers nothing sent in the old session in the new one, so every
+    /// request without an answer must be sent again. It comes last in its packet's results. A
+    /// request the server took before the reset may then run twice: its answer comes in the old
+    /// session, which is no longer read (as with TDLib, which starts a new session on every 17). A
+    /// request that isn't idempotent needs its own deduplication, such as a `random_id`.
+    SessionReset,
 }
 
 impl BadMessage {

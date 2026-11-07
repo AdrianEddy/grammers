@@ -205,3 +205,54 @@ async fn request_body_that_is_not_a_tl_object_is_dropped() {
     }
     assert!(sender.requests.is_empty());
 }
+
+#[tokio::test]
+async fn session_reset_sends_every_unanswered_request_again() {
+    let (mut sender, _server) = sender().await;
+    let (old, mut sent_answer) = serialized(&mut sender);
+    sent(&mut sender);
+    // A second request, serialized in the old session and not written yet.
+    let (tx, mut unsent_answer) = oneshot::channel();
+    sender.enqueue_body(tl::functions::Ping { ping_id: 2 }.to_bytes(), tx);
+    sender.try_fill_write();
+    assert!(matches!(
+        sender.requests[1].state,
+        RequestState::Serialized(_)
+    ));
+
+    // The server answers nothing of the old session in the new one: both go again.
+    receive(&mut sender, Deserialization::SessionReset);
+    assert!(
+        sender
+            .requests
+            .iter()
+            .all(|request| matches!(request.state, RequestState::NotSerialized))
+    );
+    // An answer named by an old message identifier is no answer to either now.
+    receive(&mut sender, result(old, pong(old)));
+    assert!(sent_answer.try_recv().is_err());
+    assert!(unsent_answer.try_recv().is_err());
+
+    // The old session's bytes still go out, then both requests again, with new identifiers.
+    let n = sender.state.io_buffers().1.len();
+    sender.on_net_write(n);
+    sender.try_fill_write();
+    let n = sender.state.io_buffers().1.len();
+    sender.on_net_write(n);
+    let resent: Vec<MsgId> = sender
+        .requests
+        .iter()
+        .map(|request| match &request.state {
+            RequestState::Sent(pair) => pair.msg_id,
+            _ => panic!("every request sent again"),
+        })
+        .collect();
+    assert_eq!(resent.len(), 2);
+    assert!(!resent.contains(&old));
+    for msg_id in resent {
+        receive(&mut sender, result(msg_id, pong(msg_id)));
+    }
+    assert!(sent_answer.try_recv().unwrap().is_ok());
+    assert!(unsent_answer.try_recv().unwrap().is_ok());
+    assert!(sender.requests.is_empty());
+}

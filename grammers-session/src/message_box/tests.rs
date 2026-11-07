@@ -3059,3 +3059,23 @@ fn lagged_updates_are_a_gap() {
     assert_eq!(message_boxes.take_delta(), StateDelta::default());
     assert_eq!(message_boxes.session_state(), loaded_state());
 }
+
+#[test]
+fn new_session_is_a_gap() {
+    // The server started a new session on the connection that gets the updates: those it sent to
+    // the earlier one may be lost, so the account's difference begins at once.
+    let mut message_boxes = settled(T0);
+    assert_eq!(
+        message_boxes.process_updates(UpdatesLike::NewSession, T0),
+        Err(Gap)
+    );
+    assert_eq!(
+        message_boxes.difference_pending(),
+        DiffPending {
+            account: true,
+            channels: 0
+        }
+    );
+    assert_eq!(message_boxes.take_delta(), StateDelta::default());
+    assert_eq!(message_boxes.session_state(), loaded_state());
+}

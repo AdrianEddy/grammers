@@ -423,6 +423,8 @@ impl<T: Transport, M: mtp::Mtp> Sender<T, M> {
                 mtp::Deserialization::RpcError(error) => self.process_error(error),
                 mtp::Deserialization::BadMessage(bad_msg) => self.process_bad_message(bad_msg),
                 mtp::Deserialization::Failure(failure) => self.process_deserialize_error(failure),
+                mtp::Deserialization::NewSession => updates.push(UpdatesLike::NewSession),
+                mtp::Deserialization::SessionReset => self.process_session_reset(),
             }
         }
     }
@@ -548,7 +550,8 @@ impl<T: Transport, M: mtp::Mtp> Sender<T, M> {
     /// (tdesktop does the same, "such message was not sent recently"), and the request is still
     /// sent. The MTProto layer doesn't check: it has already applied the salt, time or `seq_no`
     /// correction the notification carries (`Encrypted::handle_bad_notification`), whatever
-    /// message it names.
+    /// message it names, but for a 17 (`msg_id` too high) about an identifier issued before its
+    /// last clock correction, which no longer changes the clock.
     fn process_bad_message(&mut self, bad_msg: mtp::BadMessage) {
         for i in (0..self.requests.len()).rev() {
             let Some(request) = self.requests.get_mut(i) else {
@@ -600,6 +603,26 @@ impl<T: Transport, M: mtp::Mtp> Sender<T, M> {
                 _ => {}
             }
         }
+    }
+
+    /// Handle the MTP's start of a new session: the server answers nothing sent in the old one in
+    /// the new one, so every request without an answer is sent again, in the new session. One
+    /// whose bytes are still going out under the old session goes too, and is sent again after
+    /// them. So a request the server took before the reset may run twice, its first answer lost
+    /// with the old session (as with TDLib); one that isn't idempotent needs its own
+    /// deduplication, such as a `random_id`.
+    fn process_session_reset(&mut self) {
+        let mut resent = 0;
+        for request in self.requests.iter_mut() {
+            match request.state {
+                RequestState::Serialized(_) | RequestState::Sent(_) => {
+                    request.state = RequestState::NotSerialized;
+                    resent += 1;
+                }
+                RequestState::NotSerialized => {}
+            }
+        }
+        info!("new session; re-sending {resent} request(s) without an answer");
     }
 
     fn process_deserialize_error(&mut self, failure: mtp::DeserializationFailure) {

@@ -8,8 +8,8 @@
 
 //! The server's datacenter options, stored without panicking on ones that can't be used;
 //! updates that find the channel full, which become one `Lagged`, also when the pool drops the
-//! connection; and answers read in the poll whose write or flush fails, which still reach their
-//! requests.
+//! connection; a new session, a gap on the home connection alone; and answers read in the poll
+//! whose write or flush fails, which still reach their requests.
 
 use std::num::NonZeroUsize;
 use std::pin::{Pin, pin};
@@ -19,7 +19,7 @@ use grammers_mtproto::mtp::{Deserialization, DeserializeError, Mtp, Plain};
 use grammers_mtproto::transport::Intermediate;
 use grammers_mtproto::{DequeBuffer, MsgId};
 use grammers_session::storages::MemorySession;
-use tl::Serializable;
+use tl::{Identifiable, Serializable};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
 use tokio::task::JoinHandle;
 
@@ -76,6 +76,7 @@ enum Seen {
     Update(i32),
     Lagged,
     ConnectionClosed,
+    NewSession,
 }
 
 /// An update told apart by its `pts`.
@@ -88,6 +89,7 @@ fn seen(updates: UpdatesLike) -> Seen {
         UpdatesLike::AffectedMessages(affected) => Seen::Update(affected.pts),
         UpdatesLike::Lagged => Seen::Lagged,
         UpdatesLike::ConnectionClosed => Seen::ConnectionClosed,
+        UpdatesLike::NewSession => Seen::NewSession,
         other => panic!("unexpected {other:?}"),
     }
 }
@@ -210,7 +212,8 @@ async fn runner_sends_the_signal_an_ended_connection_owed() {
     runner.await.unwrap();
 }
 
-/// Reads every packet as one update, as `Encrypted` does a real one; it sends nothing.
+/// Reads every packet as one update, as `Encrypted` does a real one, but `new_session_created`,
+/// which it reads as the new session it reports; it sends nothing.
 struct UpdatesOnly;
 
 impl Mtp for UpdatesOnly {
@@ -226,7 +229,12 @@ impl Mtp for UpdatesOnly {
         &mut self,
         payload: &mut [u8],
     ) -> Result<Vec<Deserialization>, DeserializeError> {
-        Ok(vec![Deserialization::Update(payload.to_vec())])
+        let new_session = tl::types::NewSessionCreated::CONSTRUCTOR_ID.to_le_bytes();
+        Ok(vec![if payload.starts_with(&new_session) {
+            Deserialization::NewSession
+        } else {
+            Deserialization::Update(payload.to_vec())
+        }])
     }
 }
 
@@ -239,6 +247,17 @@ fn packet(pts: i32) -> Vec<u8> {
         })
         .to_bytes();
     [(update.len() as u32).to_le_bytes().as_slice(), &update].concat()
+}
+
+/// `new_session_created` as the server sends it, framed by the intermediate transport.
+fn new_session_packet() -> Vec<u8> {
+    let created = tl::enums::NewSession::Created(tl::types::NewSessionCreated {
+        first_msg_id: 4,
+        unique_id: 1,
+        server_salt: 0,
+    })
+    .to_bytes();
+    [(created.len() as u32).to_le_bytes().as_slice(), &created].concat()
 }
 
 type Answer = oneshot::Receiver<Result<InvokeResponse, InvocationError>>;
@@ -327,6 +346,21 @@ async fn connection_sends_lagged_with_no_update_to_carry_it() {
     );
     assert!(connection.task.await.unwrap().is_none());
     drop(connection.rpc_tx);
+}
+
+#[tokio::test]
+async fn new_session_is_a_gap_on_the_home_connection_alone() {
+    // The home connection gets the account's updates: those the server sent to the session it
+    // replaced may be lost.
+    let mut home = Connection::run(true).await;
+    home.server.write_all(&new_session_packet()).await.unwrap();
+    assert_eq!(home.next().await, Seen::NewSession);
+
+    // Any other connection's new session says nothing of them: the update after it comes first.
+    let mut other = Connection::run(false).await;
+    let packets = [new_session_packet(), packet(1)].concat();
+    other.server.write_all(&packets).await.unwrap();
+    assert_eq!(other.next().await, Seen::Update(1));
 }
 
 #[tokio::test]

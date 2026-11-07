@@ -21,6 +21,8 @@ use crate::utils::StackBuffer;
 use crate::{DequeBuffer, MsgId, manual_tl};
 
 #[cfg(test)]
+mod clock_tests;
+#[cfg(test)]
 mod server_data_tests;
 
 /// How many future salts to fetch or have stored at a given time.
@@ -98,6 +100,16 @@ pub struct Encrypted {
     /// The ID of the last message.
     last_msg_id: i64,
 
+    /// Whether the server took a message of this session: it sent one that isn't a notice
+    /// refusing one of ours. The first it takes brings `new_session_created`, ahead of any notice
+    /// about a later message.
+    accepted: bool,
+
+    /// A message of this packet refused one of ours as `msg_id` too high: once the packet is
+    /// processed, the next identifiers follow the clock corrected since
+    /// ([`Encrypted::follow_corrected_clock`]).
+    msg_id_too_high: bool,
+
     /// Identifiers that need to be acknowledged to the server.
     ///
     /// A [Content-related Message] is "a message requiring an explicit
@@ -153,15 +165,6 @@ impl Builder {
     /// Finishes the builder and returns the `MTProto` instance with all
     /// the configuration changes applied.
     pub fn finish(self, auth_key: [u8; 256]) -> Encrypted {
-        #[expect(
-            clippy::expect_used,
-            reason = "the operating system's random number generator, which nothing here works without; not server data"
-        )]
-        let session_id = {
-            let mut buffer = [0u8; 8];
-            getrandom::fill(&mut buffer).expect("failed to generate a secure session_id");
-            i64::from_le_bytes(buffer)
-        };
         Encrypted {
             auth_key: AuthKey::from_bytes(auth_key),
             time_offset: self.time_offset,
@@ -172,9 +175,11 @@ impl Builder {
             }],
             start_salt_time: None,
             salt_request_msg_id: None,
-            session_id,
+            session_id: random_session_id(),
             sequence: 0,
             last_msg_id: 0,
+            accepted: false,
+            msg_id_too_high: false,
             pending_ack: vec![],
             compression_threshold: self.compression_threshold,
             deserialization: Vec::new(),
@@ -182,6 +187,17 @@ impl Builder {
             unpacked_budget: manual_tl::MAX_UNPACKED_PER_PACKET,
         }
     }
+}
+
+/// A new session's identifier: secure and random.
+#[expect(
+    clippy::expect_used,
+    reason = "the operating system's random number generator, which nothing here works without; not server data"
+)]
+fn random_session_id() -> i64 {
+    let mut buffer = [0u8; 8];
+    getrandom::fill(&mut buffer).expect("failed to generate a secure session_id");
+    i64::from_le_bytes(buffer)
 }
 
 impl Encrypted {
@@ -233,6 +249,31 @@ impl Encrypted {
 
         self.last_msg_id = new_msg_id;
         new_msg_id
+    }
+
+    /// After a `msg_id` too high, lets the next message identifiers follow the corrected clock,
+    /// behind the ones sent. A session's identifiers must rise, but those of messages the server
+    /// refused leave no trace in it: while it has taken none of this session's, they go on from the
+    /// corrected clock in this session, as tdesktop's do. Once it has, they go on in a new session,
+    /// whose requests start again ([`Deserialization::SessionReset`]), as TDLib's do and as
+    /// [Time Synchronization] says: "the client will have to generate a new session to assure the
+    /// monotonicity of message identifiers".
+    ///
+    /// [Time Synchronization]: https://core.telegram.org/mtproto#time-synchronization
+    fn follow_corrected_clock(&mut self) {
+        self.last_msg_id = 0;
+        if !self.accepted {
+            return;
+        }
+        info!("msg_id too high in a session the server took messages of; starting a new session");
+        self.session_id = random_session_id();
+        self.sequence = 0;
+        self.accepted = false;
+        // The old session's messages to acknowledge, and its request for salts, which the server
+        // answers there.
+        self.pending_ack.clear();
+        self.salt_request_msg_id = None;
+        self.deserialization.push(Deserialization::SessionReset);
     }
 
     /// Generates the next sequence number depending on whether
@@ -350,6 +391,10 @@ impl Encrypted {
         plaintext: &[u8],
     ) -> Result<Vec<Deserialization>, DeserializeError> {
         let processed = self.process_plaintext(plaintext);
+        // Decided once the whole packet is read, whatever order its messages came in.
+        if mem::take(&mut self.msg_id_too_high) {
+            self.follow_corrected_clock();
+        }
 
         // For simplicity, and to avoid passing too much stuff around (RPC results, updates),
         // the processing result is stored in self. After processing is done, that temporary
@@ -395,10 +440,23 @@ impl Encrypted {
         // * https://core.telegram.org/mtproto/service_messages
         // * https://core.telegram.org/mtproto/service_messages_about_messages
         //
+        let constructor_id = message.constructor_id()?;
+        // Anything the server sends in this session, but a notice refusing one of its messages and
+        // the wrappers of others, shows that it took one of them.
+        if !matches!(
+            constructor_id,
+            tl::types::BadMsgNotification::CONSTRUCTOR_ID
+                | tl::types::BadServerSalt::CONSTRUCTOR_ID
+                | manual_tl::MessageContainer::CONSTRUCTOR_ID
+                | manual_tl::GzipPacked::CONSTRUCTOR_ID
+        ) {
+            self.accepted = true;
+        }
+
         // The order of the `match` here is the same as the order in which the
         // items appear in the documentation (to make it easier to review).
         // TODO verify what needs ack and what doesn't
-        match message.constructor_id()? {
+        match constructor_id {
             // Response to an RPC query
             manual_tl::RpcResult::CONSTRUCTOR_ID => self.handle_rpc_result(message),
 
@@ -772,9 +830,15 @@ impl Encrypted {
                 // Sent `msg_id` was too low (our `time_offset` is wrong).
                 self.correct_time_offset(message.msg_id);
             }
-            17 => {
-                // Sent `msg_id` was too high (our `time_offset` is wrong).
+            // Only about one issued since the last correction (those rise, from below every one
+            // refused before): one above the last issued is stale, or replayed, and correcting
+            // the clock from it again could take the identifiers back, or start a session for
+            // nothing. The caller still sends the message it names again.
+            17 if bad_msg.bad_msg_id <= self.last_msg_id => {
+                // Sent `msg_id` was too high (our `time_offset` is wrong), and so are the ones
+                // after it: the next ones must go below them.
                 self.correct_time_offset(message.msg_id);
+                self.msg_id_too_high = true;
             }
             32 => {
                 // Sent `seq_no` was too low. Bump it by some large-ish value.
@@ -1104,7 +1168,6 @@ impl Encrypted {
         &mut self,
         message: manual_tl::Message,
     ) -> Result<(), DeserializeError> {
-        // TODO notify upper layers about the need to use getDifference
         let new_session = tl::enums::NewSession::from_bytes(&message.body)?;
         match new_session {
             tl::enums::NewSession::Created(x) => {
@@ -1116,6 +1179,8 @@ impl Encrypted {
                 });
             }
         }
+        // The gap the documentation names: the caller fetches the difference.
+        self.deserialization.push(Deserialization::NewSession);
         Ok(())
     }
 

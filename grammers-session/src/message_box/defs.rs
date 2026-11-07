@@ -264,6 +264,10 @@ pub enum UpdatesLike {
     /// carrying them was full. Sent once there is room again, before any later
     /// update from the same connection. This should be treated as a gap.
     Lagged,
+    /// Indicates that the server started a new session on the connection that receives
+    /// updates (`new_session_created`): updates it sent to an earlier session may be lost.
+    /// This should be treated as a gap.
+    NewSession,
 }
 
 // Public interface around the more tightly-packed internal state.
