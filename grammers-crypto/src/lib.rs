@@ -27,7 +27,7 @@ pub use factorize::factorize;
 use glass_pumpkin::safe_prime;
 use num_bigint::BigUint;
 use num_traits::ToPrimitive;
-pub use obfuscated::ObfuscatedCipher;
+pub use obfuscated::{ObfuscatedCipher, ObfuscatedKeystream};
 
 /// The error type for [`decrypt_data_v2`].
 #[derive(Clone, Debug, PartialEq)]
