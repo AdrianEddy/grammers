@@ -407,6 +407,36 @@ impl<T: Transport, M: mtp::Mtp> Sender<T, M> {
             .for_each(|r| drop(r.result.send(Err(InvocationError::from(error.clone())))));
     }
 
+    /// Close the connection on purpose, the caller's decision rather than a failure of the
+    /// connection: fail the requests whose bytes left with an I/O error of kind
+    /// [`io::ErrorKind::ConnectionAborted`], since the server may have taken them and their
+    /// answers could come only on this connection, and hand each of the others to `unsent`, its
+    /// body and the channel its caller waits on, to be sent on another connection.
+    ///
+    /// The others are the requests not serialized yet, and those whose packet the stream hasn't
+    /// taken whole: the server reads no part of a packet it doesn't have all of. A request
+    /// [`Self::process_session_reset`] marked to go again in a new session is among them, though
+    /// its bytes may have left in the old one: sent on another connection, it may run twice, as it
+    /// would in the new session.
+    pub(crate) fn close(
+        self,
+        mut unsent: impl FnMut(Vec<u8>, oneshot::Sender<Result<Vec<u8>, InvocationError>>),
+    ) {
+        for request in self.requests {
+            match request.state {
+                RequestState::Sent(_) => {
+                    drop(request.result.send(Err(InvocationError::Io(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        "the connection was closed before the answer came",
+                    )))))
+                }
+                RequestState::NotSerialized | RequestState::Serialized(_) => {
+                    unsent(request.body, request.result)
+                }
+            }
+        }
+    }
+
     /// Process the result of deserializing an MTP buffer.
     fn process_mtp_buffer(
         &mut self,

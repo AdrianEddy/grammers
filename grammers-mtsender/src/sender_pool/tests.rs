@@ -9,9 +9,10 @@
 //! The server's datacenter options, stored without panicking on ones that can't be used;
 //! updates that find the channel full, which become one `Lagged`, also when the pool drops the
 //! connection; a new session, a gap on the home connection alone; answers read in the poll whose
-//! write or flush fails, which still reach their requests; and a request that reaches a connection
-//! as it ends, which goes to a new one, once. No pool here reaches anything but in-memory streams:
-//! every dial is refused ([`RefusingDialer`]).
+//! write or flush fails, which still reach their requests; a request that reaches a connection
+//! as it ends, which goes to a new one, once; and a connection the pool closes, which fails the
+//! requests whose bytes left and hands back the others, those still queued for it unwritten. No
+//! pool here reaches anything but in-memory streams: every dial is refused ([`RefusingDialer`]).
 
 use std::num::NonZeroUsize;
 use std::pin::{Pin, pin};
@@ -439,10 +440,12 @@ fn refusing_pool() -> (SenderPool, Arc<RefusingDialer>) {
 }
 
 /// A [`refusing_pool`] with one home connection to `dc_id` in it, as `create_connection` puts one
-/// there, over `stream`; `rpc` is the channel its requests come through.
-async fn pool_with_connection_over(
+/// there, over `stream`, its messages framed by `mtp`; `rpc` is the channel its requests come
+/// through.
+async fn pool_with_connection_over<M: Mtp + Send + 'static>(
     dc_id: i32,
     stream: impl MtStream,
+    mtp: M,
     (rpc_tx, rpc_rx): (mpsc::UnboundedSender<Rpc>, mpsc::UnboundedReceiver<Rpc>),
 ) -> (SenderPool, Arc<RefusingDialer>) {
     let (mut pool, dialer) = refusing_pool();
@@ -452,14 +455,9 @@ async fn pool_with_connection_over(
         ipv4: None,
         ipv6: None,
     };
-    let sender = Sender::connect(
-        Intermediate::new(),
-        UpdatesOnly,
-        &Pipe::new(stream),
-        &target,
-    )
-    .await
-    .unwrap();
+    let sender = Sender::connect(Intermediate::new(), mtp, &Pipe::new(stream), &target)
+        .await
+        .unwrap();
     pool.runner.connection_pool.spawn(run_sender(
         dc_id,
         sender,
@@ -476,7 +474,8 @@ async fn pool_with_connection_over(
 /// [`pool_with_connection_over`] an in-memory stream that leads to the returned end.
 async fn pool_with_connection(dc_id: i32) -> (SenderPool, DuplexStream, Arc<RefusingDialer>) {
     let (client, server) = tokio::io::duplex(1 << 16);
-    let (pool, dialer) = pool_with_connection_over(dc_id, client, mpsc::unbounded_channel()).await;
+    let (pool, dialer) =
+        pool_with_connection_over(dc_id, client, UpdatesOnly, mpsc::unbounded_channel()).await;
     (pool, server, dialer)
 }
 
@@ -733,7 +732,7 @@ async fn request_queued_as_its_connection_ends_goes_to_a_new_one() {
             handed_back: false,
         }),
     };
-    let (pool, dialer) = pool_with_connection_over(2, stream, (rpc_tx, rpc_rx)).await;
+    let (pool, dialer) = pool_with_connection_over(2, stream, UpdatesOnly, (rpc_tx, rpc_rx)).await;
     let runner = tokio::spawn(pool.runner.run());
 
     // The request is queued in the poll the connection fails in, so the connection never takes
@@ -796,4 +795,134 @@ async fn request_handed_back_twice_fails_with_its_connection_error() {
     assert!(dialer.dialed.lock().unwrap().is_empty());
     assert!(pool.handle.quit());
     runner.await.unwrap();
+}
+
+/// Hand the runner a request for datacenter 2, as a caller's [`SenderPoolHandle::raw_invoke_in_dc`]
+/// does, and let the connection take it.
+async fn invoke(runner: &mut SenderPoolRunner, body: Vec<u8>) -> Answer {
+    let (tx, rx) = oneshot::channel();
+    let request = Request::Invoke { dc_id: 2, body, tx };
+    assert!(runner.process_request(request).await.is_continue());
+    settle().await;
+    rx
+}
+
+/// A request whose packet is too big for a 64-byte pipe: the stream takes part of it, and its
+/// write stays pending.
+fn big_request() -> Vec<u8> {
+    tl::functions::upload::SaveFilePart {
+        file_id: 1,
+        file_part: 0,
+        bytes: vec![0; 4096],
+    }
+    .to_bytes()
+}
+
+/// A [`refusing_pool`] whose home connection to datacenter 2 holds a request of each kind, over a
+/// 64-byte pipe whose other end is returned: `sent`, written whole; `partly`, whose packet the
+/// stream took in part; `queued`, behind it, not serialized (the plain MTP sends one request at a
+/// time); and one whose caller gave up.
+async fn connection_holding_a_request_of_each_kind()
+-> (SenderPool, DuplexStream, Arc<RefusingDialer>, [Answer; 3]) {
+    let (client, mut server) = tokio::io::duplex(64);
+    let (mut pool, dialer) =
+        pool_with_connection_over(2, client, Plain::new(), mpsc::unbounded_channel()).await;
+    let sent = invoke(&mut pool.runner, ping()).await;
+    // The transport's tag and length, the plain header and the ping.
+    let mut request = [0; 4 + 4 + 20 + 12];
+    server.read_exact(&mut request).await.unwrap();
+    let partly = invoke(&mut pool.runner, big_request()).await;
+    let queued = invoke(&mut pool.runner, ping()).await;
+    drop(invoke(&mut pool.runner, ping()).await);
+    (pool, server, dialer, [sent, partly, queued])
+}
+
+#[tokio::test]
+async fn disconnect_fails_what_left_and_sends_on_what_never_did() {
+    let (pool, _server, dialer, [sent, partly, queued]) =
+        connection_holding_a_request_of_each_kind().await;
+    assert!(pool.handle.disconnect_from_dc(2));
+    let runner = tokio::spawn(pool.runner.run());
+
+    // The server may have taken the request whose bytes left, and its answer could come only on
+    // the closed connection: the caller learns it was aborted, as an I/O error its retry policy
+    // reads, never that the pool dropped it.
+    assert!(matches!(
+        answer(sent).await,
+        Err(InvocationError::Io(error)) if error.kind() == io::ErrorKind::ConnectionAborted
+    ));
+    // The server has none of the others: each goes to a new connection, whose outcome is its
+    // answer (the dial is refused). The request whose caller gave up goes nowhere.
+    for unsent in [partly, queued] {
+        assert!(matches!(
+            answer(unsent).await,
+            Err(InvocationError::Io(error)) if error.kind() == io::ErrorKind::ConnectionRefused
+        ));
+    }
+    assert_eq!(*dialer.dialed.lock().unwrap(), [2, 2]);
+    assert!(pool.handle.quit());
+    runner.await.unwrap();
+}
+
+#[tokio::test]
+async fn requests_queued_right_before_a_disconnect_go_back_unwritten() {
+    let (client, mut server) = tokio::io::duplex(1 << 16);
+    let (mut pool, _) =
+        pool_with_connection_over(2, client, Plain::new(), mpsc::unbounded_channel()).await;
+    // The runner queues requests for the connection and then closes it, before the connection's
+    // task runs: its channel holds them as it closes. Enough of them that a connection polling
+    // its stream and its channel in a random order would all but surely write one.
+    let mut queued = Vec::new();
+    for _ in 0..32 {
+        let (tx, rx) = oneshot::channel();
+        let request = Request::Invoke {
+            dc_id: 2,
+            body: ping(),
+            tx,
+        };
+        assert!(pool.runner.process_request(request).await.is_continue());
+        queued.push(rx);
+    }
+    let disconnect = Request::Disconnect { dc_id: 2 };
+    assert!(pool.runner.process_request(disconnect).await.is_continue());
+    let runner = tokio::spawn(pool.runner.run());
+
+    // None leaves: each goes to a new connection, whose outcome is its answer (the dial is
+    // refused), rather than fail as aborted, and the server reads nothing but the end.
+    for rx in queued {
+        assert!(matches!(
+            answer(rx).await,
+            Err(InvocationError::Io(error)) if error.kind() == io::ErrorKind::ConnectionRefused
+        ));
+    }
+    let mut written = Vec::new();
+    let read = timeout(Duration::from_secs(10), server.read_to_end(&mut written));
+    assert_eq!(read.await.unwrap().unwrap(), 0);
+    assert!(pool.handle.quit());
+    runner.await.unwrap();
+}
+
+#[tokio::test]
+async fn quit_fails_what_its_connections_hold() {
+    let (pool, _server, dialer, [sent, partly, queued]) =
+        connection_holding_a_request_of_each_kind().await;
+    assert!(pool.handle.quit());
+    timeout(Duration::from_secs(10), pool.runner.run())
+        .await
+        .unwrap();
+
+    // As a disconnect fails it; the others have no pool left to go on through.
+    assert!(matches!(
+        answer(sent).await,
+        Err(InvocationError::Io(error)) if error.kind() == io::ErrorKind::ConnectionAborted
+    ));
+    for unsent in [partly, queued] {
+        assert!(
+            timeout(Duration::from_secs(10), unsent)
+                .await
+                .unwrap()
+                .is_err()
+        );
+    }
+    assert!(dialer.dialed.lock().unwrap().is_empty());
 }

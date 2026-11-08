@@ -75,7 +75,7 @@ enum Request {
 struct Rpc {
     body: Vec<u8>,
     tx: oneshot::Sender<Result<InvokeResponse, InvocationError>>,
-    /// An ended connection handed it back once already ([`ConnectionEnd::unsent`]).
+    /// An ended connection handed it back before ([`ConnectionEnd::unsent`]).
     handed_back: bool,
 }
 
@@ -88,13 +88,15 @@ struct ConnectionInfo {
 struct ConnectionEnd {
     /// The datacenter it was connected to.
     dc_id: i32,
-    /// The requests the runner sent it that it never took, so never sent. A request a connection
-    /// hands back is sent on once, through a new connection ([`SenderPoolRunner::dispatch`]);
-    /// handed back again, it fails with that connection's [`error`](ConnectionEnd::error), as the
-    /// requests that connection took do, and the caller's retry policy decides.
+    /// The requests it never sent whose callers still wait: the ones the runner sent it that it
+    /// never took, and, if the runner closed it, the ones it took and never wrote
+    /// ([`Sender::close`]). A request a connection hands back is sent on through a new connection
+    /// ([`SenderPoolRunner::dispatch`]). If a connection that failed hands back a request that was
+    /// handed back before, the request fails with that connection's [`error`](ConnectionEnd::error)
+    /// instead, as the requests that connection took do, and the caller's retry policy decides.
     unsent: Vec<Rpc>,
-    /// The error that ended the connection, or `None` if the runner dropped its end of the
-    /// channel, which leaves nothing unsent.
+    /// The error that ended the connection, or `None` if the runner closed it: it dropped its end
+    /// of the channel ([`SenderPoolHandle::disconnect_from_dc`], or the pool quitting).
     error: Option<ReadError>,
     /// The gap signal the updates channel is still owed ([`UpdatesForwarder::finish`]).
     owed_signal: Option<UpdatesLike>,
@@ -205,6 +207,11 @@ impl SenderPoolHandle {
     ///
     /// This is useful after datacenter migrations during sign in,
     /// when the old connection is known to not be needed anymore.
+    ///
+    /// The requests the connections hold aren't dropped. One whose bytes left fails with an I/O
+    /// error of kind [`std::io::ErrorKind::ConnectionAborted`]: the server may have taken it, and
+    /// its answer could come only on the closed connection. Any other goes to a new connection to
+    /// the datacenter, as a request made after the disconnect would.
     pub fn disconnect_from_dc(&self, dc_id: i32) -> bool {
         self.0.send(Request::Disconnect { dc_id }).is_ok()
     }
@@ -212,8 +219,11 @@ impl SenderPoolHandle {
     /// Communicate with the running [`SenderPoolRunner`] instance
     /// to drop all active connections and gracefully stop running.
     ///
-    /// The runner takes it after the requests ahead of it, each of which may need a new
-    /// connection's dial and `initConnection` (up to 60 seconds).
+    /// The runner takes it after the requests ahead of it, those a closed or failed connection
+    /// handed back included, each of which may need a new connection's dial and `initConnection`
+    /// (up to 60 seconds). The requests the connections still hold then fail: one whose bytes left
+    /// with an I/O error of kind [`std::io::ErrorKind::ConnectionAborted`], as
+    /// [`Self::disconnect_from_dc`] fails it, and any other with [`InvocationError::Dropped`].
     pub fn quit(&self) -> bool {
         self.0.send(Request::Quit).is_ok()
     }
@@ -424,7 +434,8 @@ impl SenderPoolRunner {
                 ControlFlow::Continue(())
             }
             Request::Disconnect { dc_id } => {
-                // Dropping `rpc_tx` ends `run_sender`, which hands back the signal it owes.
+                // Dropping `rpc_tx` ends `run_sender`, which fails the requests whose bytes left
+                // and hands back the others, which the join arm sends on, with the signal it owes.
                 self.connections
                     .retain(|connection| connection.dc_id != dc_id);
                 ControlFlow::Continue(())
@@ -439,8 +450,8 @@ impl SenderPoolRunner {
     /// runner joins it, so a retry can reach the runner while the connection is still listed. An
     /// ended or ending connection takes nothing more ([`run_sender`] closes its end of the channel
     /// first): the request goes to a new connection, rather than fail with the old one. A request
-    /// a connection hands back comes here once: handed back again, it fails with that connection's
-    /// error ([`ConnectionEnd::unsent`]).
+    /// a connection hands back comes here too; handed back again by a connection that failed, it
+    /// fails with that connection's error instead ([`ConnectionEnd::unsent`]).
     async fn dispatch(&mut self, dc_id: i32, mut rpc: Rpc) {
         loop {
             let open = self
@@ -619,8 +630,12 @@ async fn send_owed_signal(updates: &mpsc::Sender<UpdatesLike>, owed: &mut Option
 /// Drive `sender`, the connection to `dc_id`, feeding it the requests from `rpc_rx` and forwarding
 /// its updates, until its connection fails or the runner drops the other end of `rpc_rx`. Then
 /// close `rpc_rx`, so the runner can send it nothing more, and hand back, for the runner to send
-/// on, the requests still queued in it, which the sender never took, with the error that ended
-/// the connection and the gap signal the updates channel is still owed ([`ConnectionEnd`]).
+/// on, the requests that never left: those the sender never wrote, when the runner closed the
+/// connection (a failed connection fails them with its error), and those still queued in
+/// `rpc_rx`, which the sender never took. They go with the error that ended the connection and
+/// the gap signal the updates channel is still owed ([`ConnectionEnd`]). A request whose caller
+/// no longer waits, such as a keepalive ping, is dropped instead: sent on, it could only make a
+/// new connection for nobody.
 ///
 /// A new session ([`UpdatesLike::NewSession`]) is a gap in the account's updates only on the home
 /// connection, which they come on, so only the home sender forwards it, as only it reports its
@@ -634,6 +649,17 @@ async fn run_sender<T: transport::Transport, M: mtp::Mtp>(
 ) -> ConnectionEnd {
     let (owed_signal, error) = loop {
         tokio::select! {
+            // The channel first: once the runner closes it, what is still in it reaches the
+            // sender and goes back unwritten (`Sender::close`), and a burst is serialized
+            // together. It can't starve the step: every caller waits for an answer only the step
+            // brings. The owed `Lagged` goes ahead of the step, which a stream busy with a
+            // download keeps ready.
+            biased;
+            rpc = rpc_rx.recv() => match rpc {
+                Some(rpc) => sender.enqueue_body(rpc.body, rpc.tx),
+                None => break (updates.finish(false), None),
+            },
+            () = updates.send_lagged(), if updates.owes_lagged() => {}
             step = sender.step() => match step {
                 Ok(all_new_updates) => {
                     for new_updates in all_new_updates {
@@ -645,21 +671,28 @@ async fn run_sender<T: transport::Transport, M: mtp::Mtp>(
                 // `Sender::step` logged the error and failed the requests with it.
                 Err(error) => break (updates.finish(home_sender), Some(error)),
             },
-            () = updates.send_lagged(), if updates.owes_lagged() => {}
-            rpc = rpc_rx.recv() => match rpc {
-                Some(rpc) => sender.enqueue_body(rpc.body, rpc.tx),
-                None => break (updates.finish(false), None),
-            },
         }
     };
 
+    // What the sender holds and never wrote, ahead of what it never took. After a failed step it
+    // holds nothing: `Sender::step` failed every request with the error. A sender keeps no
+    // `handed_back`, so these start at `false`. That is safe only because the join arm reads the
+    // flag on a failed connection's end, and this is empty then.
+    let mut unsent = Vec::new();
+    sender.close(|body, tx| {
+        unsent.push(Rpc {
+            body,
+            tx,
+            handed_back: false,
+        })
+    });
     // From now on a send to this connection fails, and gives the runner its request back; one
     // sent before is in the channel, which `recv` drains until it reports the end.
     rpc_rx.close();
-    let mut unsent = Vec::new();
     while let Some(rpc) = rpc_rx.recv().await {
         unsent.push(rpc);
     }
+    unsent.retain(|rpc| !rpc.tx.is_closed());
     ConnectionEnd {
         dc_id,
         unsent,
