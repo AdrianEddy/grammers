@@ -76,17 +76,13 @@ pub struct Encrypted {
     /// The Authorization Key to use to encrypt payload.
     auth_key: AuthKey,
 
-    /// The server's clock, which message identifiers are taken from.
+    /// The server's clock, which message identifiers are taken from and the salts' validity is
+    /// read on.
     clock: ServerClock,
 
-    /// Salts that may be used when encrypting payload, sorted by valid date descending (so the last one is the one
-    /// that can be used now).
+    /// Salts that may be used when encrypting payload, sorted by valid date descending, read as
+    /// the clock reads times, modulo 2^32 (so the last one is the one that can be used now).
     salts: Vec<tl::types::FutureSalt>,
-
-    /// The `now` received from future salts along with the instant when it occured.
-    ///
-    /// Used to accurately determine when salts become valid.
-    start_salt_time: Option<(i32, Instant)>,
 
     /// Internal request for salts which should not be propagated.
     salt_request_msg_id: Option<MsgId>,
@@ -150,8 +146,10 @@ struct Nesting {
 /// (`AuthData::next_message_id`: the server time difference plus `Time::now()`, which is
 /// monotonic) and tdesktop's (`MsgIdManager::next`: an identifier from the server's time plus a
 /// monotonic counter's advance), so a step of the machine's wall clock while a connection is open
-/// doesn't move them: only the server's time does ([`Encrypted::correct_clock`]). The wall clock
-/// is read once, when [`Builder::finish`] starts the clock.
+/// doesn't move them: only the server's time does ([`Encrypted::correct_clock`],
+/// [`ServerClock::update`]). The wall clock is read once, when [`Builder::finish`] starts the
+/// clock. The salts' validity is read on the same clock, as TDLib reads it on its one server time
+/// (`AuthData::update_salt`), so a correction moves both.
 ///
 /// The monotonic clock may stand still while the machine sleeps (on Linux and macOS): identifiers
 /// taken after a long sleep are behind, and the server's notice that one is too low (16) sets the
@@ -162,6 +160,9 @@ struct ServerClock {
     /// hold them, so adding the time since `at` can't overflow.
     anchor: Duration,
     at: Instant,
+    /// Whether a time the server sent set the clock (a 16, a 17 or [`Self::update`]), not the
+    /// wall clock it started from: TDLib's `server_time_difference_was_updated_`.
+    from_server: bool,
 }
 
 impl ServerClock {
@@ -172,6 +173,7 @@ impl ServerClock {
         Self {
             anchor: Duration::new(u64::from(secs), wall.subsec_nanos()),
             at: Instant::now(),
+            from_server: false,
         }
     }
 
@@ -189,6 +191,7 @@ impl ServerClock {
         Self {
             anchor: Duration::from_secs(u64::from(secs)),
             at: Instant::now(),
+            from_server: true,
         }
     }
 
@@ -197,6 +200,23 @@ impl ServerClock {
     fn now(&self) -> (u32, u32) {
         let now = self.anchor + self.at.elapsed();
         (now.as_secs() as u32, now.subsec_nanos())
+    }
+
+    /// Move the clock to `secs`, a time the server sent. On a clock still from the wall clock it
+    /// sets it, back too: the wall clock may be ahead by less than the 30 s the server answers
+    /// with a 17. Once the server's time has set it (this, a 16 or a 17), only forward: the server
+    /// sent `secs` at or before now, so its time is at least that, and a clock ahead stays until a
+    /// 17 ([`Encrypted::correct_clock`]). TDLib does both: `AuthData::update_server_time_difference`
+    /// sets the difference on its first call after `reset_server_time_difference` (at each
+    /// session's start, and when its clock is found too fast) and only raises it after that.
+    ///
+    /// Both are seconds modulo 2^32, so `secs` is ahead when their difference, read as a signed
+    /// number, is positive.
+    fn update(&mut self, secs: u32) {
+        let (now, _) = self.now();
+        if !self.from_server || secs.wrapping_sub(now).cast_signed() > 0 {
+            *self = Self::at_server_time(secs);
+        }
     }
 }
 
@@ -231,7 +251,6 @@ impl Builder {
                 valid_until: i32::MAX,
                 salt: self.first_salt,
             }],
-            start_salt_time: None,
             salt_request_msg_id: None,
             session_id: random_session_id(),
             sequence: 0,
@@ -1099,10 +1118,16 @@ impl Encrypted {
                 }));
         }
 
-        self.start_salt_time = Some((salts.now, Instant::now()));
+        // The server's time when it answered sets a clock still from the wall clock, and moves one
+        // the server's time set up to it ([`ServerClock::update`]); the salts' validity and the
+        // next identifiers follow, as TDLib's do.
+        self.clock.update(salts.now.cast_unsigned());
         self.salts = salts.salts.0;
-        // `Reverse`, not a negation: `valid_since` is the server's, and `-i32::MIN` overflows.
-        self.salts.sort_by_key(|salt| Reverse(salt.valid_since));
+        // Newest first, by the time from the server's `now`: the times are its seconds modulo
+        // 2^32, as `push` reads them, so their order is their difference from `now`, read as a
+        // signed number. `Reverse`, not a negation: the difference can be `i32::MIN`.
+        self.salts
+            .sort_by_key(|salt| Reverse(salt.valid_since.wrapping_sub(salts.now)));
         info!("got {} future salts", self.salts.len());
 
         Ok(())
@@ -1467,17 +1492,22 @@ impl Mtp for Encrypted {
     fn push(&mut self, buffer: &mut DequeBuffer<u8>, request: &[u8]) -> Option<MsgId> {
         // TODO rather than taking in bytes, take requests, serialize them in place, and if too large drop the last part of the buffer
 
-        // Check to see if the next salt can be used already. If it can, drop the current one and,
-        // if the next salt is the last one, fetch more.
+        // Drop every salt a later one has superseded: the next salt can be used once its
+        // `valid_since` is past by `SALT_USE_DELAY` on the server's clock, the one message
+        // identifiers are taken from, as TDLib's `AuthData::update_salt` switches on its server
+        // time. If the salt left is the last one, fetch more. Only a `future_salts` answer gives
+        // more than one salt.
         //
-        // The times come from the server, so the arithmetic saturates.
-        if let Some((start_secs, start_instant)) = self.start_salt_time
-            && let [.., next, _current] = self.salts.as_slice()
+        // The times are the server's seconds modulo 2^32, as the clock's are, so the time since
+        // `valid_since` is their difference, read as a signed number.
+        let (now, _) = self.clock.now();
+        while let [.., next, _current] = self.salts.as_slice()
+            && now
+                .wrapping_sub(next.valid_since.cast_unsigned())
+                .cast_signed()
+                >= SALT_USE_DELAY
         {
-            let now = start_secs.saturating_add(start_instant.elapsed().as_secs() as i32);
-            if now >= next.valid_since.saturating_add(SALT_USE_DELAY) {
-                self.salts.pop();
-            }
+            self.salts.pop();
         }
 
         self.try_request_salts(buffer);

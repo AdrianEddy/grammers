@@ -11,7 +11,10 @@
 //! taken none of its messages, in a new one once it has; a notice about an identifier from before
 //! the last correction changes neither. The identifiers come from the server's clock, which the
 //! monotonic clock carries on, never from the machine's wall clock after it starts. Identifiers
-//! are compared as the unsigned numbers they are, so they rise past i64::MAX, in 2038.
+//! are compared as the unsigned numbers they are, so they rise past i64::MAX, in 2038. The salts'
+//! validity is read on the same clock, modulo 2^32 as it holds seconds, past 2038 too. The
+//! server's time in `future_salts` sets a clock still from the wall clock, back too, and after that
+//! only moves it forward.
 
 use super::*;
 use crate::mtp::BadMessage;
@@ -287,8 +290,8 @@ fn identifiers_follow_the_server_clock_not_the_wall_clock() {
     // plays no part. So a step of the wall clock on an open connection can't move the identifiers.
     let mut mtp = Encrypted::build().finish([0; 256]);
     mtp.clock = ServerClock {
-        anchor: Duration::from_secs(NEW_YEAR_2020 as u64),
         at: Instant::now().checked_sub(Duration::from_secs(10)).unwrap(),
+        ..ServerClock::at_server_time(NEW_YEAR_2020 as u32)
     };
     let sent = request(&mut mtp);
     let expected = NEW_YEAR_2020 + 10;
@@ -354,4 +357,163 @@ fn notice_about_an_identifier_issued_before_one_past_i64_max_corrects_the_clock(
     assert!((seconds(next) - server_time).abs() <= 1);
     assert!(MsgId(next) < MsgId(first) && MsgId(first) < MsgId(second));
     assert_eq!(mtp.session_id, session);
+}
+
+/// The server's answer to `get_future_salts` (its message `req_msg_id`), sent at `now` on its
+/// clock: each salt with the time it is valid from. The times go as the protocol's `int`, the
+/// seconds modulo 2^32.
+fn future_salts(req_msg_id: i64, now: i64, salts: &[(i64, i64)]) -> Vec<u8> {
+    let salts = salts
+        .iter()
+        .map(|&(valid_since, salt)| tl::types::FutureSalt {
+            valid_since: valid_since as i32,
+            valid_until: (valid_since + 3600) as i32,
+            salt,
+        })
+        .collect();
+    tl::enums::FutureSalts::Salts(tl::types::FutureSalts {
+        req_msg_id,
+        now: now as i32,
+        salts: tl::RawVec(salts),
+    })
+    .to_bytes()
+}
+
+/// An MTP whose clock is at 2020-01-01, with three salts from the server then: the one in use, an
+/// hour old, and the next two, valid from 500 s and from 5000 s on.
+fn mtp_with_salts() -> Encrypted {
+    let mut mtp = Encrypted::build().finish([0; 256]);
+    mtp.clock = ServerClock::at_server_time(NEW_YEAR_2020 as u32);
+    mtp.salt_request_msg_id = Some(MsgId(7));
+    let salts = [
+        (NEW_YEAR_2020 - 3600, 1),
+        (NEW_YEAR_2020 + 500, 2),
+        (NEW_YEAR_2020 + 5000, 3),
+    ];
+    receive_at(
+        &mut mtp,
+        NEW_YEAR_2020,
+        &[future_salts(7, NEW_YEAR_2020, &salts)],
+    );
+    mtp
+}
+
+#[test]
+fn salt_and_identifiers_follow_one_clock_after_a_correction() {
+    let mut mtp = mtp_with_salts();
+    let sent = request(&mut mtp);
+    assert_eq!(mtp.get_current_salt(), 1);
+
+    // The server's 16 says its clock is 1000 s ahead of the client's: on it, the next salt is
+    // valid by now, so the next request takes both its identifier and its salt from the corrected
+    // clock.
+    receive_at(&mut mtp, NEW_YEAR_2020 + 1000, &[too_low(sent)]);
+    let next = request(&mut mtp);
+    assert!((seconds(next) - (NEW_YEAR_2020 + 1000)).abs() <= 1);
+    assert_eq!(mtp.get_current_salt(), 2);
+}
+
+#[test]
+fn a_correction_past_several_salts_drops_them_all() {
+    let mut mtp = mtp_with_salts();
+    let sent = request(&mut mtp);
+
+    // The server's 16 says its clock is 6000 s ahead of the client's: on it, both later salts are
+    // valid, so the next request skips the one between and takes the last, as TDLib's
+    // `AuthData::update_salt` would. That leaves one salt, so it waits behind a request for more.
+    receive_at(&mut mtp, NEW_YEAR_2020 + 6000, &[too_low(sent)]);
+    let mut buffer = DequeBuffer::with_capacity(0, 0);
+    let ping = tl::functions::Ping { ping_id: 1 }.to_bytes();
+    let pushed = mtp.push(&mut buffer, &ping);
+    assert_eq!(mtp.get_current_salt(), 3);
+    assert!(pushed.is_none() && mtp.salt_request_msg_id.is_some());
+}
+
+#[test]
+fn salts_across_2038_are_used_in_order() {
+    // 2038-01-19T03:14:08Z, from which the protocol's `int` times read negative: an answer half an
+    // hour before it, with the salt in use and the next two, both valid from after that second.
+    let wrap = i64::from(LAST_SECOND_BELOW_I64_MAX) + 1;
+    let mut mtp = Encrypted::build().finish([0; 256]);
+    mtp.clock = ServerClock::at_server_time((wrap - 1800) as u32);
+    mtp.salt_request_msg_id = Some(MsgId(7));
+    let salts = [(wrap - 2800, 1), (wrap + 800, 2), (wrap + 4400, 3)];
+    receive_at(
+        &mut mtp,
+        wrap - 1800,
+        &[future_salts(7, wrap - 1800, &salts)],
+    );
+    let sent = request(&mut mtp);
+    assert_eq!(mtp.get_current_salt(), 1);
+
+    // On a clock moved past the second one's `valid_since` by more than `SALT_USE_DELAY` (by a
+    // 16), it is the one in use, the third still to come.
+    receive_at(&mut mtp, wrap + 900, &[too_low(sent)]);
+    request(&mut mtp);
+    assert_eq!(mtp.get_current_salt(), 2);
+}
+
+#[test]
+fn first_future_salts_now_sets_a_clock_from_the_wall_clock_back_too() {
+    // A key from an earlier connection and a wall clock 20 s fast: less than the 30 s the server
+    // answers with a 17, so nothing else corrects the clock it starts from.
+    let mut mtp = Encrypted::build().time_offset(20).finish([0; 256]);
+    mtp.salt_request_msg_id = Some(MsgId(7));
+
+    // The server's first time sets it, back as well: the next identifier, and the salt in use,
+    // follow the server's time. On the fast clock the next salt, valid from 45 s ago, would be
+    // past `SALT_USE_DELAY` already.
+    let server_time = now();
+    let salts = [
+        (server_time - 3600, 1),
+        (server_time - 45, 2),
+        (server_time + 3600, 3),
+    ];
+    receive_at(
+        &mut mtp,
+        server_time,
+        &[future_salts(7, server_time, &salts)],
+    );
+    let next = request(&mut mtp);
+    assert!(
+        (seconds(next) - server_time).abs() <= 1,
+        "{} is not the server's {server_time}",
+        seconds(next)
+    );
+    assert_eq!(mtp.get_current_salt(), 1);
+
+    // After that the server's times only move it forward: an answer from 10 s before (one that
+    // took long to come) leaves it.
+    mtp.salt_request_msg_id = Some(MsgId(9));
+    let before = server_time - 10;
+    receive_at(&mut mtp, before, &[future_salts(9, before, &salts)]);
+    let (clock, _) = mtp.clock.now();
+    assert!((i64::from(clock) - server_time).abs() <= 1);
+}
+
+#[test]
+fn future_salts_now_moves_a_server_set_clock_forward_never_back() {
+    // On a clock the server's time set, it answers at a time 1000 s ahead: the server's time is at
+    // least that, so the clock moves up to it, and the next identifier and the salt in use follow.
+    let mut mtp = mtp_with_salts();
+    mtp.salt_request_msg_id = Some(MsgId(9));
+    let salts = [
+        (NEW_YEAR_2020 - 3600, 1),
+        (NEW_YEAR_2020 + 500, 2),
+        (NEW_YEAR_2020 + 5000, 3),
+    ];
+    let ahead = NEW_YEAR_2020 + 1000;
+    receive_at(&mut mtp, ahead, &[future_salts(9, ahead, &salts)]);
+    let next = request(&mut mtp);
+    assert!((seconds(next) - ahead).abs() <= 1);
+    assert_eq!(mtp.get_current_salt(), 2);
+
+    // An answer from a time behind the clock leaves it: the server's time is at least the latest
+    // it said. The identifiers would rise anyway, a session's never fall; the salt shows the
+    // clock: of the same three salts again, the next one is valid on it, so it is the one in use.
+    mtp.salt_request_msg_id = Some(MsgId(11));
+    receive_at(&mut mtp, ahead, &[future_salts(11, NEW_YEAR_2020, &salts)]);
+    let later = request(&mut mtp);
+    assert!((seconds(later) - ahead).abs() <= 1);
+    assert_eq!(mtp.get_current_salt(), 2);
 }
