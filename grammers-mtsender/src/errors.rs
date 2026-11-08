@@ -204,7 +204,9 @@ pub enum InvocationError {
     /// Most commonly, the session is accessed on each request to query the current
     /// datacenter, and whenever peers are encountered as those need to be persisted.
     ///
-    /// The concrete error type is erased as that depends on the session storage used.
+    /// The concrete error type is erased as that depends on the session storage used. It is
+    /// displayed after `session error: `, and the error chain goes on from its `source()`: to
+    /// reach the storage's own error, match this variant and downcast the box.
     Session(Box<dyn std::error::Error + Send + Sync>),
 
     /// The request invocation failed because it was invalid or the server
@@ -248,12 +250,22 @@ pub enum InvocationError {
     Authentication(authentication::Error),
 }
 
-impl std::error::Error for InvocationError {}
+impl std::error::Error for InvocationError {
+    /// What a session error's own error wraps: its message is already this one's ([`fmt::Display`]
+    /// renders it, as every grammers error renders the one it wraps), so the chain goes on from its
+    /// `source()`, as `#[error(transparent)]` would, and no reporter prints a message twice.
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Session(error) => error.source(),
+            _ => None,
+        }
+    }
+}
 
 impl fmt::Display for InvocationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Session(_) => write!(f, "session error"),
+            Self::Session(err) => write!(f, "session error: {err}"),
             Self::Rpc(err) => write!(f, "request error: {err}"),
             Self::Io(err) => write!(f, "request error: {err}"),
             Self::Deserialize(err) => write!(f, "request error: {err}"),
