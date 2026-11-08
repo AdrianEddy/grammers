@@ -9,13 +9,18 @@
 //! A client clock ahead of the server's: after `bad_msg_notification` 17 (`msg_id` too high), the
 //! next message identifiers follow the corrected clock, in the same session while the server has
 //! taken none of its messages, in a new one once it has; a notice about an identifier from before
-//! the last correction changes neither.
+//! the last correction changes neither. The identifiers come from the server's clock, which the
+//! monotonic clock carries on, never from the machine's wall clock after it starts.
 
 use super::*;
 use crate::mtp::BadMessage;
 
+/// 2020-01-01T00:00:00Z and 2021-01-01T00:00:00Z: server times years from the machine's clock.
+const NEW_YEAR_2020: i64 = 1_577_836_800;
+const NEW_YEAR_2021: i64 = 1_609_459_200;
+
 fn now() -> i64 {
-    Encrypted::now_since_epoch().as_secs() as i64
+    ServerClock::wall_clock_since_epoch().as_secs() as i64
 }
 
 /// The seconds of a message identifier.
@@ -73,6 +78,15 @@ fn too_high(bad_msg_id: i64) -> Vec<u8> {
         bad_msg_id,
         bad_msg_seqno: 1,
         error_code: 17,
+    })
+    .to_bytes()
+}
+
+fn too_low(bad_msg_id: i64) -> Vec<u8> {
+    tl::enums::BadMsgNotification::Notification(tl::types::BadMsgNotification {
+        bad_msg_id,
+        bad_msg_seqno: 1,
+        error_code: 16,
     })
     .to_bytes()
 }
@@ -138,8 +152,9 @@ fn session_the_server_took_a_message_of_is_replaced() {
     let first = request(&mut mtp);
     receive(&mut mtp, &[session_created(first), rpc_result(first)]);
 
-    // The clock jumps 1000 s ahead: the next request is refused, beside something to acknowledge.
-    mtp.time_offset = 1000;
+    // The client's clock of the server's time gets 1000 s ahead (the server's own clock stepped
+    // back, say): the next request is refused, beside something to acknowledge.
+    mtp.clock.anchor += Duration::from_secs(1000);
     let sent = request(&mut mtp);
     let results = receive(
         &mut mtp,
@@ -257,15 +272,37 @@ fn msg_id_too_low_stays_in_the_session() {
     let first = request(&mut mtp);
     receive(&mut mtp, &[session_created(first)]);
     let sent = request(&mut mtp);
-    let too_low = tl::enums::BadMsgNotification::Notification(tl::types::BadMsgNotification {
-        bad_msg_id: sent,
-        bad_msg_seqno: 1,
-        error_code: 16,
-    })
-    .to_bytes();
-    assert!(!is_reset(&receive(&mut mtp, &[too_low])));
+    assert!(!is_reset(&receive(&mut mtp, &[too_low(sent)])));
     assert_eq!(mtp.session_id, session);
     let next = request(&mut mtp);
     assert!(next > sent);
     assert!((seconds(next) - now()).abs() <= 5);
+}
+
+#[test]
+fn identifiers_follow_the_server_clock_not_the_wall_clock() {
+    // The server's clock, set 10 s ago at a time years from the machine's: the monotonic clock
+    // carried it on by those 10 s, and the machine's wall clock, read only when the MTP was built,
+    // plays no part. So a step of the wall clock on an open connection can't move the identifiers.
+    let mut mtp = Encrypted::build().finish([0; 256]);
+    mtp.clock = ServerClock {
+        anchor: Duration::from_secs(NEW_YEAR_2020 as u64),
+        at: Instant::now().checked_sub(Duration::from_secs(10)).unwrap(),
+    };
+    let sent = request(&mut mtp);
+    let expected = NEW_YEAR_2020 + 10;
+    assert!(
+        (seconds(sent) - expected).abs() <= 1,
+        "{} is not the server's {expected}",
+        seconds(sent)
+    );
+
+    // A correction sets the clock from the server's own time, and it goes on from there.
+    receive_at(&mut mtp, NEW_YEAR_2021, &[too_low(sent)]);
+    let next = request(&mut mtp);
+    assert!(
+        (seconds(next) - NEW_YEAR_2021).abs() <= 1,
+        "{} is not the server's {NEW_YEAR_2021}",
+        seconds(next)
+    );
 }

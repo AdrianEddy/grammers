@@ -8,7 +8,7 @@
 
 use std::cmp::Reverse;
 use std::mem;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use grammers_crypto::{AuthKey, decrypt_data_v2, encrypt_data_v2, get_padding_data_v2};
 use grammers_tl_types::{self as tl, Deserializable, Identifiable, Serializable};
@@ -76,8 +76,8 @@ pub struct Encrypted {
     /// The Authorization Key to use to encrypt payload.
     auth_key: AuthKey,
 
-    /// The time offset from the server's time, in seconds.
-    time_offset: i32,
+    /// The server's clock, which message identifiers are taken from.
+    clock: ServerClock,
 
     /// Salts that may be used when encrypting payload, sorted by valid date descending (so the last one is the one
     /// that can be used now).
@@ -144,8 +144,65 @@ struct Nesting {
     gzip_depth: u32,
 }
 
+/// The server's clock as the client keeps it: the server's time at one instant, which the
+/// monotonic clock carries on from. Message identifiers are taken from it, as TDLib's are
+/// (`AuthData::next_message_id`: the server time difference plus `Time::now()`, which is
+/// monotonic) and tdesktop's (`MsgIdManager::next`: an identifier from the server's time plus a
+/// monotonic counter's advance), so a step of the machine's wall clock while a connection is open
+/// doesn't move them: only the server's time does ([`Encrypted::correct_clock`]). The wall clock
+/// is read once, when [`Builder::finish`] starts the clock.
+///
+/// The monotonic clock may stand still while the machine sleeps (on Linux and macOS): identifiers
+/// taken after a long sleep are behind, and the server's notice that one is too low (16) sets the
+/// clock again, in the same session.
+#[derive(Clone, Copy, Debug)]
+struct ServerClock {
+    /// The server's time since the epoch at `at`, its seconds modulo 2^32 as message identifiers
+    /// hold them, so adding the time since `at` can't overflow.
+    anchor: Duration,
+    at: Instant,
+}
+
+impl ServerClock {
+    /// The server's clock `offset` seconds from the machine's wall clock, now.
+    fn from_wall_clock(offset: i32) -> Self {
+        let wall = Self::wall_clock_since_epoch();
+        let secs = (wall.as_secs() as u32).wrapping_add_signed(offset);
+        Self {
+            anchor: Duration::new(u64::from(secs), wall.subsec_nanos()),
+            at: Instant::now(),
+        }
+    }
+
+    /// The machine's wall-clock time since the epoch. A clock set before the epoch reads as the
+    /// epoch: the server's clock, corrected from the server's message IDs, makes up for it like for
+    /// any wrong clock.
+    fn wall_clock_since_epoch() -> Duration {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+    }
+
+    /// The server's clock, at `secs` now: the seconds of a message identifier the server sent.
+    fn at_server_time(secs: u32) -> Self {
+        Self {
+            anchor: Duration::from_secs(u64::from(secs)),
+            at: Instant::now(),
+        }
+    }
+
+    /// The server's time now: its seconds since the epoch, modulo 2^32, and the nanoseconds past
+    /// them.
+    fn now(&self) -> (u32, u32) {
+        let now = self.anchor + self.at.elapsed();
+        (now.as_secs() as u32, now.subsec_nanos())
+    }
+}
+
 impl Builder {
-    /// Configures the time offset to Telegram servers.
+    /// Configures the time offset to Telegram servers: the server's clock, which message
+    /// identifiers are taken from, starts at the machine's wall clock plus `offset` seconds, and
+    /// goes on from the monotonic clock, so a later step of the wall clock doesn't move it.
     pub fn time_offset(mut self, offset: i32) -> Self {
         self.time_offset = offset;
         self
@@ -167,7 +224,7 @@ impl Builder {
     pub fn finish(self, auth_key: [u8; 256]) -> Encrypted {
         Encrypted {
             auth_key: AuthKey::from_bytes(auth_key),
-            time_offset: self.time_offset,
+            clock: ServerClock::from_wall_clock(self.time_offset),
             salts: vec![tl::types::FutureSalt {
                 valid_since: 0,
                 valid_until: i32::MAX,
@@ -215,33 +272,19 @@ impl Encrypted {
         self.auth_key.to_bytes()
     }
 
-    /// The local time since the epoch. A clock set before the epoch reads as the epoch: the time
-    /// offset, corrected from the server's message IDs, makes up for it like for any wrong clock.
-    fn now_since_epoch() -> std::time::Duration {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-    }
-
-    /// Correct our time offset based on a known valid message ID.
+    /// Set the server's clock from a message ID the server sent: its seconds are the server's time.
     ///
-    /// The message ID's time comes from the server, and the seconds of a message ID are taken
-    /// modulo 2^32 anyway ([`Self::get_new_msg_id`]), so the arithmetic wraps.
-    fn correct_time_offset(&mut self, msg_id: i64) {
-        let now = Self::now_since_epoch().as_secs() as i32;
-
-        let correct = (msg_id >> 32) as i32;
-        self.time_offset = correct.wrapping_sub(now);
+    /// The seconds of a message ID are taken modulo 2^32 anyway ([`Self::get_new_msg_id`]), so
+    /// the server's are too.
+    fn correct_clock(&mut self, msg_id: i64) {
+        self.clock = ServerClock::at_server_time((msg_id >> 32) as u32);
     }
 
-    /// Generates a new unique message ID based on the current
-    /// time (in ms) since epoch, applying a known time offset.
+    /// Generates a new unique message ID from the server's clock ([`ServerClock`]): its seconds,
+    /// and its nanoseconds shifted to a multiple of 4.
     fn get_new_msg_id(&mut self) -> i64 {
-        let now = Self::now_since_epoch();
-
-        let seconds = (now.as_secs() as i32).wrapping_add(self.time_offset) as u64;
-        let nanoseconds = now.subsec_nanos() as u64;
-        let mut new_msg_id = ((seconds << 32) | (nanoseconds << 2)) as i64;
+        let (seconds, nanoseconds) = self.clock.now();
+        let mut new_msg_id = ((u64::from(seconds) << 32) | (u64::from(nanoseconds) << 2)) as i64;
 
         if self.last_msg_id >= new_msg_id {
             new_msg_id = self.last_msg_id.wrapping_add(4);
@@ -827,17 +870,17 @@ impl Encrypted {
 
         match bad_msg.error_code {
             16 => {
-                // Sent `msg_id` was too low (our `time_offset` is wrong).
-                self.correct_time_offset(message.msg_id);
+                // Sent `msg_id` was too low (our clock of the server's time is wrong).
+                self.correct_clock(message.msg_id);
             }
             // Only about one issued since the last correction (those rise, from below every one
             // refused before): one above the last issued is stale, or replayed, and correcting
             // the clock from it again could take the identifiers back, or start a session for
             // nothing. The caller still sends the message it names again.
             17 if bad_msg.bad_msg_id <= self.last_msg_id => {
-                // Sent `msg_id` was too high (our `time_offset` is wrong), and so are the ones
-                // after it: the next ones must go below them.
-                self.correct_time_offset(message.msg_id);
+                // Sent `msg_id` was too high (our clock of the server's time is wrong), and so
+                // are the ones after it: the next ones must go below them.
+                self.correct_clock(message.msg_id);
                 self.msg_id_too_high = true;
             }
             32 => {
@@ -1544,7 +1587,7 @@ mod tests {
     }
 
     fn ensure_buffer_is_message(buffer: &[u8], body: &[u8], seq_no: u8) {
-        // buffer[0..8] is the msg_id, based on `SystemTime::now()`
+        // buffer[0..8] is the msg_id, from the server's clock
         assert_ne!(&buffer[0..8], [0, 0, 0, 0, 0, 0, 0, 0]);
         // buffer[8..12] is the seq_no, ever-increasing odd number (little endian)
         assert_eq!(&buffer[8..12], [seq_no, 0, 0, 0]);
