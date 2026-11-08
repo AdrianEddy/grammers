@@ -31,7 +31,6 @@ use grammers_session::types::DcOption;
 use grammers_session::updates::UpdatesLike;
 use grammers_tl_types::{self as tl, Deserializable, enums};
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::task::AbortHandle;
 use tokio::{
     sync::{mpsc, oneshot},
     task::JoinSet,
@@ -40,7 +39,7 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 use crate::configuration::{ConnectionParams, RetryContext};
-use crate::errors::InvocationError;
+use crate::errors::{InvocationError, ReadError};
 use crate::net::{ConnKind, DialTarget};
 use crate::{Sender, connect, connect_with_auth};
 
@@ -76,12 +75,29 @@ enum Request {
 struct Rpc {
     body: Vec<u8>,
     tx: oneshot::Sender<Result<InvokeResponse, InvocationError>>,
+    /// An ended connection handed it back once already ([`ConnectionEnd::unsent`]).
+    handed_back: bool,
 }
 
 struct ConnectionInfo {
     dc_id: i32,
     rpc_tx: mpsc::UnboundedSender<Rpc>,
-    abort_handle: AbortHandle,
+}
+
+/// What a connection's task hands back to the runner as it ends ([`run_sender`]).
+struct ConnectionEnd {
+    /// The datacenter it was connected to.
+    dc_id: i32,
+    /// The requests the runner sent it that it never took, so never sent. A request a connection
+    /// hands back is sent on once, through a new connection ([`SenderPoolRunner::dispatch`]);
+    /// handed back again, it fails with that connection's [`error`](ConnectionEnd::error), as the
+    /// requests that connection took do, and the caller's retry policy decides.
+    unsent: Vec<Rpc>,
+    /// The error that ended the connection, or `None` if the runner dropped its end of the
+    /// channel, which leaves nothing unsent.
+    error: Option<ReadError>,
+    /// The gap signal the updates channel is still owed ([`UpdatesForwarder::finish`]).
+    owed_signal: Option<UpdatesLike>,
 }
 
 /// A fat [`SenderPoolHandle`] with additional metadata from its attached [`SenderPoolRunner`].
@@ -135,9 +151,8 @@ pub struct SenderPoolRunner {
     request_rx: mpsc::UnboundedReceiver<Request>,
     updates_tx: mpsc::Sender<UpdatesLike>,
     connections: Vec<ConnectionInfo>,
-    /// The connections' tasks, each ending with the gap signal it still owed the updates
-    /// channel ([`UpdatesForwarder::finish`]).
-    connection_pool: JoinSet<Option<UpdatesLike>>,
+    /// The connections' tasks, each ending with what it hands back ([`ConnectionEnd`]).
+    connection_pool: JoinSet<ConnectionEnd>,
     /// A gap signal an ended connection owed the updates channel, sent once it has room. One
     /// covers any number: each makes the receiver fetch the difference.
     owed_signal: Option<UpdatesLike>,
@@ -197,8 +212,8 @@ impl SenderPoolHandle {
     /// Communicate with the running [`SenderPoolRunner`] instance
     /// to drop all active connections and gracefully stop running.
     ///
-    /// The runner takes it after the request it is handling, and a new connection's dial and
-    /// `initConnection` can take up to 60 seconds.
+    /// The runner takes it after the requests ahead of it, each of which may need a new
+    /// connection's dial and `initConnection` (up to 60 seconds).
     pub fn quit(&self) -> bool {
         self.0.send(Request::Quit).is_ok()
     }
@@ -327,19 +342,34 @@ impl SenderPoolRunner {
             tokio::select! {
                 biased;
                 Some(completion) = self.connection_pool.join_next(), if !self.connection_pool.is_empty() => {
+                    // A connection whose task ended, or is ending, closed its end of the channel
+                    // (`run_sender`), so it takes no more requests.
+                    self.connections
+                        .retain(|connection| !connection.rpc_tx.is_closed());
                     match completion {
-                        Ok(Some(signal)) => {
-                            self.owed_signal.get_or_insert(signal);
+                        Ok(end) => {
+                            if let Some(signal) = end.owed_signal {
+                                self.owed_signal.get_or_insert(signal);
+                            }
+                            for mut rpc in end.unsent {
+                                match &end.error {
+                                    // Its second connection ended before taking it too.
+                                    Some(error) if rpc.handed_back => {
+                                        drop(rpc.tx.send(Err(error.clone().into())));
+                                    }
+                                    _ => {
+                                        rpc.handed_back = true;
+                                        self.dispatch(end.dc_id, rpc).await;
+                                    }
+                                }
+                            }
                         }
-                        Ok(None) => {}
                         Err(err) => {
                             if let Ok(reason) = err.try_into_panic() {
                                 panic::resume_unwind(reason);
                             }
                         }
                     }
-                    self.connections
-                        .retain(|connection| !connection.abort_handle.is_finished());
                 }
                 () = send_owed_signal(&self.updates_tx, &mut self.owed_signal), if self.owed_signal.is_some() => {}
                 request = self.request_rx.recv() => {
@@ -363,21 +393,12 @@ impl SenderPoolRunner {
     async fn process_request(&mut self, request: Request) -> ControlFlow<()> {
         match request {
             Request::Invoke { dc_id, body, tx } => {
-                let connection = match self
-                    .connections
-                    .iter()
-                    .find(|connection| connection.dc_id == dc_id)
-                {
-                    Some(connection) => connection,
-                    None => match self.create_connection(dc_id).await {
-                        Ok(x) => x,
-                        Err(e) => {
-                            let _ = tx.send(Err(e));
-                            return ControlFlow::Continue(());
-                        }
-                    },
+                let rpc = Rpc {
+                    body,
+                    tx,
+                    handed_back: false,
                 };
-                let _ = connection.rpc_tx.send(Rpc { body, tx });
+                self.dispatch(dc_id, rpc).await;
                 ControlFlow::Continue(())
             }
             Request::CheckRetry {
@@ -412,6 +433,38 @@ impl SenderPoolRunner {
         }
     }
 
+    /// Hand `rpc` to the connection to `dc_id`, making one if none is open.
+    ///
+    /// A connection's task wakes the callers of its requests as its connection fails, before the
+    /// runner joins it, so a retry can reach the runner while the connection is still listed. An
+    /// ended or ending connection takes nothing more ([`run_sender`] closes its end of the channel
+    /// first): the request goes to a new connection, rather than fail with the old one. A request
+    /// a connection hands back comes here once: handed back again, it fails with that connection's
+    /// error ([`ConnectionEnd::unsent`]).
+    async fn dispatch(&mut self, dc_id: i32, mut rpc: Rpc) {
+        loop {
+            let open = self
+                .connections
+                .iter()
+                .find(|connection| connection.dc_id == dc_id && !connection.rpc_tx.is_closed());
+            let connection = match open {
+                Some(connection) => connection,
+                None => match self.create_connection(dc_id).await {
+                    Ok(connection) => connection,
+                    Err(error) => {
+                        drop(rpc.tx.send(Err(error)));
+                        return;
+                    }
+                },
+            };
+            match connection.rpc_tx.send(rpc) {
+                Ok(()) => return,
+                // It closed its end since it was found: it is ending too.
+                Err(mpsc::error::SendError(unsent)) => rpc = unsent,
+            }
+        }
+    }
+
     async fn create_connection(&mut self, dc_id: i32) -> Result<&ConnectionInfo, InvocationError> {
         let dc_option = match self.session.dc_option(dc_id)? {
             Some(x) => x,
@@ -426,17 +479,14 @@ impl SenderPoolRunner {
         self.session.set_dc_option(&dc_option).await?;
 
         let (rpc_tx, rpc_rx) = mpsc::unbounded_channel();
-        let abort_handle = self.connection_pool.spawn(run_sender(
+        self.connection_pool.spawn(run_sender(
+            dc_id,
             sender,
             rpc_rx,
             UpdatesForwarder::new(self.updates_tx.clone()),
             dc_option.id == self.session.home_dc_id()?,
         ));
-        Ok(self.connections.push_mut(ConnectionInfo {
-            dc_id,
-            rpc_tx,
-            abort_handle,
-        }))
+        Ok(self.connections.push_mut(ConnectionInfo { dc_id, rpc_tx }))
     }
 
     async fn connect_sender(
@@ -566,20 +616,23 @@ async fn send_owed_signal(updates: &mpsc::Sender<UpdatesLike>, owed: &mut Option
     }
 }
 
-/// Drive `sender`, feeding it the requests from `rpc_rx` and forwarding its updates, until its
-/// connection fails or the runner drops the other end of `rpc_rx`. Returns the gap signal the
-/// updates channel is still owed ([`UpdatesForwarder::finish`]), for the runner to send.
+/// Drive `sender`, the connection to `dc_id`, feeding it the requests from `rpc_rx` and forwarding
+/// its updates, until its connection fails or the runner drops the other end of `rpc_rx`. Then
+/// close `rpc_rx`, so the runner can send it nothing more, and hand back, for the runner to send
+/// on, the requests still queued in it, which the sender never took, with the error that ended
+/// the connection and the gap signal the updates channel is still owed ([`ConnectionEnd`]).
 ///
 /// A new session ([`UpdatesLike::NewSession`]) is a gap in the account's updates only on the home
 /// connection, which they come on, so only the home sender forwards it, as only it reports its
 /// closing (TDLib also fetches the difference on the main session's new session alone).
 async fn run_sender<T: transport::Transport, M: mtp::Mtp>(
+    dc_id: i32,
     mut sender: Sender<T, M>,
     mut rpc_rx: mpsc::UnboundedReceiver<Rpc>,
     mut updates: UpdatesForwarder,
     home_sender: bool,
-) -> Option<UpdatesLike> {
-    loop {
+) -> ConnectionEnd {
+    let (owed_signal, error) = loop {
         tokio::select! {
             step = sender.step() => match step {
                 Ok(all_new_updates) => {
@@ -590,14 +643,28 @@ async fn run_sender<T: transport::Transport, M: mtp::Mtp>(
                     }
                 }
                 // `Sender::step` logged the error and failed the requests with it.
-                Err(_) => break updates.finish(home_sender),
+                Err(error) => break (updates.finish(home_sender), Some(error)),
             },
             () = updates.send_lagged(), if updates.owes_lagged() => {}
             rpc = rpc_rx.recv() => match rpc {
                 Some(rpc) => sender.enqueue_body(rpc.body, rpc.tx),
-                None => break updates.finish(false),
+                None => break (updates.finish(false), None),
             },
         }
+    };
+
+    // From now on a send to this connection fails, and gives the runner its request back; one
+    // sent before is in the channel, which `recv` drains until it reports the end.
+    rpc_rx.close();
+    let mut unsent = Vec::new();
+    while let Some(rpc) = rpc_rx.recv().await {
+        unsent.push(rpc);
+    }
+    ConnectionEnd {
+        dc_id,
+        unsent,
+        error,
+        owed_signal,
     }
 }
 

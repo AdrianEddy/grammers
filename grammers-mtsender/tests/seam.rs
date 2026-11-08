@@ -685,7 +685,8 @@ fn config(dc_options: Vec<tl::enums::DcOption>) -> tl::enums::Config {
 }
 
 /// One run of a pool on `session` that connects to datacenter 2, whose server holds
-/// [`AUTH_KEY`], answers `initConnection` with `config` and hangs up. Returns the address dialed.
+/// [`AUTH_KEY`], answers `initConnection` with `config`, takes the request and hangs up. Returns
+/// the address dialed.
 async fn connect_to_dc2(session: &Arc<MemorySession>, config: &tl::enums::Config) -> SocketAddrV4 {
     let (dialer, mut servers) = TestDialer::new(1 << 16);
     let params = params(Arc::clone(&dialer), Vec::new());
@@ -698,9 +699,12 @@ async fn connect_to_dc2(session: &Arc<MemorySession>, config: &tl::enums::Config
     let serve = async {
         let mut server = servers.recv().await.unwrap();
         server.answer_encrypted(&config.to_bytes()).await;
+        server.read_packet().await;
     };
-    // The pool stores what the connect learnt before it sends the request, which finds the
-    // server gone.
+    // The pool stores what the connect learnt before it sends the request, which the server takes
+    // before it hangs up, so the request fails with the connection. A server gone before the
+    // request left would have the pool send it on through a new connection, which nobody here
+    // answers.
     let (result, ()) = tokio::join!(call, serve);
     assert!(result.is_err());
     assert!(pool.handle.quit());
