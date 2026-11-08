@@ -48,9 +48,10 @@ jobs:
       - run: cargo "+$MSRV" clippy $CRATES --all-targets -- -D warnings
       - run: cargo test $CRATES
       # What MultiChat doesn't build: `grammers-mtsender`'s default `os-detect` (the OS probes behind
-      # `ConnectionParams::default()`) and `proxy` (`Socks5Dialer`), linted, and the proxy dialer tested offline.
+      # `ConnectionParams::default()`) and `proxy` (`Socks5Dialer`), linted, and the proxy dialer tested offline (its
+      # unit tests and the seam's).
       - run: cargo "+$MSRV" clippy -p grammers-mtsender --all-features --all-targets -- -D warnings
-      - run: cargo test -p grammers-mtsender --no-default-features --features proxy --test seam
+      - run: cargo test -p grammers-mtsender --no-default-features --features proxy --lib --test seam
       # The generator's own tests, and serde for the generated code (`impl-serde`, which MultiChat's fake server reads
       # and writes its transcripts with): binary fields serialized as bytes.
       - run: cargo "+$MSRV" clippy -p grammers-tl-gen -p grammers-tl-types --all-features --all-targets -- -D warnings

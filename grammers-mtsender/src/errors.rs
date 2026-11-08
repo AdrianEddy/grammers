@@ -6,6 +6,7 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+use std::sync::Arc;
 use std::{fmt, io};
 
 use grammers_mtproto::connection::UnpackError;
@@ -13,10 +14,11 @@ use grammers_mtproto::{authentication, mtp, transport};
 use grammers_tl_types as tl;
 
 /// This error occurs when reading from the network fails.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum ReadError {
-    /// Standard I/O error.
-    Io(io::Error),
+    /// Standard I/O error, shared: the error that ends a connection fails every request the
+    /// connection held, each with a copy of this ([`InvocationError::Io`] says what it gets).
+    Io(Arc<io::Error>),
     /// Error propagated from the underlying [`transport`], such as a transport error code the
     /// server sent ([`transport::Error::BadStatus`]).
     Transport(transport::Error),
@@ -24,18 +26,14 @@ pub enum ReadError {
     Deserialize(mtp::DeserializeError),
 }
 
-impl std::error::Error for ReadError {}
-
-impl Clone for ReadError {
-    fn clone(&self) -> Self {
+impl std::error::Error for ReadError {
+    /// The I/O error's own source: [`fmt::Display`] renders the I/O error, so the chain goes on
+    /// from its `source()`, as [`InvocationError`]'s does. The other variants wrap errors that
+    /// have no source.
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Io(e) => Self::Io(
-                e.raw_os_error()
-                    .map(io::Error::from_raw_os_error)
-                    .unwrap_or_else(|| io::Error::new(e.kind(), e.to_string())),
-            ),
-            Self::Transport(e) => Self::Transport(e.clone()),
-            Self::Deserialize(e) => Self::Deserialize(e.clone()),
+            Self::Io(error) => error.source(),
+            Self::Transport(_) | Self::Deserialize(_) => None,
         }
     }
 }
@@ -52,7 +50,7 @@ impl fmt::Display for ReadError {
 
 impl From<io::Error> for ReadError {
     fn from(error: io::Error) -> Self {
-        Self::Io(error)
+        Self::Io(Arc::new(error))
     }
 }
 
@@ -218,6 +216,14 @@ pub enum InvocationError {
     ///
     /// Telegram may kill the connection at any moment, but it is generally valid to retry
     /// the request at least once immediately, which will be done through a new connection.
+    ///
+    /// It is displayed after `request error: `, and the error chain goes on from the I/O error's
+    /// `source()`, which is its payload's own, such as the cause a [`crate::Dialer`]'s error keeps.
+    /// An I/O error that ends a connection fails every request the connection held, so they share
+    /// it: a request's own is an `io::Error` of the same kind whose payload is that
+    /// `Arc<io::Error>` (at `get_ref()`), which renders it and goes on from its `source()`. An
+    /// operating system's error is copied instead (its code is all it holds), and a request that
+    /// shares the error with no other gets it whole.
     Io(io::Error),
 
     /// Error propagated from attempting to deserialize an invalid [`tl::Deserializable`].
@@ -251,12 +257,14 @@ pub enum InvocationError {
 }
 
 impl std::error::Error for InvocationError {
-    /// What a session error's own error wraps: its message is already this one's ([`fmt::Display`]
-    /// renders it, as every grammers error renders the one it wraps), so the chain goes on from its
-    /// `source()`, as `#[error(transparent)]` would, and no reporter prints a message twice.
+    /// What a session or I/O error's own error wraps: its message is already this one's
+    /// ([`fmt::Display`] renders it, as every grammers error renders the one it wraps), so the
+    /// chain goes on from its `source()`, as `#[error(transparent)]` would, and no reporter prints
+    /// a message twice. The other variants wrap errors that have no source.
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Session(error) => error.source(),
+            Self::Io(error) => error.source(),
             _ => None,
         }
     }
@@ -286,7 +294,14 @@ impl From<Box<dyn std::error::Error + Send + Sync>> for InvocationError {
 impl From<ReadError> for InvocationError {
     fn from(error: ReadError) -> Self {
         match error {
-            ReadError::Io(error) => Self::from(error),
+            // The error itself, unless other requests share it (`Self::Io`'s doc says how).
+            ReadError::Io(error) => Self::Io(match Arc::try_unwrap(error) {
+                Ok(error) => error,
+                Err(shared) => match shared.raw_os_error() {
+                    Some(code) => io::Error::from_raw_os_error(code),
+                    None => io::Error::new(shared.kind(), shared),
+                },
+            }),
             ReadError::Transport(error) => Self::from(error),
             ReadError::Deserialize(error) => Self::from(error),
         }

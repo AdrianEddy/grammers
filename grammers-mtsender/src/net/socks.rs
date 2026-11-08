@@ -12,6 +12,7 @@ use std::io::{self, ErrorKind};
 use std::net::{IpAddr, SocketAddr};
 
 use hickory_resolver::Resolver;
+use hickory_resolver::net::NetError;
 use percent_encoding::percent_decode_str;
 use tokio_socks::tcp::Socks5Stream;
 use tracing::info;
@@ -84,10 +85,10 @@ impl Socks5Dialer {
                 Ok(ip) => ip,
                 Err(_) => Resolver::builder_tokio()
                     .and_then(|builder| builder.build())
-                    .map_err(io::Error::other)?
+                    .map_err(lookup_error)?
                     .lookup_ip(domain.as_str())
                     .await
-                    .map_err(io::Error::other)?
+                    .map_err(lookup_error)?
                     .iter()
                     .next()
                     .ok_or_else(|| {
@@ -99,6 +100,63 @@ impl Socks5Dialer {
             },
         };
         Ok(SocketAddr::new(ip, self.port))
+    }
+}
+
+/// A failed lookup of the proxy's host as the dial's error ([`ProxyError::Lookup`]).
+fn lookup_error(error: NetError) -> io::Error {
+    io::Error::other(ProxyError::Lookup(error))
+}
+
+/// A failed SOCKS5 connect as the dial's error, of kind [`ErrorKind::ConnectionAborted`]
+/// ([`ProxyError::Io`], [`ProxyError::Socks`]).
+fn socks_error(error: tokio_socks::Error) -> io::Error {
+    io::Error::new(
+        ErrorKind::ConnectionAborted,
+        match error {
+            tokio_socks::Error::Io(io_error) => ProxyError::Io(io_error),
+            answer => ProxyError::Socks(answer),
+        },
+    )
+}
+
+/// A dial's failure at the proxy, as the dial's error carries it: its message names the proxy
+/// hop, and a chain-aware reporter reads each cause once (each variant says how).
+#[derive(Debug)]
+enum ProxyError {
+    /// hickory's error, as hickory renders it, with no source; `Debug` keeps its structure.
+    /// hickory mostly renders the error it wraps and returns it from `source()` as well
+    /// (thiserror's `{0}` beside `#[from]`), so a chain-aware reporter, which
+    /// `InvocationError::Io` passes the dial's error on to, would print it twice; a cause it
+    /// doesn't render (`ProtoError::UrlParsing` and the like, which these calls don't return) is
+    /// left to `Debug`.
+    Lookup(NetError),
+    /// The connection to the proxy failed (it hung up during the handshake, say): the I/O error
+    /// taken out of `tokio_socks::Error::Io`, which renders it and returns it as well. The chain
+    /// goes on from the I/O error's own source.
+    Io(io::Error),
+    /// `tokio-socks`' other errors, which wrap nothing: the proxy's answers (`ConnectionRefused`:
+    /// the proxy answered that the target refused the connection), and no proxy to talk to
+    /// (`ProxyServerUnreachable`: no connection to the proxy could be made).
+    Socks(tokio_socks::Error),
+}
+
+impl fmt::Display for ProxyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Lookup(error) => write!(f, "looking up the SOCKS5 proxy's host: {error}"),
+            Self::Io(error) => write!(f, "SOCKS5 proxy: {error}"),
+            Self::Socks(error) => write!(f, "SOCKS5 proxy: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for ProxyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => error.source(),
+            Self::Lookup(_) | Self::Socks(_) => None,
+        }
     }
 }
 
@@ -141,7 +199,7 @@ impl Dialer for Socks5Dialer {
                                 .await
                         }
                     }
-                    .map_err(|err| io::Error::new(ErrorKind::ConnectionAborted, err))
+                    .map_err(socks_error)
                 })
                 .await?;
             // As in `TokioTcpDialer`: a request is written whole.
@@ -150,3 +208,6 @@ impl Dialer for Socks5Dialer {
         })
     }
 }
+
+#[cfg(test)]
+mod tests;

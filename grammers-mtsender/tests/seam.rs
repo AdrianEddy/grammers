@@ -11,8 +11,9 @@
 //! over it: one to a peer that never answers fails in time, one whose server gives the datacenter
 //! a new address keeps it, and one whose server forgot the session's key makes a new one. A
 //! transport error code fails a request as a transport error. A dial gives up on an address that
-//! never answers and tries the next. The tests play the server on in-memory streams; nothing
-//! leaves the machine.
+//! never answers and tries the next, and a SOCKS5 dial's error names the proxy and says its cause
+//! once. The tests play the server on in-memory streams, and the proxy on loopback; nothing leaves
+//! the machine.
 
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
@@ -1025,4 +1026,47 @@ async fn socks5_dialer_connects_through_the_proxy() {
     // A password that isn't UTF-8 once decoded can't be sent.
     let error = Socks5Dialer::new("socks5://user:%FF@127.0.0.1:1080").unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+}
+
+#[tokio::test]
+#[cfg(feature = "proxy")]
+async fn socks5_dial_error_says_its_cause_once() {
+    use std::error::Error;
+
+    use grammers_mtsender::Socks5Dialer;
+
+    // A proxy that reads the client's greeting and hangs up: the dial fails with the read's own
+    // error, which `tokio-socks` both renders and returns as its source.
+    let proxy_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let proxy_address = proxy_listener.local_addr().unwrap();
+    let proxy = tokio::spawn(async move {
+        let (mut conn, _) = proxy_listener.accept().await.unwrap();
+        // Version 5, one method: none.
+        let mut greeting = [0; 3];
+        conn.read_exact(&mut greeting).await.unwrap();
+        assert_eq!(greeting, [5, 1, 0]);
+    });
+
+    let dialer = Socks5Dialer::new(&format!("socks5://{proxy_address}")).unwrap();
+    // The proxy never connects anywhere: it hangs up before the client names the target.
+    let target = DialTarget {
+        dc_id: 2,
+        kind: ConnKind::Main,
+        ipv4: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9)),
+        ipv6: None,
+    };
+    let error = dialer.dial(&target).await.err().unwrap();
+    proxy.await.unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+
+    // As a request's error, which goes on from the dial error's source: the read's error is said
+    // once, after the proxy hop's name.
+    let error = InvocationError::Io(error);
+    let chain: Vec<_> = std::iter::successors(Some(&error as &dyn Error), |&error| error.source())
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(
+        chain,
+        ["request error: SOCKS5 proxy: unexpected end of file"]
+    );
 }

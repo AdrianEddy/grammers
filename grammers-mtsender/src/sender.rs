@@ -201,7 +201,12 @@ impl<T: Transport, M: mtp::Mtp> Sender<T, M> {
         mut rx: oneshot::Receiver<Result<Vec<u8>, InvocationError>>,
     ) -> Result<Vec<u8>, InvocationError> {
         loop {
-            self.step().await?;
+            if let Err(error) = self.step().await {
+                // `step` failed every request it held with a copy of `error`, this one too: with
+                // that copy dropped, the caller gets the error whole (`InvocationError::Io`).
+                drop(rx);
+                return Err(error.into());
+            }
             match rx.try_recv() {
                 Ok(x) => break x,
                 Err(TryRecvError::Empty) => continue,
@@ -301,13 +306,13 @@ impl<T: Transport, M: mtp::Mtp> Sender<T, M> {
     /// bytes left is marked sent before any answer is read, then the bytes read. A failed write
     /// or flush is returned last: the answers that arrived with it still reach their requests.
     fn on_ready(&mut self, ready: Ready) -> Result<Vec<UpdatesLike>, ReadError> {
-        let written = ready.written.transpose().map_err(ReadError::Io);
+        let written = ready.written.transpose().map_err(ReadError::from);
         if let Ok(Some(n)) = written {
             self.on_net_write(n);
         }
         let updates = match ready.read {
             Some(read) => read
-                .map_err(ReadError::Io)
+                .map_err(ReadError::from)
                 .and_then(|n| self.on_net_read(n)),
             None => Ok(Vec::new()),
         };

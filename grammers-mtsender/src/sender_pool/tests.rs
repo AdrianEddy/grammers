@@ -11,8 +11,9 @@
 //! connection; a new session, a gap on the home connection alone; answers read in the poll whose
 //! write or flush fails, which still reach their requests; a request that reaches a connection
 //! as it ends, which goes to a new one, once; and a connection the pool closes, which fails the
-//! requests whose bytes left and hands back the others, those still queued for it unwritten. No
-//! pool here reaches anything but in-memory streams: every dial is refused ([`RefusingDialer`]).
+//! requests whose bytes left and hands back the others, those still queued for it unwritten. A
+//! connection that fails gives every request it held its error, cause and all. No pool here
+//! reaches anything but in-memory streams: every dial is refused ([`RefusingDialer`]).
 
 use std::num::NonZeroUsize;
 use std::pin::{Pin, pin};
@@ -777,7 +778,7 @@ async fn request_handed_back_twice_fails_with_its_connection_error() {
                 tx,
                 handed_back: false,
             }],
-            error: Some(ReadError::Io(io::ErrorKind::ConnectionReset.into())),
+            error: Some(io::Error::from(io::ErrorKind::ConnectionReset).into()),
             owed_signal: None,
         }
     });
@@ -925,4 +926,91 @@ async fn quit_fails_what_its_connections_hold() {
         );
     }
     assert!(dialer.dialed.lock().unwrap().is_empty());
+}
+
+/// An error that names what failed and leaves its cause to `source()`, as a stream's may.
+#[derive(Debug)]
+struct TunnelError(io::Error);
+
+impl fmt::Display for TunnelError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("the tunnel failed")
+    }
+}
+
+impl std::error::Error for TunnelError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+/// A stream that takes every write, and whose first read fails with the error it holds.
+struct FailsReading(Option<io::Error>);
+
+impl AsyncRead for FailsReading {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        _: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Poll::Ready(Err(self.0.take().expect("one read")))
+    }
+}
+
+impl AsyncWrite for FailsReading {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+#[tokio::test]
+async fn connection_error_reaches_every_request_it_held_with_its_cause() {
+    // Two requests, which the connection takes before its first read: that read fails.
+    let (rpc_tx, rpc_rx) = mpsc::unbounded_channel();
+    let held = [ping(), ping()].map(|body| {
+        let (tx, rx) = oneshot::channel();
+        let rpc = Rpc {
+            body,
+            tx,
+            handed_back: false,
+        };
+        assert!(rpc_tx.send(rpc).is_ok());
+        rx
+    });
+    let stream = FailsReading(Some(io::Error::new(
+        io::ErrorKind::ConnectionReset,
+        TunnelError(io::Error::other("the relay hung up")),
+    )));
+    let _pool = pool_with_connection_over(2, stream, Plain::new(), (rpc_tx, rpc_rx)).await;
+
+    // Each fails with the connection's error, its kind, message and cause, which a copy shares.
+    for rx in held {
+        let error = answer(rx).await.unwrap_err();
+        let chain: Vec<_> =
+            std::iter::successors(Some(&error as &dyn std::error::Error), |&error| {
+                error.source()
+            })
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            chain,
+            ["request error: the tunnel failed", "the relay hung up"]
+        );
+        assert!(matches!(
+            error,
+            InvocationError::Io(error) if error.kind() == io::ErrorKind::ConnectionReset
+        ));
+    }
 }
