@@ -97,7 +97,10 @@ impl Mtp for Plain {
         // > server message identifiers modulo 4 yield 1 if
         // > the message is a response to a client message
         // https://core.telegram.org/mtproto/description#message-identifier-msg-id
-        if msg_id <= 0 || (msg_id % 4) != 1 {
+        //
+        // Taken as the unsigned number it is: from 2038-01-19T03:14:08Z its top bit is set, and
+        // as the `long` it is carried in, it reads negative.
+        if msg_id.cast_unsigned() % 4 != 1 {
             return Err(DeserializeError::BadMessageId { got: msg_id });
         }
 

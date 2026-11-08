@@ -97,8 +97,9 @@ pub struct Encrypted {
     /// The current message sequence number.
     sequence: i32,
 
-    /// The ID of the last message.
-    last_msg_id: i64,
+    /// The ID of the last message, as the unsigned number identifiers are ordered by
+    /// ([`MsgId`]'s order).
+    last_msg_id: u64,
 
     /// Whether the server took a message of this session: it sent one that isn't a notice
     /// refusing one of ours. The first it takes brings `new_session_created`, ahead of any notice
@@ -282,16 +283,19 @@ impl Encrypted {
 
     /// Generates a new unique message ID from the server's clock ([`ServerClock`]): its seconds,
     /// and its nanoseconds shifted to a multiple of 4.
+    ///
+    /// Identifiers are compared as the unsigned numbers they are: from 2038-01-19T03:14:08Z their
+    /// top bit is set, and the `long` the protocol carries them in reads negative.
     fn get_new_msg_id(&mut self) -> i64 {
         let (seconds, nanoseconds) = self.clock.now();
-        let mut new_msg_id = ((u64::from(seconds) << 32) | (u64::from(nanoseconds) << 2)) as i64;
+        let mut new_msg_id = (u64::from(seconds) << 32) | (u64::from(nanoseconds) << 2);
 
         if self.last_msg_id >= new_msg_id {
             new_msg_id = self.last_msg_id.wrapping_add(4);
         }
 
         self.last_msg_id = new_msg_id;
-        new_msg_id
+        new_msg_id.cast_signed()
     }
 
     /// After a `msg_id` too high, lets the next message identifiers follow the corrected clock,
@@ -877,7 +881,7 @@ impl Encrypted {
             // refused before): one above the last issued is stale, or replayed, and correcting
             // the clock from it again could take the identifiers back, or start a session for
             // nothing. The caller still sends the message it names again.
-            17 if bad_msg.bad_msg_id <= self.last_msg_id => {
+            17 if bad_msg.bad_msg_id.cast_unsigned() <= self.last_msg_id => {
                 // Sent `msg_id` was too high (our clock of the server's time is wrong), and so
                 // are the ones after it: the next ones must go below them.
                 self.correct_clock(message.msg_id);
@@ -1550,7 +1554,7 @@ impl Mtp for Encrypted {
             buffer.extend_front(&msg_key);
             buffer.extend_front(&self.auth_key.key_id());
 
-            Some(MsgId(self.last_msg_id))
+            Some(MsgId(self.last_msg_id.cast_signed()))
         }
     }
 

@@ -10,7 +10,8 @@
 //! next message identifiers follow the corrected clock, in the same session while the server has
 //! taken none of its messages, in a new one once it has; a notice about an identifier from before
 //! the last correction changes neither. The identifiers come from the server's clock, which the
-//! monotonic clock carries on, never from the machine's wall clock after it starts.
+//! monotonic clock carries on, never from the machine's wall clock after it starts. Identifiers
+//! are compared as the unsigned numbers they are, so they rise past i64::MAX, in 2038.
 
 use super::*;
 use crate::mtp::BadMessage;
@@ -305,4 +306,52 @@ fn identifiers_follow_the_server_clock_not_the_wall_clock() {
         "{} is not the server's {NEW_YEAR_2021}",
         seconds(next)
     );
+}
+
+/// 2038-01-19T03:14:07Z: the last second whose message identifiers are below i64::MAX, the most
+/// the `long` they are sent in holds as a positive number.
+const LAST_SECOND_BELOW_I64_MAX: u32 = (1 << 31) - 1;
+
+#[test]
+fn identifiers_past_i64_max_still_rise() {
+    let mut mtp = Encrypted::build().finish([0; 256]);
+    mtp.clock = ServerClock::at_server_time(LAST_SECOND_BELOW_I64_MAX);
+    let before = request(&mut mtp);
+    assert!(before > 0);
+
+    // A second later the identifiers' top bit is set: the next one is the server's time all the
+    // same, above the last as an unsigned number, rather than held just past it as if it were
+    // below.
+    mtp.clock.anchor += Duration::from_secs(1);
+    let after = request(&mut mtp);
+    assert_eq!(
+        after.cast_unsigned() >> 32,
+        u64::from(LAST_SECOND_BELOW_I64_MAX) + 1
+    );
+    assert!(MsgId(after) > MsgId(before));
+}
+
+#[test]
+fn notice_about_an_identifier_issued_before_one_past_i64_max_corrects_the_clock() {
+    // A clock 1000 s fast, at the last second below i64::MAX and then the first past it: two
+    // requests in flight before the server took anything.
+    let mut mtp = Encrypted::build().finish([0; 256]);
+    let session = mtp.session_id;
+    mtp.clock = ServerClock::at_server_time(LAST_SECOND_BELOW_I64_MAX);
+    let first = request(&mut mtp);
+    mtp.clock.anchor += Duration::from_secs(1);
+    let second = request(&mut mtp);
+
+    // The notice about the first names an identifier issued since the last correction, below the
+    // second as unsigned numbers: it corrects the clock, in the same session.
+    let server_time = i64::from(LAST_SECOND_BELOW_I64_MAX) - 1000;
+    let results = receive_at(&mut mtp, server_time, &[too_high(first)]);
+    assert!(matches!(
+        results.as_slice(),
+        [Deserialization::BadMessage(BadMessage { code: 17, msg_id })] if *msg_id == MsgId(first)
+    ));
+    let next = request(&mut mtp);
+    assert!((seconds(next) - server_time).abs() <= 1);
+    assert!(MsgId(next) < MsgId(first) && MsgId(first) < MsgId(second));
+    assert_eq!(mtp.session_id, session);
 }
