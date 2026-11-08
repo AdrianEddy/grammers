@@ -28,7 +28,7 @@ fn gcd(mut a: u128, mut b: u128) -> u128 {
 
 /// How many steps of the pseudo-random sequence one attempt may take before it gives up.
 ///
-/// `pq` is "the product of two different odd prime numbers [and] normally less than or equal to
+/// `pq` is "the product of two different odd prime numbers \[and\] normally less than or equal to
 /// 2^63-1" (<https://core.telegram.org/mtproto/auth_key>), so its smaller factor `p` is below
 /// 2^32. Pollard's rho finds `p` after about the square root of `p` steps, at most some 2^16
 /// here, and Brent's variant takes a small multiple of that, so the bound leaves a wide margin.

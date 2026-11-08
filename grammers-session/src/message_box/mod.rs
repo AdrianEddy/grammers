@@ -20,7 +20,7 @@
 //! or not.
 //! If not getting difference,
 //! a possible gap may be found for the updates
-//! (entry is in [`MessageBoxes::possible_gaps`]).
+//! (the entry's [`LiveEntry::possible_gap`] is set).
 //! Otherwise, the entry is on its happy path.
 //!
 //! Gaps are cleared when they are either

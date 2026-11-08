@@ -149,13 +149,13 @@ const SELF_USER_ID: PeerId = PeerId(1 << 40);
 /// and channels have a proper constructor for empty already.
 const EMPTY_CHAT_ID: i64 = -1000000000000;
 
-/// https://core.telegram.org/api/bots/ids#user-ids
+/// <https://core.telegram.org/api/bots/ids#user-ids>
 const USER_ID_RANGE: RangeInclusive<i64> = 1..=0xffffffffff;
-/// https://core.telegram.org/api/bots/ids#chat-ids
+/// <https://core.telegram.org/api/bots/ids#chat-ids>
 const CHAT_ID_RANGE: RangeInclusive<i64> = 1..=999999999999;
-/// https://core.telegram.org/api/bots/ids#supergroup-channel-ids
+/// <https://core.telegram.org/api/bots/ids#supergroup-channel-ids>
 const SUPERGROUP_AND_CHANNEL_ID_RANGE: RangeInclusive<i64> = 1..=997852516352;
-/// https://core.telegram.org/api/bots/ids#monoforum-ids
+/// <https://core.telegram.org/api/bots/ids#monoforum-ids>
 const MONOFORUM_ID_RANGE: RangeInclusive<i64> = 1002147483649..=3000000000000;
 
 impl PeerId {

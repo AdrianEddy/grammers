@@ -56,6 +56,14 @@ jobs:
       - run: cargo "+$MSRV" clippy -p grammers-tl-gen -p grammers-tl-types --all-features --all-targets -- -D warnings
       - run: cargo test -p grammers-tl-gen
       - run: cargo test -p grammers-tl-types --features impl-serde,tl-mtproto --test serde
+      # Rustdoc at the MSRV, as clippy, private items included, as MultiChat documents its own crates: a broken
+      # intra-doc link or a bare URL fails the job. The crates as MultiChat builds them, then with every feature.
+      - run: cargo "+$MSRV" doc $CRATES --no-deps --document-private-items
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - run: cargo "+$MSRV" doc -p grammers-mtsender -p grammers-tl-gen -p grammers-tl-types --all-features --no-deps --document-private-items
+        env:
+          RUSTDOCFLAGS: -D warnings
 
   msrv:
     runs-on: ubuntu-latest
