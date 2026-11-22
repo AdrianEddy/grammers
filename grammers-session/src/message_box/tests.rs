@@ -3079,3 +3079,5 @@ fn new_session_is_a_gap() {
     assert_eq!(message_boxes.take_delta(), StateDelta::default());
     assert_eq!(message_boxes.session_state(), loaded_state());
 }
+
+mod account_difference;

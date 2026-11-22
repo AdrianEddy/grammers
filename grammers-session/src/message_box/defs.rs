@@ -60,14 +60,19 @@ pub(super) const POSSIBLE_GAP_TIMEOUT: Duration = Duration::from_millis(500);
 /// decide ([`MessageBoxes::begin_channel_difference`]).
 pub(super) const NO_UPDATES_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
-/// How long a channel waits to get its difference again after it failed for a temporary reason
-/// ([`super::PrematureEndReason::TemporaryServerIssues`]). The wait doubles with each failure in a
-/// row, up to [`CHANNEL_RETRY_MAX`], and starts over once the server answers. These are
-/// tdesktop's (`failDifferenceStartTimerFor`); TDLib's are close (1 s doubling to about 60 s,
-/// with jitter, `retry_get_channel_difference_later`). There is no jitter here: the message boxes
-/// stay deterministic, and one client's channels don't fail in step with other clients'.
-pub(super) const CHANNEL_RETRY_MIN: Duration = Duration::from_secs(1);
-pub(super) const CHANNEL_RETRY_MAX: Duration = Duration::from_secs(64);
+/// How long a box waits to get its difference again after it ended for a temporary reason: a
+/// channel's ([`super::PrematureEndReason::TemporaryServerIssues`]) or the account's
+/// ([`MessageBoxes::end_account_difference`]). The wait doubles with each failure in a row, up to
+/// [`RETRY_MAX`], and starts over once the server answers. These are tdesktop's
+/// (`failDifferenceStartTimerFor`, the account's and each channel's), with no jitter, so the
+/// message boxes stay deterministic and reproducible. A fixed schedule keeps clients' failures as
+/// correlated as they began rather than spreading them: a caller's jittered reconnect spreads
+/// those of the network path, but not failures the server answers many clients with at once,
+/// which then stay in step. TDLib jitters: the account waits 1 s doubling to 32 s, then a random
+/// 60 to 80 s at its cap (`schedule_get_difference`); a channel waits each step ±20 %, the step
+/// at its cap itself a random 60 to 80 s (`retry_get_channel_difference_later`).
+pub(super) const RETRY_MIN: Duration = Duration::from_secs(1);
+pub(super) const RETRY_MAX: Duration = Duration::from_secs(64);
 
 /// A sortable [`MessageBox`] entry key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -91,11 +96,12 @@ pub(super) struct LiveEntry {
 
     /// When a channel whose difference failed for a temporary reason gets it again. It is cleared
     /// once the channel's difference begins, by this deadline or any other way, so it fires at
-    /// most once per failure. Never set for the account's boxes.
+    /// most once per failure. Never set for the account's boxes, which share
+    /// [`MessageBoxes::account_retry_at`].
     pub(super) retry_at: Option<Now>,
 
-    /// The channel's last wait before getting its difference again ([`CHANNEL_RETRY_MIN`]):
-    /// zero until its difference fails, and again once the server answers.
+    /// The channel's last wait before getting its difference again ([`RETRY_MIN`]): zero until
+    /// its difference fails, and again once the server answers.
     pub(super) retry_delay: Duration,
 
     /// Updates for the channel that arrived while it got its difference, held until the difference
@@ -127,14 +133,36 @@ pub struct MessageBoxes {
     /// while the account has no state.
     pub(super) account_deadline: Now,
 
+    /// When the account gets its difference again after one ended without an answer to apply
+    /// ([`MessageBoxes::end_account_difference`]); `None` while no such retry is armed. It falls
+    /// due also while channels get their differences. While it is armed, only the caller begins
+    /// the account's difference sooner ([`MessageBoxes::begin_account_difference`], for a new
+    /// connection): a `seq` gap, `updatesTooLong`, a gap signal and the idle deadline wait for it,
+    /// and so does a possible gap of the account's, whose updates are dropped once its half second
+    /// is over, for the retry's difference to return. The account's updates that follow on from
+    /// its state are still applied meanwhile, and a container's `seq` is held as while the
+    /// difference runs ([`MessageBoxes::postponed_seq`]), so a `seq` gap drops none of them.
+    /// Without the wait, every update of a busy account would be a gap after an unanswered end, and
+    /// a failure that repeats would cost one difference every half a second instead of one per
+    /// backoff step. Cleared once the account's difference begins, so it fires at most once per
+    /// failure, and once its `pts` is restored ([`MessageBoxes::restore_pts`]).
+    pub(super) account_retry_at: Option<Now>,
+
+    /// The account's last wait before getting its difference again ([`RETRY_MIN`]): zero until its
+    /// difference ends unanswered, and again once the server answers one or restores its `pts`.
+    pub(super) account_retry_delay: Duration,
+
     /// Updates for the account's boxes that arrived while the account got its difference, held
     /// until the difference ends ([`MessageBoxes::process_updates`]). Both boxes always get it
     /// together, so they share this, also while the secondary box has no entry yet.
     pub(super) account_postponed: Vec<(PtsInfo, tl::enums::Update)>,
 
     /// The `seq_start` and `seq` of each sequenced container that arrived while the account got
-    /// its difference. The difference replaces the local `seq`, so they are checked against the
-    /// difference's once it ends.
+    /// its difference, or waited for its retry ([`MessageBoxes::account_retry_at`]). The
+    /// difference replaces the local `seq`, so they are checked against the `seq` of the next
+    /// answered one once it ends (a restored `pts` keeps the local `seq`,
+    /// [`MessageBoxes::restore_pts`]); an unanswered end drops them, the retry's difference
+    /// setting it.
     pub(super) postponed_seq: Vec<(i32, i32)>,
 
     /// Optimization field: no deadline is earlier than this one. It can be earlier than the

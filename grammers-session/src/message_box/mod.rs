@@ -32,6 +32,11 @@
 //! [`MessageBoxes::check_deadlines`] will always return the current time,
 //! since "now" is the time to get the difference.
 //!
+//! A difference the server doesn't answer with one ends with
+//! [`MessageBoxes::end_channel_difference`] or [`MessageBoxes::end_account_difference`], and is
+//! due again after a backoff. The account's, when the server refuses its state, ends with the
+//! server's `pts` instead ([`MessageBoxes::restore_pts`]).
+//!
 //! The message boxes never read a clock: the caller passes the current time ([`Now`])
 //! to every method that arms or checks a deadline.
 //!
@@ -64,11 +69,11 @@ use std::cmp::{Ordering, Reverse};
 use std::mem;
 use std::time::Duration;
 
-use defs::{CHANNEL_RETRY_MAX, CHANNEL_RETRY_MIN, DirtySet, Key};
 pub use defs::{
     CommonState, DiffPending, Gap, MessageBox, MessageBoxes, Now, State, StateDelta,
     UpdateAndPeers, UpdatesLike,
 };
+use defs::{DirtySet, Key, RETRY_MAX, RETRY_MIN};
 use defs::{
     LiveEntry, NO_DATE, NO_PTS, NO_SEQ, POSSIBLE_GAP_TIMEOUT, PossibleGap, PtsInfo, WrongPts,
 };
@@ -159,6 +164,8 @@ impl MessageBoxes {
             seq: NO_SEQ,
             getting_diff_for: Vec::new(),
             account_deadline: Duration::MAX,
+            account_retry_at: None,
+            account_retry_delay: Duration::ZERO,
             account_postponed: Vec::new(),
             postponed_seq: Vec::new(),
             // No deadline is armed: the first `check_deadlines` computes the next one.
@@ -208,6 +215,8 @@ impl MessageBoxes {
             seq: state.seq,
             getting_diff_for: Vec::new(),
             account_deadline,
+            account_retry_at: None,
+            account_retry_delay: Duration::ZERO,
             account_postponed: Vec::new(),
             postponed_seq: Vec::new(),
             next_deadline: Duration::ZERO,
@@ -398,9 +407,21 @@ impl MessageBoxes {
     /// moved later is only noticed then.
     ///
     /// If a deadline expired, the corresponding entries will be marked as needing to get its difference.
-    /// While there are entries pending of getting their difference, this method returns `now`.
+    /// While there are entries pending of getting their difference, this method returns `now`, and
+    /// checks only the account's armed retry ([`MessageBoxes::end_account_difference`]).
+    ///
+    /// While that retry is armed, a possible gap of the account's whose half second is over is
+    /// dropped instead, for the retry's difference to return its updates.
     pub fn check_deadlines(&mut self, now: Now) -> Now {
         if !self.getting_diff_for.is_empty() {
+            // Channels getting their differences don't hold the account's retry back: once due, it
+            // begins, as tdesktop's and TDLib's retry timers are the account's own.
+            if self
+                .account_retry_at
+                .is_some_and(|retry_at| now >= retry_at)
+            {
+                self.begin_account_difference();
+            }
             return now;
         }
         if now < self.next_deadline {
@@ -410,18 +431,41 @@ impl MessageBoxes {
         // To avoid hogging up all CPU by sleeping for no duration,
         // if no deadline is armed, the next one is a full timeout away.
         let mut next_deadline = next_updates_deadline(now);
-        let mut account_due = now >= self.account_deadline;
-        if account_due {
+        // An armed retry is the account's one deadline to begin its difference
+        // (`account_retry_at`).
+        let retrying = self.account_retry_at.is_some();
+        let mut account_due = match self.account_retry_at {
+            Some(retry_at) => now >= retry_at,
+            None => now >= self.account_deadline,
+        };
+        if account_due && !retrying {
             debug!("no updates for the account in a while; getting its difference");
             // Restarted here, not only when the difference ends: if it can't begin (no common
             // state), the deadline mustn't stay in the past.
             self.account_deadline = next_deadline;
         }
-        next_deadline = next_deadline.min(self.account_deadline);
+        next_deadline = next_deadline.min(self.account_retry_at.unwrap_or(self.account_deadline));
         for entry in &mut self.entries {
             let Some(deadline) = entry.deadline() else {
                 continue;
             };
+            // A possible gap of the account's doesn't begin its difference while the retry is
+            // armed. It holds its updates for its half second, in case the socket fills it, and is
+            // then dropped, for the retry's difference to return them, as beginning the difference
+            // would drop them; held until the retry, it would only grow, sorted on every arrival.
+            // An account box's deadline is its possible gap's alone: the retry is the boxes'.
+            if retrying && !matches!(entry.key, Key::Channel(_)) {
+                if now < deadline {
+                    next_deadline = next_deadline.min(deadline);
+                } else {
+                    debug!(
+                        key = ?entry.key,
+                        "dropping a possible gap's updates; the account's retry returns them"
+                    );
+                    entry.possible_gap = None;
+                }
+                continue;
+            }
             if now < deadline {
                 next_deadline = next_deadline.min(deadline);
                 continue;
@@ -515,11 +559,16 @@ impl MessageBoxes {
 
     /// Try to begin getting difference for the given entry.
     /// Fails if the entry does not have a previously-known state that can be used to get its difference.
+    /// The account's waits for its armed retry, if one is ([`MessageBoxes::account_retry_at`]).
     ///
     /// Clears any previous gaps.
     fn try_begin_get_diff(&mut self, key: Key) {
         if let Key::Common | Key::Secondary = key {
-            self.begin_account_difference();
+            if self.account_retry_at.is_some() {
+                debug!("the account's difference waits for its retry");
+            } else {
+                self.begin_account_difference();
+            }
         } else if !self.getting_diff_for.contains(&key) {
             if self.update_entry(key, LiveEntry::begin_difference) {
                 self.getting_diff_for.push(key);
@@ -532,31 +581,45 @@ impl MessageBoxes {
         }
     }
 
-    /// Begin getting the account's difference.
-    /// Fails if the common box has no state to get it from.
+    /// Begin getting the account's difference now, also while a retry is armed for it after an
+    /// unanswered end ([`MessageBoxes::end_account_difference`]), which this cancels: for a reason
+    /// of the caller's that the retry doesn't cover, such as a new connection. That is a new
+    /// session, whose difference TDLib asks for at once whatever its retry timer, as the updates
+    /// the server pushed to the earlier one may be lost. The caller paces such reasons, a
+    /// reconnect's backoff for instance. The backoff keeps its step: if this difference ends
+    /// unanswered too, the retry waits the next one.
     ///
     /// `updates.getDifference` returns the updates of the common and the secondary box at once,
     /// so both boxes always get difference together. Otherwise the updates of the box not
     /// getting difference would be checked against the state the difference had just moved to
     /// its end, and dropped as already handled.
     ///
-    /// Clears any previous gaps of both.
-    fn begin_account_difference(&mut self) {
+    /// Returns `true` if the account's difference is pending, also if it already was. Returns
+    /// `false`, and does nothing, if the common box has no state to get it from (see
+    /// [`MessageBoxes::set_state`]). Clears any previous gaps of both boxes.
+    pub fn begin_account_difference(&mut self) -> bool {
         if self.entry(Key::Common).is_none() {
             info!("tried to begin getting difference but do not have the common state");
-            return;
+            return false;
         }
+        self.account_retry_at = None;
         for key in [Key::Common, Key::Secondary] {
             if !self.getting_diff_for.contains(&key) {
                 self.update_entry(key, LiveEntry::begin_difference);
                 self.getting_diff_for.push(key);
             }
         }
+        true
     }
 
-    /// Finish getting the account's difference, restart its idle deadline, and add to `result`
-    /// the updates postponed for the account meanwhile that follow on from the state it left.
-    fn end_account_difference(&mut self, now: Now, result: &mut Vec<(tl::enums::Update, State)>) {
+    /// Finish getting the account's difference, which the server answered, restart its idle
+    /// deadline, and add to `result` the updates postponed for the account meanwhile that follow
+    /// on from the state it left.
+    fn finish_account_difference(
+        &mut self,
+        now: Now,
+        result: &mut Vec<(tl::enums::Update, State)>,
+    ) {
         for key in [Key::Common, Key::Secondary] {
             self.try_end_get_diff(key);
         }
@@ -621,13 +684,16 @@ impl MessageBoxes {
     /// > gaps in the same sequence.
     ///
     /// The call that ends that difference ([`MessageBoxes::apply_difference`],
-    /// [`MessageBoxes::apply_channel_difference`], [`MessageBoxes::end_channel_difference`])
-    /// returns them after the difference's own updates, checked against the state it left the way
-    /// updates arriving then are: dropped if the difference returned them, held if updates before
-    /// them are still missing (after a temporary failure, dropped too, for the retry to return).
-    /// Their users and chats are returned now, with this call's. In the same way, while the
-    /// account gets its difference, a container's `seq` is checked once the difference ends,
-    /// against the `seq` it ended at.
+    /// [`MessageBoxes::apply_channel_difference`], [`MessageBoxes::end_channel_difference`],
+    /// [`MessageBoxes::end_account_difference`]) returns them after the difference's own updates,
+    /// checked against the state it left the way updates arriving then are: dropped if the
+    /// difference returned them, held if updates before them are still missing (after a temporary
+    /// failure, dropped too, for the retry to return). Their users and chats are returned now, with
+    /// this call's. In the same way, while the account gets its difference, or waits for the retry
+    /// armed after an unanswered end ([`MessageBoxes::end_account_difference`]), a container's
+    /// `seq` is held, and checked once the next answered difference ends, against the `seq` it
+    /// ended at (an unanswered end drops it: the retry's difference sets it). So during the retry
+    /// a `seq` gap drops no update: the container's are checked by their boxes, as any other's.
     ///
     /// [updates' documentation]: https://core.telegram.org/api/updates
     pub fn process_updates(
@@ -660,6 +726,9 @@ impl MessageBoxes {
 
         // Both account boxes always get their difference together (`begin_account_difference`).
         let account_in_diff = self.getting_diff_for.contains(&Key::Common);
+        // While the account's difference runs, or waits for its armed retry, the difference sets
+        // `date` and `seq`.
+        let seq_held = account_in_diff || self.account_retry_at.is_some();
 
         // > For all the other [not `updates` or `updatesCombined`] `Updates` type constructors
         // > there is no need to check `seq` or change a local state.
@@ -674,8 +743,8 @@ impl MessageBoxes {
                     return Ok((Vec::new(), users, chats));
                 }
                 // The difference replaces the local `seq`: a newer container is checked against
-                // the difference's once it ends.
-                _ if account_in_diff => self.postponed_seq.push((seq_start, seq)),
+                // the next answered difference's once it ends, and its updates by their boxes now.
+                _ if seq_held => self.postponed_seq.push((seq_start, seq)),
                 // Apply
                 Ordering::Equal => {}
                 Ordering::Less => {
@@ -694,8 +763,8 @@ impl MessageBoxes {
         let (result, applied) =
             self.apply_updates(updates, (new_date, new_seq), now, Source::Socket);
 
-        // While the account gets its difference, the difference sets them.
-        if applied && !account_in_diff {
+        // While the account gets its difference, or waits for its retry, the difference sets them.
+        if applied && !seq_held {
             // > If the updates were applied, local *Updates* state must be updated
             // > with `seq` (unless it's 0) and `date` from the constructor.
             self.set_date_seq(new_date, new_seq);
@@ -930,9 +999,10 @@ impl MessageBoxes {
     /// difference left, in `pts` order and the way updates arriving now are checked, and add those
     /// that follow on to `result`. One the difference returned is dropped. One that doesn't follow
     /// on yet waits in its box's possible gap, unless `drop_after_gap`: the difference ended
-    /// without an answer to apply, so it and every later one are dropped, for the box's next
-    /// difference to return (a retry after a temporary failure, or its next gap), rather than held
-    /// in a gap that would get the difference again at once.
+    /// without an answer to apply, so it and every later one of its box are dropped, for the box's
+    /// next difference to return (a retry after a temporary failure, or its next gap), rather than
+    /// held in a gap that would get the difference again at once. The account's two boxes are
+    /// postponed together, and each drops its own.
     fn replay_postponed(
         &mut self,
         mut postponed: Vec<(PtsInfo, tl::enums::Update)>,
@@ -942,6 +1012,9 @@ impl MessageBoxes {
     ) {
         postponed.sort_by_key(|(info, _)| info.start());
         for (info, update) in postponed {
+            // This check alone drops every later update of a box once one doesn't follow on: a
+            // box's `pts` moves only through its own updates, which come in `start` order, so
+            // once one is dropped, the box's `pts` stays below every later one's `start`.
             if drop_after_gap
                 && self
                     .entry(info.key)
@@ -950,9 +1023,9 @@ impl MessageBoxes {
                 debug!(
                     key = ?info.key,
                     remote = ?info.pts,
-                    "dropping postponed updates after a gap; the next difference returns them",
+                    "dropping a postponed update after a gap; the next difference returns it",
                 );
-                break;
+                continue;
             }
             self.apply_in_order(update, info, (self.date, self.seq), now, result);
         }
@@ -1027,6 +1100,8 @@ impl MessageBoxes {
             warn!("dropping a difference for the account, which isn't getting one");
             return (Vec::new(), Vec::new(), Vec::new());
         }
+        // The server answered, so the next temporary failure waits the shortest time again.
+        self.account_retry_delay = Duration::ZERO;
         let finish: bool;
         let mut result = match difference {
             tl::enums::updates::Difference::Empty(diff) => {
@@ -1081,7 +1156,7 @@ impl MessageBoxes {
         };
 
         if finish {
-            self.end_account_difference(now, &mut result.0);
+            self.finish_account_difference(now, &mut result.0);
         }
 
         result
@@ -1150,6 +1225,96 @@ impl MessageBoxes {
         );
 
         (result_updates, users, chats)
+    }
+
+    /// End the account's difference when the server didn't answer with one: it failed for a
+    /// temporary reason, such as an internal server error, or its answer can't be read, the same
+    /// on every try. TDLib schedules the account's difference again after any failure of it
+    /// (`on_failed_get_difference`), as tdesktop does (`differenceFail`).
+    ///
+    /// The account's state is kept, and its difference is due again after a backoff: 1 second
+    /// after the first unanswered end in a row, doubling with each one up to 64 seconds, until the
+    /// server answers one ([`MessageBoxes::check_deadlines`]), also while channels get their
+    /// differences. Meanwhile nothing but the caller's [`MessageBoxes::begin_account_difference`]
+    /// begins it, for a reason the retry doesn't cover, such as a new connection: the account's
+    /// gaps wait for the retry, a possible gap's updates dropped once its half second is over, for
+    /// the retry's difference to return. The account's updates that follow on are applied, a
+    /// container's `seq` held for the retry's difference as while a difference runs (see
+    /// [`MessageBoxes::process_updates`]), and the channels' deadlines are checked again: a
+    /// channel's difference doesn't wait for the account's.
+    ///
+    /// Returns the updates postponed for the account while its difference ran that follow on from
+    /// its state (see [`MessageBoxes::process_updates`]); their users and chats were returned when
+    /// they arrived. Each of the account's boxes drops the rest from its first one that doesn't
+    /// follow on, as after a channel's temporary failure, and the retry's difference returns them.
+    /// The `seq` of the containers that arrived meanwhile is dropped too: the retry's difference
+    /// sets it.
+    ///
+    /// A server that refuses the account's state itself (`PERSISTENT_TIMESTAMP_INVALID`) is
+    /// answered with its `pts` instead ([`MessageBoxes::restore_pts`]).
+    ///
+    /// Ending the account's difference while it isn't getting one, such as for a second answer to
+    /// a request repeated while the first was in flight, changes nothing and returns nothing.
+    #[must_use = "the returned updates have moved the account's state"]
+    pub fn end_account_difference(&mut self, now: Now) -> Vec<(tl::enums::Update, State)> {
+        trace!("ending the account's difference");
+        // Both account boxes always get their difference together (`begin_account_difference`).
+        if !self.getting_diff_for.contains(&Key::Common) {
+            warn!("ignoring the end of the account's difference, which isn't getting one");
+            return Vec::new();
+        }
+        for key in [Key::Common, Key::Secondary] {
+            self.try_end_get_diff(key);
+        }
+        self.arm_account_retry(now);
+        self.postponed_seq.clear();
+        let mut result = Vec::new();
+        let postponed = mem::take(&mut self.account_postponed);
+        self.replay_postponed(postponed, true, now, &mut result);
+        result
+    }
+
+    /// Restore the account's `pts` from `updates.getState` after the server refused the state of
+    /// its difference with `PERSISTENT_TIMESTAMP_INVALID`, as TDLib does (`on_get_updates_state`'s
+    /// "Restore PTS"): only the common box moves, to `pts`; the secondary box's `qts`, the `date`
+    /// and the `seq` stay. So the account's next difference returns the secondary box's updates
+    /// after the kept `qts`, which the server's would skip for good (a difference's `qts` confirms
+    /// receipt to the server), and a container past the kept `seq` begins it, as after any lost
+    /// push.
+    ///
+    /// The account's difference ends as an answered one does, the way `updates.differenceTooLong`,
+    /// which moves only the common box too, ends it: a retry armed for it
+    /// ([`MessageBoxes::end_account_difference`]) is cancelled and its backoff starts over, the
+    /// idle deadline restarts, and the updates postponed for the account and the `seq` of the
+    /// containers held meanwhile are checked against the state it leaves (see
+    /// [`MessageBoxes::process_updates`]). The common box's up to `pts` are skipped with the jump,
+    /// which the caller tells the user of, as for `updates.differenceTooLong`; the updates that
+    /// follow on, the secondary box's from the kept `qts` among them, are returned (their users
+    /// and chats were returned when they arrived); a container still missing begins the
+    /// account's difference again.
+    ///
+    /// Boxes without the account's state get it from [`MessageBoxes::set_state`], after login.
+    #[must_use = "the returned updates have moved the account's state"]
+    pub fn restore_pts(&mut self, pts: i32, now: Now) -> Vec<(tl::enums::Update, State)> {
+        trace!(pts, "restoring the account's pts");
+        // The server answered: no retry is due, and the next temporary failure waits the shortest
+        // time again.
+        self.account_retry_at = None;
+        self.account_retry_delay = Duration::ZERO;
+        // A new entry: a possible gap the common box held while a retry waited is the jump's.
+        self.set_entry(LiveEntry::new(Key::Common, pts));
+        let mut result = Vec::new();
+        self.finish_account_difference(now, &mut result);
+        result
+    }
+
+    /// Arm the account's retry ([`MessageBoxes::account_retry_at`]) at the next backoff step from
+    /// `now`.
+    fn arm_account_retry(&mut self, now: Now) {
+        self.account_retry_delay = (self.account_retry_delay * 2).clamp(RETRY_MIN, RETRY_MAX);
+        let retry_at = now + self.account_retry_delay;
+        self.account_retry_at = Some(retry_at);
+        self.arm(retry_at);
     }
 }
 
@@ -1314,8 +1479,7 @@ impl MessageBoxes {
             PrematureEndReason::TemporaryServerIssues => {
                 let mut retry_at = None;
                 self.update_entry(key, |entry| {
-                    entry.retry_delay =
-                        (entry.retry_delay * 2).clamp(CHANNEL_RETRY_MIN, CHANNEL_RETRY_MAX);
+                    entry.retry_delay = (entry.retry_delay * 2).clamp(RETRY_MIN, RETRY_MAX);
                     entry.retry_at = Some(now + entry.retry_delay);
                     retry_at = entry.retry_at;
                 });
