@@ -355,6 +355,14 @@ impl MessageBoxes {
         }
     }
 
+    /// The `pts` of channel `channel_id`'s box, if the message boxes hold its state: the one
+    /// [`MessageBoxes::session_state`] would list for it, which the deltas
+    /// ([`MessageBoxes::take_delta`]) report as it moves. `None` for a channel they never had, and
+    /// for one whose state they dropped ([`PrematureEndReason::Banned`]).
+    pub fn channel_pts(&self, channel_id: i64) -> Option<i32> {
+        self.entry(Key::Channel(channel_id)).map(|entry| entry.pts)
+    }
+
     /// Return true if the message box is empty and has no state yet.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
