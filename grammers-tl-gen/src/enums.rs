@@ -241,6 +241,62 @@ fn write_serializable<W: Write>(
     Ok(())
 }
 
+/// Defines `constructor_id`, the identifier of the value's constructor, which its serialization
+/// starts with: a jump table, not a serialization of the whole value, and a `const fn`, since a
+/// match on constants needs nothing more.
+///
+/// ```ignore
+/// impl Name {
+///     pub const fn constructor_id(&self) -> u32 {
+///         use crate::Identifiable;
+///         match self {
+///             Self::A => crate::types::A::CONSTRUCTOR_ID, // no parameters
+///             Self::B(_) => crate::types::B::CONSTRUCTOR_ID,
+///         }
+///     }
+/// }
+/// ```
+///
+/// No TL parameter is named `constructor_id`, so no common field accessor
+/// ([`write_common_field_impl`]) has this name.
+fn write_constructor_id_impl<W: Write>(
+    file: &mut W,
+    indent: &str,
+    ty: &Type,
+    metadata: &Metadata,
+) -> io::Result<()> {
+    writeln!(
+        file,
+        "{}impl {} {{",
+        indent,
+        rustifier::types::type_name(ty)
+    )?;
+    writeln!(
+        file,
+        "{indent}    /// The identifier of this value's constructor, which its serialization starts with."
+    )?;
+    writeln!(
+        file,
+        "{indent}    pub const fn constructor_id(&self) -> u32 {{"
+    )?;
+    writeln!(file, "{indent}        use crate::Identifiable;")?;
+    writeln!(file, "{indent}        match self {{")?;
+    for d in metadata.defs_with_type(ty) {
+        writeln!(
+            file,
+            "{}            Self::{}{} => {}::CONSTRUCTOR_ID,",
+            indent,
+            rustifier::definitions::variant_name(d),
+            if d.params.is_empty() { "" } else { "(_)" },
+            rustifier::definitions::qual_name(d)
+        )?;
+    }
+    writeln!(file, "{indent}        }}")?;
+    writeln!(file, "{indent}    }}")?;
+    writeln!(file, "{indent}}}")?;
+    Ok(())
+}
+
 /// Defines the `impl Deserializable` corresponding to the type definitions:
 ///
 /// ```ignore
@@ -386,6 +442,7 @@ fn write_definition<W: Write>(
 ) -> io::Result<()> {
     write_enum(file, indent, ty, metadata, config)?;
     write_common_field_impl(file, indent, ty, metadata, config)?;
+    write_constructor_id_impl(file, indent, ty, metadata)?;
     write_serializable(file, indent, ty, metadata)?;
     write_deserializable(file, indent, ty, metadata)?;
     if config.impl_from_type {

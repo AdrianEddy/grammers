@@ -94,6 +94,39 @@ fn recursive_types_direct_boxed() -> io::Result<()> {
 }
 
 #[test]
+fn boxed_types_have_a_constructor_id() -> io::Result<()> {
+    let definitions = get_definitions(
+        "
+        textEmpty#dc3d824f = RichText;
+        textPlain#744694e0 text:string = RichText;
+        textBold#6724abc4 text:RichText = RichText;
+    ",
+    );
+    let (_, _, _, enums) = gen_rust_code(&definitions)?;
+    eprintln!("{enums}");
+    let start = enums
+        .find("pub const fn constructor_id(&self) -> u32 {")
+        .expect("a constant constructor_id accessor");
+    let accessor = &enums[start..];
+    let accessor = &accessor[..accessor
+        .find(
+            "
+    }
+",
+        )
+        .unwrap()];
+    // A parameterless variant, an ordinary one and a recursive boxed one.
+    for arm in [
+        "Self::TextEmpty => crate::types::TextEmpty::CONSTRUCTOR_ID,",
+        "Self::TextPlain(_) => crate::types::TextPlain::CONSTRUCTOR_ID,",
+        "Self::TextBold(_) => crate::types::TextBold::CONSTRUCTOR_ID,",
+    ] {
+        assert!(accessor.contains(arm), "{arm} in {accessor}");
+    }
+    Ok(())
+}
+
+#[test]
 fn recursive_types_indirect_boxed() -> io::Result<()> {
     let definitions = get_definitions(
         "
