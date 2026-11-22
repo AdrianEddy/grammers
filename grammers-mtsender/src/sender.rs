@@ -54,6 +54,20 @@ const PING_DELAY: Duration = Duration::from_secs(60);
 /// are getting through consistently enough.
 const NO_PING_DISCONNECT: i32 = 75;
 
+/// How long after a keepalive ping's packet is written the sender waits to read anything from
+/// the server before it takes the connection for dead and fails it with an I/O error of kind
+/// [`io::ErrorKind::TimedOut`]. The server answers every ping, so a live connection gives bytes
+/// within this of each; one whose peer is gone without closing it (half-open) would otherwise be
+/// found only when a write fails, which the kernel may not report for many minutes. Any bytes
+/// count as the answer, as TDLib counts any packet as a pong ("real pong can be delayed by many
+/// big packets"). TDLib takes a session that isn't online for dead 135 s after its last read or
+/// packet (`read_disconnect_delay`, `ping_disconnect_delay`, without their jitter of up to 5 s),
+/// pinging every 60 s: up to 75 s after a ping, as here. The deadline runs from the write of the
+/// ping's packet, so time before it (the sender not driven, or the ping queued behind another
+/// write) never counts against the server, and bytes read in the poll that wrote it, which came
+/// before it, don't answer it.
+const PONG_TIMEOUT: Duration = Duration::from_secs(75);
+
 /// Generate a "random" ping ID.
 pub(crate) fn generate_random_id() -> i64 {
     static LAST_ID: AtomicI64 = AtomicI64::new(0);
@@ -86,20 +100,30 @@ pub struct Sender<T: Transport, M: mtp::Mtp> {
     requests: Vec<Request>,
     /// Fires when the next keepalive ping is due.
     ping: Pin<Box<Sleep>>,
+    /// Fires [`PONG_TIMEOUT`] after the write of the first keepalive ping's packet the server
+    /// hasn't answered with bytes since, while `pong_due`.
+    pong_deadline: Pin<Box<Sleep>>,
+    /// A keepalive ping's packet was written since the stream last gave bytes, so
+    /// `pong_deadline` is armed.
+    pong_due: bool,
 }
 
 /// What was ready in one [`Sender::step`]: the bytes written and read, if the stream took or had
-/// any, and whether the ping timer fired. `written` also carries a failed flush.
+/// any, whether the ping timer fired, and whether the pong deadline passed. `written` also carries
+/// a failed flush.
 struct Ready {
     written: Option<io::Result<usize>>,
     read: Option<io::Result<usize>>,
     ping: bool,
+    silent: bool,
 }
 
 struct Request {
     body: Vec<u8>,
     state: RequestState,
     result: oneshot::Sender<Result<Vec<u8>, InvocationError>>,
+    /// The sender's own keepalive ping, whose packet's write arms the pong deadline.
+    keepalive: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -142,6 +166,8 @@ impl<T: Transport, M: mtp::Mtp> Sender<T, M> {
             state: connection::State::new(transport, mtp),
             requests: vec![],
             ping: Box::pin(sleep(PING_DELAY)),
+            pong_deadline: Box::pin(sleep(PONG_TIMEOUT)),
+            pong_due: false,
         })
     }
 
@@ -193,6 +219,7 @@ impl<T: Transport, M: mtp::Mtp> Sender<T, M> {
             body,
             state: RequestState::NotSerialized,
             result: tx,
+            keepalive: false,
         });
     }
 
@@ -224,7 +251,10 @@ impl<T: Transport, M: mtp::Mtp> Sender<T, M> {
     /// Updates received during this step, if any, are returned.
     ///
     /// If an error is returned, the connection should be treated
-    /// as dead and the sender instance recreated.
+    /// as dead and the sender instance recreated. A connection the server sends nothing on for 75
+    /// seconds after a keepalive ping goes out (one is queued every 60 seconds) fails with an I/O
+    /// error of kind [`io::ErrorKind::TimedOut`]: the time runs from the write of the ping's
+    /// packet, never from before it.
     pub async fn step(&mut self) -> Result<Vec<UpdatesLike>, ReadError> {
         self.try_fill_write();
 
@@ -243,9 +273,9 @@ impl<T: Transport, M: mtp::Mtp> Sender<T, M> {
         }
     }
 
-    /// Wait until the stream takes bytes or has bytes, or the ping timer fires, and do all of
-    /// these that are ready in one poll: the stream's read and write halves are polled together,
-    /// so it needs no split and no lock.
+    /// Wait until the stream takes bytes or has bytes, the ping timer fires or the pong deadline
+    /// passes, and do all of these that are ready in one poll: the stream's read and write halves
+    /// are polled together, so it needs no split and no lock.
     ///
     /// While the stream holds bytes it took (`unflushed`), each poll also flushes it. A finished
     /// flush is no reason to return, and a failed one is reported as a failed write.
@@ -289,23 +319,33 @@ impl<T: Transport, M: mtp::Mtp> Sender<T, M> {
             };
 
             let ping = self.ping.as_mut().poll(cx).is_ready();
+            let silent = self.pong_due && self.pong_deadline.as_mut().poll(cx).is_ready();
 
-            if written.is_none() && read.is_none() && !ping {
+            if written.is_none() && read.is_none() && !ping && !silent {
                 Poll::Pending
             } else {
                 Poll::Ready(Ready {
                     written,
                     read,
                     ping,
+                    silent,
                 })
             }
         })
     }
 
-    /// Handle what [`Self::ready`] found: first the bytes written, so that a request whose
-    /// bytes left is marked sent before any answer is read, then the bytes read. A failed write
-    /// or flush is returned last: the answers that arrived with it still reach their requests.
+    /// Handle what [`Self::ready`] found. Bytes read answer the keepalive pings whose packets went
+    /// out before this poll, but not one this poll wrote: the poll writes before it reads, and the
+    /// server can't answer a ping it doesn't have yet. Then the bytes written, so that a request
+    /// whose bytes left is marked sent (and a keepalive ping's write arms the pong deadline) before
+    /// any answer is read, then the bytes read. A failed write or flush is returned last: the
+    /// answers that arrived with it still reach their requests. A pong deadline that passed with no
+    /// bytes read fails the connection ([`PONG_TIMEOUT`]), unless it failed already.
     fn on_ready(&mut self, ready: Ready) -> Result<Vec<UpdatesLike>, ReadError> {
+        let heard = matches!(ready.read, Some(Ok(n)) if n > 0);
+        if heard {
+            self.pong_due = false;
+        }
         let written = ready.written.transpose().map_err(ReadError::from);
         if let Ok(Some(n)) = written {
             self.on_net_write(n);
@@ -316,7 +356,17 @@ impl<T: Transport, M: mtp::Mtp> Sender<T, M> {
                 .and_then(|n| self.on_net_read(n)),
             None => Ok(Vec::new()),
         };
-        written.and(updates)
+        let result = written.and(updates);
+        if result.is_ok() && ready.silent && !heard {
+            return Err(ReadError::from(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "the server sent nothing for {} s after a keepalive ping",
+                    PONG_TIMEOUT.as_secs()
+                ),
+            )));
+        }
+        result
     }
 
     /// Setup the write buffer for the transport, unless a write is already pending.
@@ -368,7 +418,9 @@ impl<T: Transport, M: mtp::Mtp> Sender<T, M> {
         Ok(updates)
     }
 
-    /// Handle `n` more written bytes being ready to process by the transport.
+    /// Handle `n` more written bytes being ready to process by the transport. Once the packet is
+    /// written whole, its requests are sent, and a keepalive ping among them gives the server
+    /// [`PONG_TIMEOUT`] from now to answer, unless an earlier ping is still unanswered.
     fn on_net_write(&mut self, n: usize) {
         if self.state.handle_net_write(n) {
             for req in self.requests.iter_mut() {
@@ -377,25 +429,34 @@ impl<T: Transport, M: mtp::Mtp> Sender<T, M> {
                     RequestState::Serialized(pair) => {
                         debug!(?pair, "sent request with");
                         req.state = RequestState::Sent(pair.clone());
+                        if req.keepalive && !self.pong_due {
+                            self.pong_due = true;
+                            self.pong_deadline
+                                .as_mut()
+                                .reset(Instant::now() + PONG_TIMEOUT);
+                        }
                     }
                 }
             }
         }
     }
 
-    /// Handle a ping timeout, meaning we need to enqueue a new ping request.
+    /// Handle a ping timeout, meaning we need to enqueue a new ping request. The write of its
+    /// packet ([`Self::on_net_write`]) gives the server [`PONG_TIMEOUT`] to answer it.
     fn on_ping_timeout(&mut self) {
         let ping_id = generate_random_id();
         debug!("enqueueing keepalive ping {}", ping_id);
         let (tx, _rx) = oneshot::channel();
-        self.enqueue_body(
-            tl::functions::PingDelayDisconnect {
+        self.requests.push(Request {
+            body: tl::functions::PingDelayDisconnect {
                 ping_id,
                 disconnect_delay: NO_PING_DISCONNECT,
             }
             .to_bytes(),
-            tx,
-        );
+            state: RequestState::NotSerialized,
+            result: tx,
+            keepalive: true,
+        });
         self.ping.as_mut().reset(Instant::now() + PING_DELAY);
     }
 
@@ -760,6 +821,8 @@ pub async fn generate_auth_key<T: Transport>(
         state: sender.state.into_encrypted(auth),
         requests: sender.requests,
         ping,
+        pong_deadline: sender.pong_deadline,
+        pong_due: sender.pong_due,
     })
 }
 

@@ -13,8 +13,10 @@
 //! transport error code fails a request as a transport error. A dial gives up on an address that
 //! never answers and tries the next, and a SOCKS5 dial's error names the proxy and says its cause
 //! once. A connection that makes a new key stores it before anything goes out under it, and the
-//! store's time takes none of the connect's. The tests play the server on in-memory streams (the
-//! handshake's half too, `handshake`), and the proxy on loopback; nothing leaves the machine.
+//! store's time takes none of the connect's. A connection the server sends nothing on after a
+//! keepalive ping fails after the pong timeout, which runs from the write of the ping's packet. The
+//! tests play the server on in-memory streams (the handshake's half too, `handshake`), and the
+//! proxy on loopback; nothing leaves the machine.
 
 mod handshake;
 
@@ -30,7 +32,7 @@ use grammers_mtproto::mtp::Plain;
 use grammers_mtproto::transport::{self, Intermediate};
 use grammers_mtsender::{
     ConnKind, ConnectionParams, DialFuture, DialTarget, Dialer, InvocationError, MtStream,
-    NoRetries, Sender, SenderPool, SenderPoolHandle, TokioTcpDialer,
+    NoRetries, ReadError, Sender, SenderPool, SenderPoolHandle, TokioTcpDialer,
 };
 use grammers_session::storages::MemorySession;
 use grammers_session::types::{DcOption, PeerId, PeerInfo, UpdateState, UpdatesState};
@@ -1250,4 +1252,152 @@ async fn key_store_takes_none_of_the_setup_time() {
 
     assert!(pool.handle.quit());
     runner.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn silent_server_fails_the_connection_after_the_pong_timeout() {
+    let (dialer, mut servers) = TestDialer::new(1 << 16);
+    let mut sender = Sender::connect(Intermediate::new(), Plain::new(), &*dialer, &target())
+        .await
+        .unwrap();
+    let mut server = servers.recv().await.unwrap();
+    let start = Instant::now();
+
+    // The server takes the request and the pings and answers nothing: 75 s after the first ping,
+    // which goes after 60 s, the connection fails, and the request with it.
+    let reads = tokio::spawn(async move {
+        loop {
+            server.read_packet().await;
+        }
+    });
+    let answer = sender.invoke(&tl::functions::help::GetNearestDc {}).await;
+    match answer {
+        Err(InvocationError::Io(error)) => assert_eq!(error.kind(), io::ErrorKind::TimedOut),
+        other => panic!("a timeout, not {other:?}"),
+    }
+    assert_eq!(start.elapsed(), Duration::from_secs(135));
+    reads.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn bytes_from_the_server_answer_the_keepalive_ping() {
+    let (dialer, mut servers) = TestDialer::new(1 << 16);
+    let mut sender = Sender::connect(Intermediate::new(), Plain::new(), &*dialer, &target())
+        .await
+        .unwrap();
+    let mut server = servers.recv().await.unwrap();
+    let start = Instant::now();
+
+    // The server answers the request after 100 s, and then nothing more.
+    let answers = tokio::spawn(async move {
+        server.read_message().await;
+        tokio::time::sleep(Duration::from_secs(100)).await;
+        server
+            .write_message(
+                &tl::enums::NearestDc::Dc(tl::types::NearestDc {
+                    country: "ZZ".into(),
+                    this_dc: 2,
+                    nearest_dc: 2,
+                })
+                .to_bytes(),
+            )
+            .await;
+        loop {
+            server.read_packet().await;
+        }
+    });
+    sender
+        .invoke(&tl::functions::help::GetNearestDc {})
+        .await
+        .unwrap();
+    assert_eq!(start.elapsed(), Duration::from_secs(100));
+
+    // The ping that went at 60 s was answered with it. The next, at 120 s, isn't: the connection
+    // fails 75 s after it.
+    step_until_timed_out(&mut sender).await;
+    assert_eq!(start.elapsed(), Duration::from_secs(195));
+    answers.abort();
+}
+
+/// Step `sender` until its connection fails, which must be the pong timeout's I/O error.
+async fn step_until_timed_out(sender: &mut Sender<Intermediate, Plain>) {
+    let error = loop {
+        match sender.step().await {
+            Ok(_) => continue,
+            Err(error) => break error,
+        }
+    };
+    match error {
+        ReadError::Io(error) => assert_eq!(error.kind(), io::ErrorKind::TimedOut),
+        other => panic!("a timeout, not {other:?}"),
+    }
+}
+
+/// The keepalive ping the client wrote last, which must be the next packet `server` reads and
+/// already be in the stream.
+async fn written_ping(server: &mut Server) -> tl::functions::PingDelayDisconnect {
+    let message = timeout(Duration::ZERO, server.read_message())
+        .await
+        .expect("the ping went out in the step before");
+    tl::functions::PingDelayDisconnect::from_boxed_bytes(&message).unwrap()
+}
+
+#[tokio::test(start_paused = true)]
+async fn bytes_read_before_the_ping_goes_out_dont_answer_it() {
+    let (dialer, mut servers) = TestDialer::new(1 << 16);
+    let mut sender = Sender::connect(Intermediate::new(), Plain::new(), &*dialer, &target())
+        .await
+        .unwrap();
+    let mut server = servers.recv().await.unwrap();
+    let start = Instant::now();
+
+    // A message from the server waits in the stream when the ping timer fires at 60 s, so the
+    // step that queues the ping reads it too. It came before the ping, so it doesn't answer it.
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    server
+        .write_message(&res_pq([7; 16], vec![1]).to_bytes())
+        .await;
+    assert!(sender.step().await.unwrap().is_empty());
+    assert!(sender.step().await.unwrap().is_empty());
+    written_ping(&mut server).await;
+    assert_eq!(start.elapsed(), Duration::from_secs(60));
+
+    // The server sends nothing more: the connection fails 75 s after that ping went out, not 75 s
+    // after the next, at 120 s.
+    step_until_timed_out(&mut sender).await;
+    assert_eq!(start.elapsed(), Duration::from_secs(135));
+    drop(server);
+}
+
+#[tokio::test(start_paused = true)]
+async fn pong_timeout_runs_from_the_write_of_the_ping() {
+    let (dialer, mut servers) = TestDialer::new(1 << 16);
+    let mut sender = Sender::connect(Intermediate::new(), Plain::new(), &*dialer, &target())
+        .await
+        .unwrap();
+    let mut server = servers.recv().await.unwrap();
+    let start = Instant::now();
+
+    // The step the ping timer ends at 60 s queues the ping, and then the sender isn't driven for
+    // 100 s, longer than the pong timeout: none of that time is the server's.
+    assert!(sender.step().await.unwrap().is_empty());
+    assert_eq!(start.elapsed(), Duration::from_secs(60));
+    tokio::time::sleep(Duration::from_secs(100)).await;
+
+    // Driven again at 160 s, the sender writes the ping, and queues the next, overdue. The
+    // server answers the first.
+    assert!(sender.step().await.unwrap().is_empty());
+    let ping = written_ping(&mut server).await;
+    let pong = tl::enums::Pong::Pong(tl::types::Pong {
+        msg_id: 0,
+        ping_id: ping.ping_id,
+    });
+    server.write_message(&pong.to_bytes()).await;
+
+    // The next step writes the second ping and reads the answer in one poll: the answer came
+    // before that ping, so it answers only the first. The server sends nothing more, and the
+    // connection fails 75 s after the second ping went out.
+    step_until_timed_out(&mut sender).await;
+    assert_eq!(start.elapsed(), Duration::from_secs(235));
+    drop(server);
 }
