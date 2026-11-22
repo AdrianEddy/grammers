@@ -46,8 +46,9 @@
 //! except for the server's own skips that [`StateDelta`] lists.
 //!
 //! Updates and differences come from the server: an update whose `pts` breaks the protocol is
-//! dropped, an unusable difference ends the box's difference, and an answer for a box that isn't
-//! getting its difference changes nothing. None of them panics.
+//! dropped (one whose `qts` does also schedules the account's difference), an unusable difference
+//! ends the box's difference, and an answer for a box that isn't getting its difference changes
+//! nothing. None of them panics.
 
 // Here and in the submodules, unexpected server data is handled, never a panic.
 #![cfg_attr(
@@ -794,6 +795,9 @@ impl MessageBoxes {
     ) -> (Vec<(tl::enums::Update, State)>, bool) {
         // Each update with its place in its box's sequence, read once. One whose `pts` breaks the
         // protocol is dropped, as TDLib drops it; a later update of its box then finds the gap.
+        // A wrong `qts` also schedules the account's difference, as TDLib schedules it
+        // (`add_pending_qts_update`), where a wrong `pts` doesn't.
+        let mut wrong_qts = false;
         let mut updates: Vec<(Option<PtsInfo>, tl::enums::Update)> = updates
             .into_iter()
             .filter_map(|update| match PtsInfo::from_update(&update) {
@@ -808,10 +812,14 @@ impl MessageBoxes {
                 }
                 Err(WrongPts::Count(info)) => {
                     warn!(?info, "dropping an update whose pts breaks the protocol");
+                    wrong_qts |= info.key == Key::Secondary;
                     None
                 }
             })
             .collect();
+        if wrong_qts {
+            self.schedule_account_difference(now);
+        }
 
         // Telegram can send updates out of order (e.g. `ReadChannelInbox` first
         // and then `NewChannelMessage`, both with the same `pts`, but the `count`
@@ -1314,6 +1322,24 @@ impl MessageBoxes {
         let mut result = Vec::new();
         self.finish_account_difference(now, &mut result);
         result
+    }
+
+    /// Schedule the account's difference after an update with a wrong `qts`, as TDLib does
+    /// (`add_pending_qts_update`, which calls `schedule_get_difference("wrong QTS")`): it is due
+    /// after the next backoff step ([`MessageBoxes::account_retry_at`]), the step a failed
+    /// difference waits, rather than at once. Nothing changes if the account is getting its
+    /// difference, or a retry is armed for it: either covers this one. Nor without the common
+    /// box's state, which the account's difference starts from.
+    fn schedule_account_difference(&mut self, now: Now) {
+        if self.account_retry_at.is_some() || self.getting_diff_for.contains(&Key::Common) {
+            return;
+        }
+        if self.entry(Key::Common).is_none() {
+            info!("a wrong qts asks for the account's difference, but there is no common state");
+            return;
+        }
+        debug!("a wrong qts schedules the account's difference");
+        self.arm_account_retry(now);
     }
 
     /// Arm the account's retry ([`MessageBoxes::account_retry_at`]) at the next backoff step from
