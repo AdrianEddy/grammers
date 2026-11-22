@@ -12,8 +12,11 @@
 //! a new address keeps it, and one whose server forgot the session's key makes a new one. A
 //! transport error code fails a request as a transport error. A dial gives up on an address that
 //! never answers and tries the next, and a SOCKS5 dial's error names the proxy and says its cause
-//! once. The tests play the server on in-memory streams, and the proxy on loopback; nothing leaves
-//! the machine.
+//! once. A connection that makes a new key stores it before anything goes out under it, and the
+//! store's time takes none of the connect's. The tests play the server on in-memory streams (the
+//! handshake's half too, `handshake`), and the proxy on loopback; nothing leaves the machine.
+
+mod handshake;
 
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
@@ -27,10 +30,11 @@ use grammers_mtproto::mtp::Plain;
 use grammers_mtproto::transport::{self, Intermediate};
 use grammers_mtsender::{
     ConnKind, ConnectionParams, DialFuture, DialTarget, Dialer, InvocationError, MtStream,
-    NoRetries, Sender, SenderPool, TokioTcpDialer,
+    NoRetries, Sender, SenderPool, SenderPoolHandle, TokioTcpDialer,
 };
-use grammers_session::Session;
 use grammers_session::storages::MemorySession;
+use grammers_session::types::{DcOption, PeerId, PeerInfo, UpdateState, UpdatesState};
+use grammers_session::{BoxFuture, Session};
 use grammers_tl_types::{self as tl, Deserializable, Serializable};
 use sha2::{Digest, Sha256};
 use tokio::io::{
@@ -1069,4 +1073,181 @@ async fn socks5_dial_error_says_its_cause_once() {
         chain,
         ["request error: SOCKS5 proxy: unexpected end of file"]
     );
+}
+
+/// Plays the server's half of the handshake on `server`'s connection, and returns the key it made.
+async fn serve_handshake(server: &mut Server, key: &handshake::TestRsaKey) -> [u8; 256] {
+    let mut handshake = handshake::Handshake::new(key);
+    loop {
+        let body = server.read_message().await;
+        match handshake.step(&body) {
+            handshake::Step::Reply(reply) => server.write_message(&reply).await,
+            handshake::Step::Done(reply, auth_key) => {
+                server.write_message(&reply).await;
+                return *auth_key;
+            }
+        }
+    }
+}
+
+/// The identifier of the key the client's next packet, an encrypted one, is under.
+async fn next_packet_key_id(server: &mut Server) -> [u8; 8] {
+    server.read_packet().await[..8].try_into().unwrap()
+}
+
+/// A request to datacenter 2 through `handle`, whose answer the test awaits.
+fn call_dc2(
+    handle: &SenderPoolHandle,
+) -> tokio::task::JoinHandle<Result<tl::enums::NearestDc, InvocationError>> {
+    let handle = handle.clone();
+    tokio::spawn(async move {
+        handle
+            .invoke_in_dc(2, &tl::functions::help::GetNearestDc {})
+            .await
+    })
+}
+
+#[tokio::test]
+async fn new_key_is_stored_before_anything_goes_out_under_it() {
+    let key = handshake::TestRsaKey::new();
+    let (dialer, mut servers) = TestDialer::new(1 << 16);
+    let (pool, session) = pool(dialer, vec![key.public()]);
+    let runner = tokio::spawn(pool.runner.run());
+    let call = call_dc2(&pool.handle);
+
+    let mut server = servers.recv().await.unwrap();
+    let auth_key = serve_handshake(&mut server, &key).await;
+    // The first encrypted packet, `initConnection`, is under the new key, which the session
+    // already holds.
+    assert_eq!(
+        next_packet_key_id(&mut server).await,
+        AuthKey::from_bytes(auth_key).key_id()
+    );
+    assert!(session.dc_option(2).unwrap().unwrap().auth_key == Some(auth_key));
+    // The connection ends before `initConnection`'s answer: the key stays, so what went out under
+    // it is under a key the session holds.
+    drop(server);
+    assert!(matches!(call.await.unwrap(), Err(InvocationError::Io(_))));
+    assert!(session.dc_option(2).unwrap().unwrap().auth_key == Some(auth_key));
+
+    assert!(pool.handle.quit());
+    runner.await.unwrap();
+}
+
+#[tokio::test]
+async fn key_made_after_a_404_is_stored_before_anything_goes_out_under_it() {
+    let key = handshake::TestRsaKey::new();
+    let session = Arc::new(MemorySession::default());
+    let mut dc2 = session.dc_option(2).unwrap().unwrap();
+    dc2.auth_key = Some(AUTH_KEY);
+    session.set_dc_option(&dc2).await.unwrap();
+    let (dialer, mut servers) = TestDialer::new(1 << 16);
+    let pool =
+        SenderPool::with_configuration(Arc::clone(&session), 1, params(dialer, vec![key.public()]));
+    let runner = tokio::spawn(pool.runner.run());
+    let call = call_dc2(&pool.handle);
+
+    // The server doesn't know the session's key.
+    let mut first = servers.recv().await.unwrap();
+    assert_eq!(
+        next_packet_key_id(&mut first).await,
+        AuthKey::from_bytes(AUTH_KEY).key_id()
+    );
+    first.write_transport_error(404).await;
+    // The new connection's key replaces it in the session before `initConnection` goes again.
+    let mut second = servers.recv().await.unwrap();
+    let auth_key = serve_handshake(&mut second, &key).await;
+    assert_eq!(
+        next_packet_key_id(&mut second).await,
+        AuthKey::from_bytes(auth_key).key_id()
+    );
+    assert!(session.dc_option(2).unwrap().unwrap().auth_key == Some(auth_key));
+    drop((first, second));
+    assert!(call.await.unwrap().is_err());
+
+    assert!(pool.handle.quit());
+    runner.await.unwrap();
+}
+
+/// A [`MemorySession`] whose write of a new authorization key takes [`SlowKeys::DELAY`].
+#[derive(Default)]
+struct SlowKeys(MemorySession);
+
+impl SlowKeys {
+    const DELAY: Duration = Duration::from_secs(100);
+}
+
+impl Session for SlowKeys {
+    type Error = <MemorySession as Session>::Error;
+
+    fn home_dc_id(&self) -> Result<i32, Self::Error> {
+        self.0.home_dc_id()
+    }
+
+    fn set_home_dc_id(&self, dc_id: i32) -> BoxFuture<'_, Result<(), Self::Error>> {
+        self.0.set_home_dc_id(dc_id)
+    }
+
+    fn dc_option(&self, dc_id: i32) -> Result<Option<DcOption>, Self::Error> {
+        self.0.dc_option(dc_id)
+    }
+
+    fn set_dc_option(&self, dc_option: &DcOption) -> BoxFuture<'_, Result<(), Self::Error>> {
+        let dc_option = dc_option.clone();
+        Box::pin(async move {
+            let held = self
+                .0
+                .dc_option(dc_option.id)?
+                .and_then(|held| held.auth_key);
+            if held != dc_option.auth_key {
+                tokio::time::sleep(Self::DELAY).await;
+            }
+            self.0.set_dc_option(&dc_option).await
+        })
+    }
+
+    fn peer(&self, peer: PeerId) -> BoxFuture<'_, Result<Option<PeerInfo>, Self::Error>> {
+        self.0.peer(peer)
+    }
+
+    fn cache_peer(&self, peer: PeerInfo) -> BoxFuture<'_, Result<(), Self::Error>> {
+        self.0.cache_peer(peer)
+    }
+
+    fn updates_state(&self) -> BoxFuture<'_, Result<UpdatesState, Self::Error>> {
+        self.0.updates_state()
+    }
+
+    fn set_update_state(&self, update: UpdateState) -> BoxFuture<'_, Result<(), Self::Error>> {
+        self.0.set_update_state(update)
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn key_store_takes_none_of_the_setup_time() {
+    let key = handshake::TestRsaKey::new();
+    let session = Arc::new(SlowKeys::default());
+    let (dialer, mut servers) = TestDialer::new(1 << 16);
+    let pool =
+        SenderPool::with_configuration(Arc::clone(&session), 1, params(dialer, vec![key.public()]));
+    let runner = tokio::spawn(pool.runner.run());
+    let start = Instant::now();
+    let call = call_dc2(&pool.handle);
+
+    // The handshake takes no time on the paused clock and its key's write takes 100 s; then a
+    // server that never answers `initConnection` lets the setup time out after 60 s of network
+    // time, none of them the write's.
+    let mut server = servers.recv().await.unwrap();
+    let auth_key = serve_handshake(&mut server, &key).await;
+    next_packet_key_id(&mut server).await;
+    assert_eq!(start.elapsed(), SlowKeys::DELAY);
+    match call.await.unwrap() {
+        Err(InvocationError::Io(error)) => assert_eq!(error.kind(), io::ErrorKind::TimedOut),
+        other => panic!("a timeout, not {other:?}"),
+    }
+    assert_eq!(start.elapsed(), SlowKeys::DELAY + Duration::from_secs(60));
+    assert!(session.dc_option(2).unwrap().unwrap().auth_key == Some(auth_key));
+
+    assert!(pool.handle.quit());
+    runner.await.unwrap();
 }

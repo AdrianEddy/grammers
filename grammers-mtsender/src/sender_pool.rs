@@ -46,10 +46,12 @@ use crate::{Sender, connect, connect_with_auth};
 /// How long to wait after warning the user that updates were dropped before warning again.
 const UPDATES_DROPPED_LOG_COOLDOWN: Duration = Duration::from_secs(300);
 
-/// How long a new connection has to answer `initConnection`, from the dial on. The runner waits
-/// for it, so a peer that accepts and then says nothing can't hold the pool for longer. It leaves
-/// room for the slowest dial through [`DialTarget::connect_any`], 10 s on each of a target's two
-/// addresses, and for the handshake, including the second dial and handshake a `-404` asks for.
+/// How long a new connection's network steps have, together, to answer `initConnection`, from the
+/// dial on ([`SetupBudget`]). The runner waits for them, so a peer that accepts and then says
+/// nothing can't hold the pool for longer. It leaves room for the slowest dial through
+/// [`DialTarget::connect_any`], 10 s on each of a target's two addresses, and for the handshake,
+/// including the second dial and handshake a `-404` asks for. The session writes between the
+/// steps don't count: a session write is never cancelled.
 const SETUP_TIMEOUT: Duration = Duration::from_secs(60);
 
 type InvokeResponse = Vec<u8>;
@@ -482,12 +484,9 @@ impl SenderPoolRunner {
             None => return Err(InvocationError::InvalidDc),
         };
 
+        // `connect_sender` stored the connection's key, if it made one, and the addresses the
+        // server gave.
         let sender = self.connect_sender(&dc_option).await?;
-
-        // `connect_sender` stored the addresses the server gave for this datacenter.
-        let mut dc_option = self.session.dc_option(dc_id)?.unwrap_or(dc_option);
-        dc_option.auth_key = Some(sender.auth_key());
-        self.session.set_dc_option(&dc_option).await?;
 
         let (rpc_tx, rpc_rx) = mpsc::unbounded_channel();
         self.connection_pool.spawn(run_sender(
@@ -495,19 +494,29 @@ impl SenderPoolRunner {
             sender,
             rpc_rx,
             UpdatesForwarder::new(self.updates_tx.clone()),
-            dc_option.id == self.session.home_dc_id()?,
+            dc_id == self.session.home_dc_id()?,
         ));
         Ok(self.connections.push_mut(ConnectionInfo { dc_id, rpc_tx }))
     }
 
+    /// Connect to `dc_option`'s datacenter and invoke `initConnection` on the new connection.
+    ///
+    /// A new authorization key, made by the handshake when the session holds none for the
+    /// datacenter or when the server answers `-404` for the one it holds, is stored before
+    /// anything goes out under it, as TDLib hands a new key to its storage once the handshake is
+    /// ready, before the session's first query. So every key a packet was sent under is one the
+    /// session holds: a connection that ends between the handshake and the answer to
+    /// `initConnection` (the pool's runner dropped, the setup timed out, the connection failed)
+    /// leaves no packet under a key that was never stored. The network steps share
+    /// [`SETUP_TIMEOUT`]; the session writes between them aren't timed.
     async fn connect_sender(
-        &mut self,
+        &self,
         dc_option: &DcOption,
     ) -> Result<Sender<Box<dyn transport::Transport + Send>, mtp::Encrypted>, InvocationError> {
-        let transport = &self.connection_params.transport;
-        let dialer = &*self.connection_params.dialer;
-        let rsa_keys = &self.connection_params.server_rsa_keys;
         let target = DialTarget::new(dc_option, ConnKind::Main);
+        let mut budget = SetupBudget {
+            left: SETUP_TIMEOUT,
+        };
 
         let init_connection = tl::functions::InvokeWithLayer {
             layer: tl::LAYER,
@@ -525,31 +534,59 @@ impl SenderPoolRunner {
             },
         };
 
-        // Only the network part has a deadline: a session write is never cancelled.
-        let (sender, enums::Config::Config(remote_config)) = timeout(SETUP_TIMEOUT, async {
-            let mut sender = if let Some(auth_key) = dc_option.auth_key {
-                connect_with_auth(transport(), dialer, &target, auth_key)
-                    .await
-                    .map_err(InvocationError::Io)?
-            } else {
-                connect(transport(), dialer, &target, rsa_keys).await?
-            };
-
-            let config = match sender.invoke(&init_connection).await {
+        let mut sender = match dc_option.auth_key {
+            Some(auth_key) => {
+                let transport = (self.connection_params.transport)();
+                let dialer = &*self.connection_params.dialer;
+                budget
+                    .run(async {
+                        connect_with_auth(transport, dialer, &target, auth_key)
+                            .await
+                            .map_err(InvocationError::Io)
+                    })
+                    .await?
+            }
+            None => {
+                self.connect_new_key(&mut budget, dc_option, &target)
+                    .await?
+            }
+        };
+        let enums::Config::Config(remote_config) =
+            match budget.run(sender.invoke(&init_connection)).await {
                 Ok(config) => config,
+                // The server doesn't know the session's key: a new one replaces it.
                 Err(InvocationError::Transport(transport::Error::BadStatus { status: 404 })) => {
-                    sender = connect(transport(), dialer, &target, rsa_keys).await?;
-                    sender.invoke(&init_connection).await?
+                    sender = self
+                        .connect_new_key(&mut budget, dc_option, &target)
+                        .await?;
+                    budget.run(sender.invoke(&init_connection)).await?
                 }
                 Err(e) => return Err(e),
             };
-            Ok((sender, config))
-        })
-        .await
-        .map_err(|_| InvocationError::Io(io::ErrorKind::TimedOut.into()))??;
 
         self.update_dc_options(&remote_config.dc_options).await?;
 
+        Ok(sender)
+    }
+
+    /// Dial `target` and make a new authorization key on the connection, within what is left of
+    /// `budget`, then store the key in `dc_option`'s row before the connection carries anything
+    /// under it. The write isn't timed: a session write is never cancelled.
+    async fn connect_new_key(
+        &self,
+        budget: &mut SetupBudget,
+        dc_option: &DcOption,
+        target: &DialTarget,
+    ) -> Result<Sender<Box<dyn transport::Transport + Send>, mtp::Encrypted>, InvocationError> {
+        let transport = (self.connection_params.transport)();
+        let dialer = &*self.connection_params.dialer;
+        let rsa_keys = &self.connection_params.server_rsa_keys;
+        let sender = budget
+            .run(connect(transport, dialer, target, rsa_keys))
+            .await?;
+        let mut keyed = dc_option.clone();
+        keyed.auth_key = Some(sender.auth_key());
+        self.session.set_dc_option(&keyed).await?;
         Ok(sender)
     }
 
@@ -615,6 +652,27 @@ impl SenderPoolRunner {
             self.session.set_dc_option(&dc_option).await?;
         }
         Ok(())
+    }
+}
+
+/// What is left of [`SETUP_TIMEOUT`] for a new connection's network steps. Each step is timed
+/// against it and uses up what it took, so the session writes between the steps, which are never
+/// cancelled, take none of it.
+struct SetupBudget {
+    left: Duration,
+}
+
+impl SetupBudget {
+    /// Run `step` within what is left, failing it with an I/O error of kind
+    /// [`io::ErrorKind::TimedOut`] once that runs out.
+    async fn run<T>(
+        &mut self,
+        step: impl Future<Output = Result<T, InvocationError>>,
+    ) -> Result<T, InvocationError> {
+        let started = tokio::time::Instant::now();
+        let result = timeout(self.left, step).await;
+        self.left = self.left.saturating_sub(started.elapsed());
+        result.map_err(|_| InvocationError::Io(io::ErrorKind::TimedOut.into()))?
     }
 }
 

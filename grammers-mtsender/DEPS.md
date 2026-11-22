@@ -80,3 +80,13 @@ Used to test for SOCKS5 proxy support.
 
 Used in the tests to play a server that holds an authorization key: the server side of MTProto 2.0's
 message encryption, which `grammers-crypto` implements only for the client.
+
+## sha1
+
+Used in the tests to play the server's half of the authorization key's handshake: the hashes of its
+answers and of the client's, which `grammers-mtproto` computes only for the client.
+
+## num-bigint
+
+Used in the tests to play the server's half of the authorization key's handshake: the RSA
+decryption and the Diffie-Hellman exchange, which `grammers-mtproto` performs only for the client.
