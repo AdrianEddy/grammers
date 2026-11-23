@@ -568,22 +568,21 @@ fn test_next_raw_update_flow_no_new_get_diff_if_already_fetching() {
 
 #[test]
 fn test_process_socket_updates_flow_already_processed() {
-    let mut message_boxes = MessageBoxes::new();
-
-    message_boxes.set_state(state(12, 34, 56, 78), T0);
-
-    for (seq, pts) in [
-        (33, 57),     // seq already applied (<)
-        (34, 57),     // seq already applied (=)
-        (35, 55),     // seq ok (>), pts already applied (<)
-        (35, 56),     // seq ok (>), pts already applied (=)
-        (NO_PTS, 55), // seq ok (0), pts already applied (<)
-        (NO_PTS, 56), // seq ok (0), pts already applied (=)
+    // A container whose `seq` the boxes have already: its updates a box orders still go to their
+    // box, as TDLib sends them whatever the `seq`, so one that follows on is handed out; the `seq`
+    // and the `date` don't move.
+    for seq in [
+        33, // seq already applied (<)
+        34, // seq already applied (=)
     ] {
+        let mut message_boxes = MessageBoxes::new();
+        message_boxes.set_state(state(12, 34, 56, 78), T0);
+        let _ = message_boxes.take_delta();
         assert_eq!(
-            message_boxes.process_updates(updates(13, seq, pts), T0), // date doesn't matter
-            Ok((Vec::new(), Vec::new(), Vec::new()))
+            message_boxes.process_updates(updates(13, seq, 57), T0),
+            updates_ok(13, seq, 57)
         );
+        assert_eq!(message_boxes.take_delta(), common_delta(57, 12, 34));
     }
 }
 
@@ -594,8 +593,6 @@ fn test_process_socket_updates_flow_common_already_applied() {
     message_boxes.set_state(state(12, 34, 56, 78), T0);
 
     for (seq, pts) in [
-        (33, 57),     // seq already applied (<)
-        (34, 57),     // seq already applied (=)
         (35, 55),     // seq ok (>), pts already applied (<)
         (35, 56),     // seq ok (>), pts already applied (=)
         (NO_PTS, 55), // seq ok (0), pts already applied (<)
@@ -663,13 +660,21 @@ fn test_process_socket_updates_flow_common_seq_gap() {
 
     message_boxes.set_state(state(12, 34, 56, 78), T0);
 
+    // Past the `seq`: its update that follows on in the common box is handed out, and the
+    // container waits half a second for the one before it.
     assert_eq!(
         message_boxes.process_updates(updates(13, 36, 57), T0),
-        Err(Gap)
+        updates_ok(13, 36, 57)
+    );
+    assert_eq!(message_boxes.get_difference(), None);
+    // None comes: the account's difference begins.
+    assert_eq!(
+        time_of_next_difference(&mut message_boxes, T0),
+        T0 + POSSIBLE_GAP_TIMEOUT
     );
     assert_eq!(
         message_boxes.get_difference(),
-        Some(get_difference(12, 56, 78))
+        Some(get_difference(12, 57, 78))
     );
 }
 
@@ -1330,7 +1335,7 @@ fn socket_update_postponed_while_account_diffs() {
     // The account (pts 100, seq 5) gets its difference, as the server has too much to send.
     // Meanwhile a message arrives (pts 103), then a sequenced container (pts 104, seq 8): their
     // updates wait for the difference, and so does the container's `seq`. A container the
-    // account already had (seq 5) is skipped, as when it gets no difference.
+    // account already had (seq 5) is skipped once the difference ends, as when it gets none.
     let diffing = || {
         let mut message_boxes = settled(T0);
         assert_eq!(
@@ -1357,7 +1362,7 @@ fn socket_update_postponed_while_account_diffs() {
         };
         let old = UpdatesLike::Updates(
             tl::types::Updates {
-                updates: vec![tl::enums::Update::Config],
+                updates: vec![tl::enums::Update::SavedReactionTags],
                 users: Vec::new(),
                 chats: Vec::new(),
                 date: 10,
@@ -1405,12 +1410,17 @@ fn socket_update_postponed_while_account_diffs() {
     assert_eq!(message_boxes.take_delta(), common_delta(104, 11, 8));
     assert_eq!(message_boxes.difference_pending(), DiffPending::default());
 
-    // The difference ends at seq 6: a container is missing before theirs, so the account's
-    // difference is due again.
+    // The difference ends at seq 6: a container is missing before theirs, which waits for it half
+    // a second, and then the account's difference is due again.
     let mut message_boxes = diffing();
     let (returned, _, _) = message_boxes.apply_difference(difference(102, 6), T0);
     assert_eq!(pts_of(&returned), vec![101, 102, 103, 104]);
     assert_eq!(message_boxes.take_delta(), common_delta(104, 11, 6));
+    assert_eq!(message_boxes.get_difference(), None);
+    assert_eq!(
+        time_of_next_difference(&mut message_boxes, T0),
+        T0 + POSSIBLE_GAP_TIMEOUT
+    );
     assert_eq!(
         message_boxes.get_difference(),
         Some(get_difference(11, 104, 50))
@@ -3010,9 +3020,9 @@ fn state_near_i32_max_does_not_overflow() {
         message_boxes.process_updates(qts_updates(i32::MAX), T0),
         NOTHING
     );
-    // A sequenced container after `seq` `i32::MAX`: handled already.
+    // A sequenced container after `seq` `i32::MAX`: handled already, its update too.
     assert_eq!(
-        message_boxes.process_updates(updates(11, i32::MIN, i32::MAX), T0),
+        message_boxes.process_updates(updates(11, i32::MIN, i32::MAX - 1), T0),
         NOTHING
     );
     assert_eq!(message_boxes.take_delta(), StateDelta::default());
@@ -3109,3 +3119,4 @@ mod channel_pts;
 mod possible_gap;
 mod qts;
 mod retry_jitter;
+mod seq;

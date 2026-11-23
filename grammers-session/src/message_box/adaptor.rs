@@ -801,3 +801,31 @@ impl PtsInfo {
         }
     }
 }
+
+/// Whether `update`, which no box orders, applies as it arrives, whatever its container's `seq`,
+/// also while the account gets its difference: TDLib's `on_pending_updates` handles these before it
+/// looks at the `seq` and at a running difference. They are its "short" updates (typing, a login
+/// token, a sent code, the configuration and the datacenters, a service notification, a language
+/// pack) and those the container's other updates refer to (a sent message's id, which pairs it
+/// with its message, a story's, a secret chat's state). Every other update no box orders waits for
+/// its container's `seq` ([`super::MessageBoxes::process_updates`]).
+pub(super) fn applies_at_once(update: &tl::enums::Update) -> bool {
+    use tl::enums::Update::*;
+    matches!(
+        update,
+        UserTyping(_)
+            | ChatUserTyping(_)
+            | ChannelUserTyping(_)
+            | EncryptedChatTyping(_)
+            | LoginToken
+            | SentPhoneCode(_)
+            | DcOptions(_)
+            | Config
+            | ServiceNotification(_)
+            | LangPackTooLong(_)
+            | LangPack(_)
+            | MessageId(_)
+            | StoryId(_)
+            | Encryption(_)
+    )
+}

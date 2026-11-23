@@ -9,10 +9,10 @@
 //! The account's difference ended without an answer ([`MessageBoxes::end_account_difference`]):
 //! retried after a backoff that only the caller cuts short
 //! ([`MessageBoxes::begin_account_difference`]), due also while a channel gets its difference,
-//! with the channels' deadlines checked meanwhile, the postponed updates that follow on handed
-//! out, the containers' `seq` held for the retry and the account's possible gaps dropped after
-//! their half second; and the account's `pts` restored from the server's after it refused the
-//! account's state ([`MessageBoxes::restore_pts`]), the rest of that state kept.
+//! with the channels' deadlines checked meanwhile, the postponed updates and held containers that
+//! follow on handed out, and the account's possible gaps and the containers past its `seq`
+//! dropped after their half second; and the account's `pts` restored from the server's after it
+//! refused the account's state ([`MessageBoxes::restore_pts`]), the rest of that state kept.
 
 use super::*;
 
@@ -133,8 +133,8 @@ fn gaps_wait_for_the_accounts_retry() {
         // A `pts` gap: held in the common box's possible gap, whose half second doesn't begin the
         // difference.
         (updates(11, NO_SEQ, 102), Ok(Vec::new())),
-        // A `seq` gap: its `seq` held for the retry's difference, its update, which follows on,
-        // handed out.
+        // A `seq` gap: its update, which follows on in its box, handed out; the container held
+        // past the `seq` for its half second, which doesn't begin the difference either.
         (
             updates(11, 7, 101),
             Ok(vec![MessageBox::Common { pts: 101 }]),
@@ -209,8 +209,8 @@ fn updates_that_follow_on_are_handed_out_after_an_unanswered_end() {
     }
 
     // The ones that follow on from the kept state are handed out: 101 and 102, and qts 51; 104,
-    // after the gap, is dropped for the retry to return. The `seq` the container carried isn't
-    // taken.
+    // after the gap, is dropped for the retry to return. The container's `seq` follows on from
+    // the local one: it is taken, the `date` kept.
     let ended = message_boxes.end_account_difference(T0);
     let boxes: Vec<_> = ended
         .iter()
@@ -230,7 +230,7 @@ fn updates_that_follow_on_are_handed_out_after_an_unanswered_end() {
             common: Some(CommonState {
                 pts: 102,
                 date: 10,
-                seq: 5
+                seq: 6
             }),
             qts: Some(51),
             ..StateDelta::default()
@@ -238,20 +238,20 @@ fn updates_that_follow_on_are_handed_out_after_an_unanswered_end() {
     );
     assert_eq!(message_boxes.get_difference(), None);
 
-    // The next container is past the local `seq`, which stayed 5. Its `seq` is held for the
-    // retry's difference, and its update, which follows on, is handed out.
+    // The next container follows on, in its box and in `seq`: handed out, its `seq` and `date`
+    // taken.
     let (updates, _, _) = message_boxes
         .process_updates(updates(13, 7, 103), T0)
         .unwrap();
     assert_eq!(boxes_of(&updates), [MessageBox::Common { pts: 103 }]);
-    assert_eq!(message_boxes.take_delta(), common_delta(103, 10, 5));
+    assert_eq!(message_boxes.take_delta(), common_delta(103, 13, 7));
 
     // The retry's difference starts from there.
     let due = time_of_next_difference(&mut message_boxes, T0);
     assert_eq!(due, T0 + Duration::from_secs(1));
     assert_eq!(
         message_boxes.get_difference(),
-        Some(get_difference(10, 103, 51))
+        Some(get_difference(13, 103, 51))
     );
 }
 
@@ -505,9 +505,14 @@ fn restore_pts_begins_the_difference_for_a_container_past_the_kept_seq() {
         .unwrap();
     assert!(updates.is_empty(), "postponed");
 
-    // The container before it is missing: the account's difference begins again, from the new pts
-    // with the kept date and qts.
+    // The container before it is missing: once it waited half a second, the account's difference
+    // begins again, from the new pts with the kept date and qts.
     assert!(message_boxes.restore_pts(500, T0).is_empty());
+    assert_eq!(message_boxes.difference_pending(), DiffPending::default());
+    assert_eq!(
+        time_of_next_difference(&mut message_boxes, T0),
+        T0 + POSSIBLE_GAP_TIMEOUT
+    );
     assert_eq!(message_boxes.difference_pending(), account_pending());
     assert_eq!(
         message_boxes.get_difference(),

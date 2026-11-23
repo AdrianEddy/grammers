@@ -141,15 +141,15 @@ pub struct MessageBoxes {
     /// ([`MessageBoxes::end_account_difference`]); `None` while no such retry is armed. It falls
     /// due also while channels get their differences. While it is armed, only the caller begins
     /// the account's difference sooner ([`MessageBoxes::begin_account_difference`], for a new
-    /// connection): a `seq` gap, `updatesTooLong`, a gap signal and the idle deadline wait for it,
-    /// and so does a possible gap of the account's, whose updates are dropped once its half second
-    /// is over, for the retry's difference to return. The account's updates that follow on from
-    /// its state are still applied meanwhile, and a container's `seq` is held as while the
-    /// difference runs ([`MessageBoxes::postponed_seq`]), so a `seq` gap drops none of them.
-    /// Without the wait, every update of a busy account would be a gap after an unanswered end, and
-    /// a failure that repeats would cost one difference every half a second instead of one per
-    /// backoff step. Cleared once the account's difference begins, so it fires at most once per
-    /// failure, and once its `pts` is restored ([`MessageBoxes::restore_pts`]).
+    /// connection): `updatesTooLong`, a gap signal and the idle deadline wait for it, and so do a
+    /// possible gap of the account's and a `seq` gap ([`MessageBoxes::seq_gap`]), whose updates
+    /// are dropped once their half second is over before the retry falls due, for the retry's
+    /// difference to return (one due with the retry is kept for its difference). The account's
+    /// updates that follow on from its state are still applied meanwhile, in their boxes and in
+    /// `seq` order. Without the wait, every update of a busy account would be a gap after an
+    /// unanswered end, and a failure that repeats would cost one difference every half a second
+    /// instead of one per backoff step. Cleared once the account's difference begins, so it fires
+    /// at most once per failure, and once its `pts` is restored ([`MessageBoxes::restore_pts`]).
     pub(super) account_retry_at: Option<Now>,
 
     /// The account's last backoff step before getting its difference again ([`RETRY_MIN`]): zero
@@ -166,13 +166,23 @@ pub struct MessageBoxes {
     /// together, so they share this, also while the secondary box has no entry yet.
     pub(super) account_postponed: Vec<(PtsInfo, tl::enums::Update)>,
 
-    /// The `seq_start` and `seq` of each sequenced container that arrived while the account got
-    /// its difference, or waited for its retry ([`MessageBoxes::account_retry_at`]). The
-    /// difference replaces the local `seq`, so they are checked against the `seq` of the next
-    /// answered one once it ends (a restored `pts` keeps the local `seq`,
-    /// [`MessageBoxes::restore_pts`]); an unanswered end drops them, the retry's difference
-    /// setting it.
-    pub(super) postponed_seq: Vec<(i32, i32)>,
+    /// The containers whose updates no box orders wait for the account's `seq`
+    /// ([`MessageBoxes::process_updates`]), in the order they apply, as TDLib keeps its
+    /// (`PendingSeqUpdates`): by `seq_start`, then the larger `seq` first. While the account gets
+    /// its difference, every container's (one of no `seq` included, an `updateShort` excepted),
+    /// checked against the `seq` the difference leaves once it ends, as TDLib's
+    /// `postponed_updates_`; otherwise those past the local `seq`, waiting for the containers
+    /// before them until [`MessageBoxes::seq_gap`], as TDLib's `pending_seq_updates_`. One queue
+    /// holds both, each container marking which it is ([`HeldSeq::during_difference`]).
+    pub(super) held_seq: VecDeque<HeldSeq>,
+
+    /// When the containers held past the local `seq` stop waiting for the ones before them, the
+    /// gap's half second after it opened ([`POSSIBLE_GAP_TIMEOUT`]): the account's difference
+    /// begins then, or, while its retry waits, they are dropped, the retry's difference setting
+    /// the `seq`. Set exactly while containers are held outside the account's difference: every
+    /// change to [`MessageBoxes::held_seq`] ends by settling it
+    /// ([`MessageBoxes::settle_seq_gap`]), and the difference's beginning closes it.
+    pub(super) seq_gap: Option<Now>,
 
     /// Optimization field: no deadline is earlier than this one. It can be earlier than the
     /// closest deadline, because a deadline that moves later doesn't move it;
@@ -230,6 +240,25 @@ pub(super) enum WrongPts {
     CommonInChannel,
     /// An update whose `count` is negative or not below its `pts`.
     Count(PtsInfo),
+}
+
+/// A container's updates that no box orders, waiting for the account's `seq`
+/// ([`MessageBoxes::held_seq`]).
+#[derive(Debug)]
+pub(super) struct HeldSeq {
+    /// The container's `seq_start`; [`NO_SEQ`] for a container of no `seq`, held only while the
+    /// account gets its difference.
+    pub(super) seq_start: i32,
+    /// The container's `seq`.
+    pub(super) seq: i32,
+    /// The container's `date`.
+    pub(super) date: i32,
+    /// The updates. There may be none: a container's `seq` still orders the containers after it.
+    pub(super) updates: Vec<tl::enums::Update>,
+    /// Whether it arrived while the account got its difference, as TDLib's `postponed_updates_`,
+    /// rather than past the local `seq` before it began, as its `pending_seq_updates_`: an empty
+    /// difference drops only the latter still past its `seq` ([`MessageBoxes::replay_held_seq`]).
+    pub(super) during_difference: bool,
 }
 
 // > ### Recovering gaps
