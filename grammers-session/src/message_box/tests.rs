@@ -3106,5 +3106,6 @@ fn new_session_is_a_gap() {
 mod account_deadlines;
 mod account_difference;
 mod channel_pts;
+mod possible_gap;
 mod qts;
 mod retry_jitter;

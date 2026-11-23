@@ -496,6 +496,15 @@ impl PtsInfo {
         self.pts - self.count
     }
 
+    /// Where the update goes among its box's: by [`PtsInfo::start`], then by `pts`, so that one
+    /// whose `pts_count` is 0 goes before one of the same start that moves the `pts`, which would
+    /// otherwise skip it as already handled. TDLib orders its pending updates by `pts`, then the
+    /// larger `pts_count` first (`PendingPtsUpdate`): the same order, except where one update
+    /// starts later than another yet has a lower `pts`, which no consistent sequence holds.
+    pub(super) fn order(&self) -> (i32, i32) {
+        (self.start(), self.pts)
+    }
+
     /// Where `update` goes in its box's sequence, if it is in one; [`WrongPts`] if its `pts` breaks
     /// the protocol.
     pub(super) fn from_update(update: &tl::enums::Update) -> Result<Option<Self>, WrongPts> {

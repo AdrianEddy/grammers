@@ -6,6 +6,7 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+use std::collections::VecDeque;
 use std::time::Duration;
 
 use grammers_tl_types as tl;
@@ -243,8 +244,10 @@ pub(super) enum WrongPts {
 pub(super) struct PossibleGap {
     pub(super) deadline: Now,
     /// Pending updates (those with a larger PTS, producing the gap which may later be filled),
-    /// each with its place in the box's sequence.
-    pub(super) updates: Vec<(PtsInfo, tl::enums::Update)>,
+    /// each with its place in the box's sequence, kept in the order they apply as they arrive
+    /// ([`PtsInfo::order`]), as TDLib keeps its pending ones in an ordered set
+    /// (`pending_pts_updates_`). An update that arrives in order lands last.
+    pub(super) updates: VecDeque<(PtsInfo, tl::enums::Update)>,
 }
 
 /// Error when a gap has been detected during update processing.

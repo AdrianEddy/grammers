@@ -67,7 +67,8 @@ mod retry;
 #[cfg(test)]
 mod tests;
 
-use std::cmp::{Ordering, Reverse};
+use std::cmp::Ordering;
+use std::collections::VecDeque;
 use std::mem;
 use std::time::Duration;
 
@@ -89,9 +90,10 @@ fn next_updates_deadline(now: Now) -> Now {
     now + defs::NO_UPDATES_TIMEOUT
 }
 
-/// Where an update goes when a batch is sorted: by where it applies in its box's sequence.
-fn update_sort_key(info: Option<&PtsInfo>) -> i32 {
-    info.map_or(NO_PTS, PtsInfo::start)
+/// Where an update goes when a batch is sorted: by where it applies in its box's sequence
+/// ([`PtsInfo::order`]), an update in no box's first.
+fn update_sort_key(info: Option<&PtsInfo>) -> (i32, i32) {
+    info.map_or((NO_PTS, NO_PTS), PtsInfo::order)
 }
 
 /// Whether a container whose `seq_start` is the one given follows on from the local `seq`
@@ -958,7 +960,8 @@ impl MessageBoxes {
             message_box: Some(message_box),
         };
         let mut applied = false;
-        let mut gap_deadline = None;
+        let mut held = false;
+        let mut opened = None;
         self.force_update_entry(LiveEntry::new(key, info.start()), |entry| {
             match entry.pts.cmp(&info.start()) {
                 // Apply
@@ -987,39 +990,48 @@ impl MessageBoxes {
                         "gap on update",
                     );
 
-                    entry
-                        .possible_gap
-                        .get_or_insert_with(|| PossibleGap {
-                            deadline: now + POSSIBLE_GAP_TIMEOUT,
-                            updates: Vec::new(),
-                        })
-                        .updates
-                        .push((info, update));
+                    match &mut entry.possible_gap {
+                        // In the order the updates apply, found by a binary search.
+                        Some(gap) => {
+                            let order = info.order();
+                            let at = gap
+                                .updates
+                                .partition_point(|(held, _)| held.order() <= order);
+                            gap.updates.insert(at, (info, update));
+                        }
+                        // The gap's deadline is armed once, when it opens.
+                        None => {
+                            let deadline = now + POSSIBLE_GAP_TIMEOUT;
+                            opened = Some(deadline);
+                            entry.possible_gap = Some(PossibleGap {
+                                deadline,
+                                updates: VecDeque::from([(info, update)]),
+                            });
+                        }
+                    }
                 }
             };
 
-            if let Some(mut gap) = entry.possible_gap.take() {
-                gap.updates
-                    .sort_by_key(|(gap_info, _)| Reverse(gap_info.start()));
-                while let Some((gap_info, gap_update)) = gap.updates.pop() {
-                    match entry.pts.cmp(&gap_info.start()) {
-                        Ordering::Equal => {
-                            entry.pts = gap_info.pts;
-                            // possible gap can only be resolve if new update closed
-                            // the gap - this has already updated its deadline if so.
-                            result.push((gap_update, mk_state(gap_info.into())));
-                        }
-                        Ordering::Greater => {}
-                        Ordering::Less => {
-                            gap.updates.push((gap_info, gap_update));
-                            break;
-                        }
-                    };
+            if let Some(gap) = &mut entry.possible_gap {
+                while let Some(start) = gap.updates.front().map(|(gap_info, _)| gap_info.start()) {
+                    let order = entry.pts.cmp(&start);
+                    if order == Ordering::Less {
+                        break;
+                    }
+                    // The box's next update, or one it has already.
+                    if let Some((gap_info, gap_update)) = gap.updates.pop_front()
+                        && order == Ordering::Equal
+                    {
+                        entry.pts = gap_info.pts;
+                        // possible gap can only be resolve if new update closed
+                        // the gap - this has already updated its deadline if so.
+                        result.push((gap_update, mk_state(gap_info.into())));
+                    }
                 }
-                if !gap.updates.is_empty() {
-                    gap_deadline = Some(gap.deadline);
-                    entry.possible_gap = Some(gap);
-                }
+                held = !gap.updates.is_empty();
+            }
+            if !held {
+                entry.possible_gap = None;
             }
         });
 
@@ -1027,13 +1039,10 @@ impl MessageBoxes {
         if applied && !matches!(key, Key::Channel(_)) {
             self.heard_from_account(now);
         }
-        match gap_deadline {
-            Some(deadline) => {
-                self.arm(deadline);
-                true
-            }
-            None => false,
+        if let Some(deadline) = opened {
+            self.arm(deadline);
         }
+        held
     }
 
     /// Check the updates postponed while their box got its difference against the state the
@@ -1051,7 +1060,7 @@ impl MessageBoxes {
         now: Now,
         result: &mut Vec<(tl::enums::Update, State)>,
     ) {
-        postponed.sort_by_key(|(info, _)| info.start());
+        postponed.sort_by_key(|(info, _)| info.order());
         for (info, update) in postponed {
             // This check alone drops every later update of a box once one doesn't follow on: a
             // box's `pts` moves only through its own updates, which come in `start` order, so
