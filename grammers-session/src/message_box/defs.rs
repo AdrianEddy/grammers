@@ -60,19 +60,22 @@ pub(super) const POSSIBLE_GAP_TIMEOUT: Duration = Duration::from_millis(500);
 /// decide ([`MessageBoxes::begin_channel_difference`]).
 pub(super) const NO_UPDATES_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
-/// How long a box waits to get its difference again after it ended for a temporary reason: a
-/// channel's ([`super::PrematureEndReason::TemporaryServerIssues`]) or the account's
-/// ([`MessageBoxes::end_account_difference`]). The wait doubles with each failure in a row, up to
-/// [`RETRY_MAX`], and starts over once the server answers. These are tdesktop's
-/// (`failDifferenceStartTimerFor`, the account's and each channel's), with no jitter, so the
-/// message boxes stay deterministic and reproducible. A fixed schedule keeps clients' failures as
-/// correlated as they began rather than spreading them: a caller's jittered reconnect spreads
-/// those of the network path, but not failures the server answers many clients with at once,
-/// which then stay in step. TDLib jitters: the account waits 1 s doubling to 32 s, then a random
-/// 60 to 80 s at its cap (`schedule_get_difference`); a channel waits each step ±20 %, the step
-/// at its cap itself a random 60 to 80 s (`retry_get_channel_difference_later`).
+/// The first step of the backoff before a box gets its difference again after it ended for a
+/// temporary reason: a channel's ([`super::PrematureEndReason::TemporaryServerIssues`]) or the
+/// account's ([`MessageBoxes::end_account_difference`]). The step doubles with each failure in a
+/// row, up to [`RETRY_MAX`], and starts over once the server answers: tdesktop's steps
+/// (`failDifferenceStartTimerFor`, the account's and each channel's), each the wait unless the
+/// caller seeds the jitter ([`MessageBoxes::seed_retry_jitter`]). Seeded, the waits spread as
+/// TDLib's do, so that clients a server failed at once don't retry in step: a random wait of
+/// [`RETRY_MAX`] to [`RETRY_MAX`] plus [`RETRY_CAP_SPREAD`] at the cap (TDLib's 60 to 80 s,
+/// `schedule_get_difference` and `retry_get_channel_difference_later`), and below it a channel's
+/// wait within 20 % of its step either way (`retry_get_channel_difference_later`), the account's
+/// exact (`schedule_get_difference`).
 pub(super) const RETRY_MIN: Duration = Duration::from_secs(1);
+/// The backoff's cap ([`RETRY_MIN`]).
 pub(super) const RETRY_MAX: Duration = Duration::from_secs(64);
+/// How much a seeded wait at the cap adds to [`RETRY_MAX`], at most: 64 to 80 s ([`RETRY_MIN`]).
+pub(super) const RETRY_CAP_SPREAD: Duration = Duration::from_secs(16);
 
 /// A sortable [`MessageBox`] entry key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -100,8 +103,8 @@ pub(super) struct LiveEntry {
     /// [`MessageBoxes::account_retry_at`].
     pub(super) retry_at: Option<Now>,
 
-    /// The channel's last wait before getting its difference again ([`RETRY_MIN`]): zero until
-    /// its difference fails, and again once the server answers.
+    /// The channel's last backoff step before getting its difference again ([`RETRY_MIN`]): zero
+    /// until its difference fails, and again once the server answers.
     pub(super) retry_delay: Duration,
 
     /// Updates for the channel that arrived while it got its difference, held until the difference
@@ -148,9 +151,14 @@ pub struct MessageBoxes {
     /// failure, and once its `pts` is restored ([`MessageBoxes::restore_pts`]).
     pub(super) account_retry_at: Option<Now>,
 
-    /// The account's last wait before getting its difference again ([`RETRY_MIN`]): zero until its
-    /// difference ends unanswered, and again once the server answers one or restores its `pts`.
+    /// The account's last backoff step before getting its difference again ([`RETRY_MIN`]): zero
+    /// until its difference ends unanswered, and again once the server answers one or restores its
+    /// `pts`.
     pub(super) account_retry_delay: Duration,
+
+    /// The state of the retries' jitter ([`MessageBoxes::seed_retry_jitter`]), a SplitMix64's;
+    /// `None` until the caller seeds it, the waits exact meanwhile.
+    pub(super) retry_rng: Option<u64>,
 
     /// Updates for the account's boxes that arrived while the account got its difference, held
     /// until the difference ends ([`MessageBoxes::process_updates`]). Both boxes always get it

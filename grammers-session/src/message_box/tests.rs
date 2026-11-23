@@ -244,6 +244,33 @@ fn common_delta(pts: i32, date: i32, seq: i32) -> StateDelta {
     }
 }
 
+/// The seed the tests of a jittered retry give [`MessageBoxes::seed_retry_jitter`].
+const SEED: u64 = 0x5EED;
+
+/// Check `wait` is a seeded wait of the account's retry at backoff step `step` (seconds): the step
+/// itself below the cap, 64 to 80 s at it.
+fn assert_account_wait(wait: Duration, step: u64) {
+    if step < 64 {
+        assert_eq!(wait, Duration::from_secs(step));
+    } else {
+        assert!(
+            (Duration::from_secs(64)..=Duration::from_secs(80)).contains(&wait),
+            "{wait:?} at the cap"
+        );
+    }
+}
+
+/// Check `wait` is a seeded wait of a channel's retry at backoff step `step` (seconds): within
+/// 20 % of the step either way below the cap, 64 to 80 s at it.
+fn assert_channel_wait(wait: Duration, step: u64) {
+    let range = if step < 64 {
+        Duration::from_millis(step * 800)..=Duration::from_millis(step * 1200)
+    } else {
+        Duration::from_secs(64)..=Duration::from_secs(80)
+    };
+    assert!(range.contains(&wait), "{wait:?} at step {step} s");
+}
+
 #[test]
 fn test_connect_flow_empty() {
     let state = UpdatesState {
@@ -1938,30 +1965,29 @@ fn temporary_channel_failure_retries_with_backoff() {
         account: false,
         channels: 1,
     };
-    let secs = Duration::from_secs;
 
-    // Each failure in a row waits twice as long as the one before, up to 64 s.
+    // Each failure in a row steps twice as far as the one before, up to 64 s; seeded, each wait
+    // within 20 % of its step, and 64 to 80 s at the cap.
+    message_boxes.seed_retry_jitter(SEED);
     let mut now = T0;
     assert!(message_boxes.begin_channel_difference(CHANNEL));
     fail(&mut message_boxes, now);
-    for wait in [1, 2, 4, 8, 16, 32, 64, 64] {
+    for step in [1, 2, 4, 8, 16, 32, 64, 64] {
         let due = time_of_next_difference(&mut message_boxes, now);
-        assert_eq!(due, now + secs(wait));
+        assert_channel_wait(due - now, step);
         assert_eq!(message_boxes.difference_pending(), pending);
         now = due;
         fail(&mut message_boxes, now);
     }
 
-    // The server answers: the next failure waits 1 s again.
+    // The server answers: the next failure steps 1 s again.
     now = time_of_next_difference(&mut message_boxes, now);
     message_boxes.apply_channel_difference(CHANNEL, channel_difference_empty(20), now);
     assert!(message_boxes.begin_channel_difference(CHANNEL));
     fail(&mut message_boxes, now);
-    assert_eq!(
-        time_of_next_difference(&mut message_boxes, now),
-        now + secs(1)
-    );
-    now += secs(1);
+    let due = time_of_next_difference(&mut message_boxes, now);
+    assert_channel_wait(due - now, 1);
+    now = due;
     fail(&mut message_boxes, now);
 
     // An answer that isn't final counts as well: the server works again.
@@ -1982,7 +2008,7 @@ fn temporary_channel_failure_retries_with_backoff() {
     );
     assert_eq!(message_boxes.difference_pending(), pending);
     fail(&mut message_boxes, now);
-    assert_eq!(message_boxes.check_deadlines(now), now + secs(1));
+    assert_channel_wait(message_boxes.check_deadlines(now) - now, 1);
 
     // The next difference to fall due is the account's idle one, at `account_due`: no channel
     // retry is left. It ends empty, which restarts the account's deadline.
@@ -2025,10 +2051,7 @@ fn temporary_channel_failure_retries_with_backoff() {
     fail(&mut message_boxes, now);
     assert!(message_boxes.begin_channel_difference(CHANNEL));
     fail(&mut message_boxes, now);
-    assert_eq!(
-        time_of_next_difference(&mut message_boxes, now),
-        now + secs(2)
-    );
+    assert_channel_wait(time_of_next_difference(&mut message_boxes, now) - now, 2);
 }
 
 // The property test: a simulated server, a lossy and reordering socket, and the client's
@@ -3083,3 +3106,4 @@ fn new_session_is_a_gap() {
 mod account_difference;
 mod channel_pts;
 mod qts;
+mod retry_jitter;

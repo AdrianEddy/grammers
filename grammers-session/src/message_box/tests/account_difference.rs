@@ -48,13 +48,15 @@ fn account_pending() -> DiffPending {
 #[test]
 fn unanswered_account_difference_is_retried_after_a_backoff() {
     let mut message_boxes = getting_account_difference(T0);
+    // Seeded: the waits at the cap are 64 to 80 s.
+    message_boxes.seed_retry_jitter(SEED);
 
     let mut now = T0;
-    for delay in [1, 2, 4, 8, 16, 32, 64, 64] {
+    for step in [1, 2, 4, 8, 16, 32, 64, 64] {
         assert!(message_boxes.end_account_difference(now).is_empty());
         assert_eq!(message_boxes.difference_pending(), DiffPending::default());
         let due = time_of_next_difference(&mut message_boxes, now);
-        assert_eq!(due, now + Duration::from_secs(delay));
+        assert_account_wait(due - now, step);
         assert_eq!(
             message_boxes.get_difference(),
             Some(get_difference(10, 100, 50))

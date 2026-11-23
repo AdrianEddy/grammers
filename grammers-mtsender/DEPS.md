@@ -44,6 +44,12 @@ clock (`test-util`) to fire the ping timer without waiting.
 
 Used for input and output buffers.
 
+## getrandom
+
+Used to seed the jitter of the update difference's retries (`MessageBoxes::seed_retry_jitter`) from
+the operating system's randomness, so that this client's retries don't keep in step with other
+clients' after a failure the server answered many of them with.
+
 ## tracing
 
 Used to log what's going on during the lifetime of the sender.

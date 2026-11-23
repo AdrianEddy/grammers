@@ -63,6 +63,7 @@
 
 mod adaptor;
 mod defs;
+mod retry;
 #[cfg(test)]
 mod tests;
 
@@ -74,11 +75,12 @@ pub use defs::{
     CommonState, DiffPending, Gap, MessageBox, MessageBoxes, Now, State, StateDelta,
     UpdateAndPeers, UpdatesLike,
 };
-use defs::{DirtySet, Key, RETRY_MAX, RETRY_MIN};
+use defs::{DirtySet, Key};
 use defs::{
     LiveEntry, NO_DATE, NO_PTS, NO_SEQ, POSSIBLE_GAP_TIMEOUT, PossibleGap, PtsInfo, WrongPts,
 };
 use grammers_tl_types as tl;
+use retry::Spread;
 use tracing::{debug, info, trace, warn};
 
 use crate::types::{ChannelState, UpdatesState};
@@ -167,6 +169,7 @@ impl MessageBoxes {
             account_deadline: Duration::MAX,
             account_retry_at: None,
             account_retry_delay: Duration::ZERO,
+            retry_rng: None,
             account_postponed: Vec::new(),
             postponed_seq: Vec::new(),
             // No deadline is armed: the first `check_deadlines` computes the next one.
@@ -218,6 +221,7 @@ impl MessageBoxes {
             account_deadline,
             account_retry_at: None,
             account_retry_delay: Duration::ZERO,
+            retry_rng: None,
             account_postponed: Vec::new(),
             postponed_seq: Vec::new(),
             next_deadline: Duration::ZERO,
@@ -1249,7 +1253,8 @@ impl MessageBoxes {
     /// (`on_failed_get_difference`), as tdesktop does (`differenceFail`).
     ///
     /// The account's state is kept, and its difference is due again after a backoff: 1 second
-    /// after the first unanswered end in a row, doubling with each one up to 64 seconds, until the
+    /// after the first unanswered end in a row, doubling with each one up to 64 seconds (64 to 80
+    /// with the caller's jitter, [`MessageBoxes::seed_retry_jitter`]), until the
     /// server answers one ([`MessageBoxes::check_deadlines`]), also while channels get their
     /// differences. Meanwhile nothing but the caller's [`MessageBoxes::begin_account_difference`]
     /// begins it, for a reason the retry doesn't cover, such as a new connection: the account's
@@ -1345,8 +1350,9 @@ impl MessageBoxes {
     /// Arm the account's retry ([`MessageBoxes::account_retry_at`]) at the next backoff step from
     /// `now`.
     fn arm_account_retry(&mut self, now: Now) {
-        self.account_retry_delay = (self.account_retry_delay * 2).clamp(RETRY_MIN, RETRY_MAX);
-        let retry_at = now + self.account_retry_delay;
+        let (step, wait) = self.next_retry(self.account_retry_delay, Spread::Account);
+        self.account_retry_delay = step;
+        let retry_at = now + wait;
         self.account_retry_at = Some(retry_at);
         self.arm(retry_at);
     }
@@ -1511,13 +1517,13 @@ impl MessageBoxes {
         let mut result = Vec::new();
         match reason {
             PrematureEndReason::TemporaryServerIssues => {
-                let mut retry_at = None;
-                self.update_entry(key, |entry| {
-                    entry.retry_delay = (entry.retry_delay * 2).clamp(RETRY_MIN, RETRY_MAX);
-                    entry.retry_at = Some(now + entry.retry_delay);
-                    retry_at = entry.retry_at;
-                });
-                if let Some(retry_at) = retry_at {
+                if let Some(entry) = self.entry(key) {
+                    let (step, wait) = self.next_retry(entry.retry_delay, Spread::Channel);
+                    let retry_at = now + wait;
+                    self.update_entry(key, |entry| {
+                        entry.retry_delay = step;
+                        entry.retry_at = Some(retry_at);
+                    });
                     self.arm(retry_at);
                 }
                 // The others aren't held in a possible gap, whose 0.5 s would get the difference
@@ -1559,8 +1565,10 @@ pub enum PrematureEndReason {
     /// such as `PERSISTENT_TIMESTAMP_OUTDATED` or another internal server error.
     ///
     /// The channel state is kept, and its difference is due again after a backoff:
-    /// 1 second after the first failure in a row, doubling with each one up to 64 seconds,
-    /// until the server answers ([`MessageBoxes::check_deadlines`]).
+    /// 1 second after the first failure in a row, doubling with each one up to 64 seconds
+    /// (each within 20 % either way, and 64 to 80 at the cap, with the caller's jitter,
+    /// [`MessageBoxes::seed_retry_jitter`]), until the server answers
+    /// ([`MessageBoxes::check_deadlines`]).
     /// It is due sooner on the channel's next gap or `updateChannelTooLong`,
     /// or when the caller asks for it ([`MessageBoxes::begin_channel_difference`]).
     TemporaryServerIssues,

@@ -97,13 +97,21 @@ impl UpdatesReceiver {
         configuration: UpdatesConfiguration,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let epoch = Instant::now();
-        let message_box = if configuration.catch_up {
+        let mut message_box = if configuration.catch_up {
             MessageBoxes::load(session.updates_state().await?, epoch.elapsed())
         } else {
             // If the user doesn't want to bother with catching up on previous update, start with
             // pristine state instead.
             MessageBoxes::new()
         };
+        // So that the differences' retries don't keep in step with other clients' after a failure
+        // the server answered many of them with. Without randomness, the waits are exact.
+        match getrandom::u64() {
+            Ok(seed) => message_box.seed_retry_jitter(seed),
+            Err(error) => {
+                warn!(%error, "no randomness to jitter the differences' retries with");
+            }
+        }
         // Don't bother getting pristine update state if we're not logged in.
         let should_get_state =
             message_box.is_empty() && session.peer(PeerId::self_user()).await?.is_some();
