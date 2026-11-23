@@ -85,7 +85,10 @@ pub struct RpcError {
 
     /// The ASCII error name, normally in screaming snake case.
     ///
-    /// Digit words are removed from the name and put in the [`RpcError::value`] instead.
+    /// The first word made of digits alone, between underscores, that fits a `u32` is removed from
+    /// the name, with one underscore, and put in the [`RpcError::value`] instead (a word of digits
+    /// past `u32::MAX` stays in the name). Digits within a word are part of the name, as in
+    /// `2FA_CONFIRM_WAIT_X`.
     /// ```
     /// use grammers_mtsender::RpcError;
     /// let rpc_error = RpcError::from(grammers_tl_types::types::RpcError {
@@ -95,7 +98,8 @@ pub struct RpcError {
     /// ```
     pub name: String,
 
-    /// If the error contained an additional integer value, it will be present here and removed from the [`RpcError::name`].
+    /// If the error's name had a word made of digits alone that fits a `u32`, the first one's
+    /// value, which is removed from the [`RpcError::name`].
     /// ```
     /// use grammers_mtsender::RpcError;
     /// let rpc_error = RpcError::from(grammers_tl_types::types::RpcError {
@@ -127,33 +131,44 @@ impl fmt::Display for RpcError {
 
 impl From<tl::types::RpcError> for RpcError {
     fn from(error: tl::types::RpcError) -> Self {
-        // Extract the numeric value in the error, if any
-        if let Some((value, parsed_value)) = error
-            .error_message
-            .split(|c: char| !c.is_ascii_digit())
-            .flat_map(|value| {
-                value
-                    .parse::<u32>()
-                    .map(|parsed_value| (value, parsed_value))
-            })
-            .next()
-        {
-            let mut to_remove = String::with_capacity(1 + value.len());
-            to_remove.push('_');
-            to_remove.push_str(value);
-            Self {
-                code: error.error_code,
-                name: error.error_message.replace(&to_remove, ""),
-                value: Some(parsed_value),
-                caused_by: None,
+        let tl::types::RpcError {
+            error_code: code,
+            error_message: message,
+        } = error;
+        // The value is the first word between underscores made of digits alone that fits a `u32`
+        // (`FLOOD_WAIT_31`, `INTERDC_2_CALL_ERROR`), and the name every other word. A digit within
+        // a word is the name's: `2FA_CONFIRM_WAIT_604800` waits 604800 s, and neither
+        // `P0NY_FLOODWAIT` nor `FLOOD_WAIT_5MIN` carries a value.
+        let mut start = 0;
+        for word in message.split('_') {
+            let end = start + word.len();
+            if !word.is_empty()
+                && word.bytes().all(|b| b.is_ascii_digit())
+                && let Ok(value) = word.parse::<u32>()
+            {
+                // The word goes with the underscore before it, or the one after it if it is first.
+                let (cut_start, cut_end) = if start == 0 {
+                    (0, message.len().min(end + 1))
+                } else {
+                    (start - 1, end)
+                };
+                let mut name = String::with_capacity(message.len() - (cut_end - cut_start));
+                name.push_str(&message[..cut_start]);
+                name.push_str(&message[cut_end..]);
+                return Self {
+                    code,
+                    name,
+                    value: Some(value),
+                    caused_by: None,
+                };
             }
-        } else {
-            Self {
-                code: error.error_code,
-                name: error.error_message.clone(),
-                value: None,
-                caused_by: None,
-            }
+            start = end + 1;
+        }
+        Self {
+            code,
+            name: message,
+            value: None,
+            caused_by: None,
         }
     }
 }
