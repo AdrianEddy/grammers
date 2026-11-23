@@ -3103,6 +3103,7 @@ fn new_session_is_a_gap() {
     assert_eq!(message_boxes.session_state(), loaded_state());
 }
 
+mod account_deadlines;
 mod account_difference;
 mod channel_pts;
 mod qts;

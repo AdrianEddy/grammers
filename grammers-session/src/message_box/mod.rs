@@ -421,19 +421,18 @@ impl MessageBoxes {
     ///
     /// If a deadline expired, the corresponding entries will be marked as needing to get its difference.
     /// While there are entries pending of getting their difference, this method returns `now`, and
-    /// checks only the account's armed retry ([`MessageBoxes::end_account_difference`]).
-    ///
-    /// While that retry is armed, a possible gap of the account's whose half second is over is
-    /// dropped instead, for the retry's difference to return its updates.
+    /// checks only the account's deadlines: its retry after an unanswered end
+    /// ([`MessageBoxes::end_account_difference`]), its boxes' possible gaps and its idle deadline
+    /// don't wait for the channels' differences, while the channels' wait for every difference to
+    /// end. While that retry is armed, it is the account's one deadline to begin its difference: a
+    /// possible gap of the account's whose half second is over is dropped instead, for the retry's
+    /// difference to return its updates.
     pub fn check_deadlines(&mut self, now: Now) -> Now {
         if !self.getting_diff_for.is_empty() {
-            // Channels getting their differences don't hold the account's retry back: once due, it
-            // begins, as tdesktop's and TDLib's retry timers are the account's own.
-            if self
-                .account_retry_at
-                .is_some_and(|retry_at| now >= retry_at)
-            {
-                self.begin_account_difference();
+            // The account's timers are its own, as tdesktop's and TDLib's are: its retry, its
+            // possible gaps and its idle deadline fall due while channels get their differences.
+            if now >= self.next_deadline {
+                self.check_account_deadlines(now);
             }
             return now;
         }
@@ -443,58 +442,22 @@ impl MessageBoxes {
 
         // To avoid hogging up all CPU by sleeping for no duration,
         // if no deadline is armed, the next one is a full timeout away.
-        let mut next_deadline = next_updates_deadline(now);
-        // An armed retry is the account's one deadline to begin its difference
-        // (`account_retry_at`).
-        let retrying = self.account_retry_at.is_some();
-        let mut account_due = match self.account_retry_at {
-            Some(retry_at) => now >= retry_at,
-            None => now >= self.account_deadline,
-        };
-        if account_due && !retrying {
-            debug!("no updates for the account in a while; getting its difference");
-            // Restarted here, not only when the difference ends: if it can't begin (no common
-            // state), the deadline mustn't stay in the past.
-            self.account_deadline = next_deadline;
-        }
-        next_deadline = next_deadline.min(self.account_retry_at.unwrap_or(self.account_deadline));
+        let mut next_deadline = next_updates_deadline(now).min(self.check_account_deadlines(now));
         for entry in &mut self.entries {
+            let Key::Channel(_) = entry.key else {
+                continue;
+            };
             let Some(deadline) = entry.deadline() else {
                 continue;
             };
-            // A possible gap of the account's doesn't begin its difference while the retry is
-            // armed. It holds its updates for its half second, in case the socket fills it, and is
-            // then dropped, for the retry's difference to return them, as beginning the difference
-            // would drop them; held until the retry, it would only grow, sorted on every arrival.
-            // An account box's deadline is its possible gap's alone: the retry is the boxes'.
-            if retrying && !matches!(entry.key, Key::Channel(_)) {
-                if now < deadline {
-                    next_deadline = next_deadline.min(deadline);
-                } else {
-                    debug!(
-                        key = ?entry.key,
-                        "dropping a possible gap's updates; the account's retry returns them"
-                    );
-                    entry.possible_gap = None;
-                }
-                continue;
-            }
             if now < deadline {
                 next_deadline = next_deadline.min(deadline);
                 continue;
             }
             debug!(?entry, "deadline for forcibly fetching updates met");
-            match entry.key {
-                Key::Common | Key::Secondary => account_due = true,
-                // The moral equivalent of `try_begin_get_diff`.
-                Key::Channel(_) => {
-                    entry.begin_difference();
-                    self.getting_diff_for.push(entry.key);
-                }
-            }
-        }
-        if account_due {
-            self.begin_account_difference();
+            // The moral equivalent of `try_begin_get_diff`.
+            entry.begin_difference();
+            self.getting_diff_for.push(entry.key);
         }
         self.next_deadline = next_deadline;
 
@@ -503,6 +466,64 @@ impl MessageBoxes {
         } else {
             now
         }
+    }
+
+    /// Check the account's deadlines at `now`, and begin its difference if one is due: its retry
+    /// while one is armed ([`MessageBoxes::end_account_difference`]), which is then the account's
+    /// one deadline to begin it, else its idle deadline, and its boxes' possible gaps. Return its
+    /// next deadline, `Duration::MAX` while its difference is pending.
+    ///
+    /// While the retry is armed, a possible gap of the account's whose half second is over is
+    /// dropped instead, for the retry's difference to return its updates.
+    fn check_account_deadlines(&mut self, now: Now) -> Now {
+        // Both account boxes always get their difference together (`begin_account_difference`).
+        if self.getting_diff_for.contains(&Key::Common) {
+            return Duration::MAX;
+        }
+        let retrying = self.account_retry_at.is_some();
+        let (mut due, mut next) = match self.account_retry_at {
+            Some(retry_at) => (now >= retry_at, retry_at),
+            None => (now >= self.account_deadline, self.account_deadline),
+        };
+        if due && !retrying {
+            debug!("no updates for the account in a while; getting its difference");
+            // Restarted here, not only when the difference ends: if it can't begin (no common
+            // state), the deadline mustn't stay in the past.
+            self.account_deadline = next_updates_deadline(now);
+            next = self.account_deadline;
+        }
+        // A passed gap of the account's is dropped only while the retry waits: one due with the
+        // retry is left to the difference that begins below.
+        let retry_waits = retrying && !due;
+        for key in [Key::Common, Key::Secondary] {
+            let Ok(entry) = self.find_entry(key) else {
+                continue;
+            };
+            // An account box's deadline is its possible gap's alone: the retry is the boxes'.
+            let Some(deadline) = entry.possible_gap.as_ref().map(|gap| gap.deadline) else {
+                continue;
+            };
+            if now < deadline {
+                next = next.min(deadline);
+            } else if retry_waits {
+                // A possible gap of the account's doesn't begin its difference while the retry
+                // waits. It holds its updates for its half second, in case the socket fills it,
+                // and is then dropped, for the retry's difference to return them, as beginning the
+                // difference would drop them; held until the retry, it would only grow.
+                debug!(
+                    ?key,
+                    "dropping a possible gap's updates; the account's retry returns them"
+                );
+                entry.possible_gap = None;
+            } else {
+                debug!(?entry, "deadline for forcibly fetching updates met");
+                due = true;
+            }
+        }
+        if due && self.begin_account_difference() {
+            return Duration::MAX;
+        }
+        next
     }
 
     /// Sets the update state.
