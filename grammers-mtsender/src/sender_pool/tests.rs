@@ -18,7 +18,8 @@
 //! dialer's permit is shut, which holds nothing else back, dials once the permit comes, and fails
 //! once its wait runs out or the pool quits. A connection that fails gives every request it held
 //! its error, cause and all. No pool here reaches anything but in-memory streams: every dial is
-//! refused ([`RefusingDialer`]).
+//! refused ([`RefusingDialer`]). Other modules' tests drive a handle whose runner is a script
+//! ([`scripted`]), as the handle's channel and its requests are this module's alone.
 
 use std::num::NonZeroUsize;
 use std::pin::{Pin, pin};
@@ -1348,4 +1349,39 @@ async fn connection_error_reaches_every_request_it_held_with_its_cause() {
             InvocationError::Io(error) if error.kind() == io::ErrorKind::ConnectionReset
         ));
     }
+}
+
+/// What [`scripted`]'s runner answers a request with, by its body.
+pub(crate) type Script = dyn Fn(&[u8]) -> Result<Vec<u8>, InvocationError> + Send + Sync;
+
+/// The requests [`scripted`]'s runner took: each one's constructor, and when it came.
+pub(crate) type Calls = Arc<Mutex<Vec<(u32, tokio::time::Instant)>>>;
+
+/// A handle whose runner is `script`: each request is answered with what it says, and recorded by
+/// its constructor and when it came; a failed one is never retried, and a disconnect is told at
+/// once. For the tests of what drives a pool through its handle (the updates receiver's), which
+/// reach neither the handle's channel nor the requests it carries.
+pub(crate) fn scripted(script: Box<Script>) -> (SenderPoolHandle, Calls) {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let calls: Calls = Arc::default();
+    let seen = Arc::clone(&calls);
+    tokio::spawn(async move {
+        while let Some(request) = rx.recv().await {
+            match request {
+                Request::Invoke { body, tx, .. } => {
+                    let id = u32::from_le_bytes(body[..4].try_into().unwrap());
+                    seen.lock().unwrap().push((id, tokio::time::Instant::now()));
+                    let _ = tx.send(script(&body));
+                }
+                Request::CheckRetry { error, tx, .. } => {
+                    let _ = tx.send(ControlFlow::Break(error));
+                }
+                Request::Disconnect { done, .. } => {
+                    let _ = done.send(());
+                }
+                Request::Quit => break,
+            }
+        }
+    });
+    (SenderPoolHandle(tx), calls)
 }

@@ -1273,4 +1273,4 @@ impl fmt::Debug for Request {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

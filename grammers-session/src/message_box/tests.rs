@@ -3115,6 +3115,7 @@ fn new_session_is_a_gap() {
 
 mod account_deadlines;
 mod account_difference;
+mod account_state;
 mod channel_deadlines;
 mod channel_pts;
 mod connection_signals;

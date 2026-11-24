@@ -388,9 +388,19 @@ impl MessageBoxes {
         self.entry(Key::Channel(channel_id)).map(|entry| entry.pts)
     }
 
-    /// Return true if the message box is empty and has no state yet.
+    /// Return true if the message boxes hold no box at all: neither the account's state
+    /// ([`MessageBoxes::has_account_state`]) nor the secondary box's or any channel's.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Whether the message boxes hold the account's update state, its common box's `pts`, which
+    /// the account's difference is asked from: set by [`MessageBoxes::set_state`], or loaded with
+    /// it ([`MessageBoxes::load`]). A state loaded without a `pts`, the secondary box's `qts` or
+    /// channels' boxes alone, holds none, and [`MessageBoxes::set_state`] then sets it, keeping
+    /// the channels' boxes.
+    pub fn has_account_state(&self) -> bool {
+        self.entry(Key::Common).is_some()
     }
 
     /// Return what the message boxes advanced since the previous call, or since they were
@@ -578,10 +588,12 @@ impl MessageBoxes {
     /// Should be called right after login if [`MessageBoxes::new`] was used, otherwise undesirable
     /// updates will be fetched.
     ///
-    /// Should only be called while [`MessageBoxes::is_empty`].
+    /// Should only be called without the account's state ([`MessageBoxes::has_account_state`]).
+    /// The channels' boxes the message boxes hold already are kept, each at its own `pts`; the
+    /// secondary box takes the state's `qts`.
     pub fn set_state(&mut self, state: tl::types::updates::State, now: Now) {
         trace!(?state, "setting state");
-        debug_assert!(self.is_empty());
+        debug_assert!(!self.has_account_state());
         self.set_entry(LiveEntry::new(Key::Common, state.pts));
         self.set_entry(LiveEntry::new(Key::Secondary, state.qts));
         self.set_date_seq(state.date, state.seq);

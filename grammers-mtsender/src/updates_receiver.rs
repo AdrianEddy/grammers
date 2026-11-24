@@ -112,9 +112,10 @@ impl UpdatesReceiver {
                 warn!(%error, "no randomness to jitter the differences' retries with");
             }
         }
-        // Don't bother getting pristine update state if we're not logged in.
+        // Don't bother getting pristine update state if we're not logged in. Without the
+        // account's state (its `pts`), loaded channels or a `qts` alone are no state to start from.
         let should_get_state =
-            message_box.is_empty() && session.peer(PeerId::self_user()).await?.is_some();
+            !message_box.has_account_state() && session.peer(PeerId::self_user()).await?.is_some();
 
         Ok(UpdatesReceiver {
             handle,
@@ -144,17 +145,7 @@ impl UpdatesReceiver {
             self.should_get_state = false;
             match self.invoke(&tl::functions::updates::GetState {}).await {
                 Ok(tl::enums::updates::State::State(state)) => {
-                    session
-                        .clone()
-                        .set_update_state(UpdateState::All(UpdatesState {
-                            pts: state.pts,
-                            qts: state.qts,
-                            date: state.date,
-                            seq: state.seq,
-                            channels: Vec::new(),
-                        }))
-                        .await?;
-                    self.message_box.set_state(state, self.now());
+                    self.set_account_state(state).await?;
                 }
                 Err(_err) => {
                     // The account may no longer actually be logged in, or it can rarely fail.
@@ -278,6 +269,28 @@ impl UpdatesReceiver {
         self.epoch.elapsed()
     }
 
+    /// Sets the account's update state, `updates.getState`'s `state`, in the session and in the
+    /// message boxes, which keep the channels' boxes they loaded without it (a stored state of no
+    /// `pts`): the session stores those with it, so the state it holds stays the boxes'.
+    async fn set_account_state(
+        &mut self,
+        state: tl::types::updates::State,
+    ) -> Result<(), InvocationError> {
+        let channels = self.message_box.session_state().channels;
+        self.session
+            .clone()
+            .set_update_state(UpdateState::All(UpdatesState {
+                pts: state.pts,
+                qts: state.qts,
+                date: state.date,
+                seq: state.seq,
+                channels,
+            }))
+            .await?;
+        self.message_box.set_state(state, self.now());
+        Ok(())
+    }
+
     async fn invoke<R: tl::RemoteCall>(&self, request: &R) -> Result<R::Return, InvocationError> {
         let dc_id = self.session.clone().home_dc_id()?;
         self.handle
@@ -301,3 +314,6 @@ impl UpdatesReceiver {
         self.buffer.push_back((updates, users, chats));
     }
 }
+
+#[cfg(test)]
+mod tests;
