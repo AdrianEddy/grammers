@@ -13,10 +13,11 @@
 //! transport error code fails a request as a transport error. A dial gives up on an address that
 //! never answers and tries the next, and a SOCKS5 dial's error names the proxy and says its cause
 //! once. A connection that makes a new key stores it before anything goes out under it, and the
-//! store's time takes none of the connect's. A connection the server sends nothing on after a
-//! keepalive ping fails after the pong timeout, which runs from the write of the ping's packet. The
-//! tests play the server on in-memory streams (the handshake's half too, `handshake`), and the
-//! proxy on loopback; nothing leaves the machine.
+//! store's time takes none of the connect's. The home connection says it opened before its first
+//! request goes out, and another datacenter's doesn't. A connection the server sends nothing on
+//! after a keepalive ping fails after the pong timeout, which runs from the write of the ping's
+//! packet. The tests play the server on in-memory streams (the handshake's half too,
+//! `handshake`), and the proxy on loopback; nothing leaves the machine.
 
 mod handshake;
 
@@ -36,6 +37,7 @@ use grammers_mtsender::{
 };
 use grammers_session::storages::MemorySession;
 use grammers_session::types::{DcOption, PeerId, PeerInfo, UpdateState, UpdatesState};
+use grammers_session::updates::UpdatesLike;
 use grammers_session::{BoxFuture, Session};
 use grammers_tl_types::{self as tl, Deserializable, Serializable};
 use sha2::{Digest, Sha256};
@@ -1169,6 +1171,66 @@ async fn key_made_after_a_404_is_stored_before_anything_goes_out_under_it() {
 
     assert!(pool.handle.quit());
     runner.await.unwrap();
+}
+
+/// The home connection says it opened once `initConnection` is answered, before any request goes
+/// to it, so the open is in the updates channel by the time its first request reaches the server,
+/// and its close comes after it; a connection to another datacenter, which the account's updates
+/// don't come on, says neither.
+#[tokio::test]
+async fn the_home_connection_opens_before_its_first_request() {
+    let session = Arc::new(MemorySession::default());
+    for dc in [2, 4] {
+        let mut option = session.dc_option(dc).unwrap().unwrap();
+        option.auth_key = Some(AUTH_KEY);
+        session.set_dc_option(&option).await.unwrap();
+    }
+    let (dialer, mut servers) = TestDialer::new(1 << 16);
+    let SenderPool {
+        runner,
+        handle,
+        mut updates,
+    } = SenderPool::with_configuration(Arc::clone(&session), 1, params(dialer, Vec::new()));
+    let runner = tokio::spawn(runner.run());
+    for dc in [2, 4] {
+        let caller = handle.clone();
+        let call = tokio::spawn(async move {
+            caller
+                .invoke_in_dc(dc, &tl::functions::help::GetNearestDc {})
+                .await
+        });
+        let mut server = servers.recv().await.unwrap();
+        server
+            .answer_encrypted(&config(Vec::new()).to_bytes())
+            .await;
+        // The connection's next packet (the request, the answer's ack) goes once the open is in.
+        server.read_packet().await;
+        let opened = updates.try_recv();
+        if dc == 2 {
+            assert!(
+                matches!(opened, Ok(UpdatesLike::ConnectionOpened)),
+                "{opened:?}"
+            );
+        } else {
+            assert!(opened.is_err(), "{opened:?}");
+        }
+        // The server hangs up: the request fails with its connection.
+        drop(server);
+        assert!(call.await.unwrap().is_err());
+        if dc == 2 {
+            let closed = timeout(Duration::from_secs(10), updates.recv())
+                .await
+                .unwrap();
+            assert!(
+                matches!(closed, Some(UpdatesLike::ConnectionClosed)),
+                "{closed:?}"
+            );
+        }
+    }
+    assert!(handle.quit());
+    runner.await.unwrap();
+    // Datacenter 4's connection said nothing of its end either.
+    assert!(updates.try_recv().is_err());
 }
 
 /// A [`MemorySession`] whose write of a new authorization key takes [`SlowKeys::DELAY`].

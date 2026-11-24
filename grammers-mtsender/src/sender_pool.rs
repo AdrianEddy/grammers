@@ -20,9 +20,9 @@
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use std::num::NonZeroU32;
 use std::ops::{ControlFlow, Deref};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
-use std::{fmt, io, panic};
+use std::{fmt, io, mem, panic};
 
 use grammers_mtproto::{MAX_REQUEST_SIZE, mtp, transport};
 use grammers_session::Session;
@@ -100,8 +100,6 @@ struct ConnectionEnd {
     /// The error that ended the connection, or `None` if the runner closed it: it dropped its end
     /// of the channel ([`SenderPoolHandle::disconnect_from_dc`], or the pool quitting).
     error: Option<ReadError>,
-    /// The gap signal the updates channel is still owed ([`UpdatesForwarder::finish`]).
-    owed_signal: Option<UpdatesLike>,
 }
 
 /// A fat [`SenderPoolHandle`] with additional metadata from its attached [`SenderPoolRunner`].
@@ -142,6 +140,29 @@ pub struct SenderPool {
     ///
     /// Update handling must be processed in a sequential manner,
     /// so this is a separate instance with no way to clone it.
+    ///
+    /// Besides the updates, it carries what the receiver needs to know of the connections:
+    ///
+    /// - [`UpdatesLike::ConnectionOpened`] once a connection to the home datacenter, which the
+    ///   account's updates come on, has its `initConnection` answered, before any request goes to
+    ///   it, and [`UpdatesLike::ConnectionClosed`] once such a connection fails. The opens and the
+    ///   closes come in the order they happened, each behind the signals before it, also while the
+    ///   channel is full, so the last of them the receiver has read says whether the home
+    ///   connection is up. While the channel is full they are owed, and the receiver then reads
+    ///   what it would have made of them one by one: a close takes the place of an open it follows
+    ///   (that connection ended before the receiver heard of it), and of a
+    ///   [`UpdatesLike::Lagged`] (both make it fetch the difference); an open goes after them.
+    /// - [`UpdatesLike::NewSession`] when the server starts a new session on a home connection
+    ///   that is up. A connection's first session, which the answer to the pool's own
+    ///   `initConnection` creates, isn't forwarded: the pool reads no update of that call.
+    /// - [`UpdatesLike::Lagged`] when updates were dropped because the channel was full.
+    ///
+    /// The updates aren't ordered against the signals owed: a connection's updates can be read
+    /// before its open while that is owed, or before the close owed for the connection before
+    /// it. The message boxes order the updates by their `pts`, `qts` and `seq`.
+    ///
+    /// A connection the runner drops on request ([`SenderPoolHandle::disconnect_from_dc`], or the
+    /// pool quitting) gets no close: its caller knows it is gone, and no gap is owed for it.
     pub updates: mpsc::Receiver<UpdatesLike>,
 }
 
@@ -153,13 +174,12 @@ pub struct SenderPoolRunner {
     api_id: i32,
     connection_params: ConnectionParams,
     request_rx: mpsc::UnboundedReceiver<Request>,
-    updates_tx: mpsc::Sender<UpdatesLike>,
+    /// The updates channel's sender, and the connection signals it is owed, which the
+    /// connections' tasks share.
+    signals: ConnectionSignals,
     connections: Vec<ConnectionInfo>,
     /// The connections' tasks, each ending with what it hands back ([`ConnectionEnd`]).
     connection_pool: JoinSet<ConnectionEnd>,
-    /// A gap signal an ended connection owed the updates channel, sent once it has room. One
-    /// covers any number: each makes the receiver fetch the difference.
-    owed_signal: Option<UpdatesLike>,
 }
 
 impl Deref for SenderPoolFatHandle {
@@ -330,10 +350,9 @@ impl SenderPool {
                 api_id,
                 connection_params,
                 request_rx,
-                updates_tx,
+                signals: ConnectionSignals::new(updates_tx),
                 connections: Vec::new(),
                 connection_pool: JoinSet::new(),
-                owed_signal: None,
             },
             handle: SenderPoolFatHandle {
                 thin: SenderPoolHandle(request_tx),
@@ -360,9 +379,6 @@ impl SenderPoolRunner {
                         .retain(|connection| !connection.rpc_tx.is_closed());
                     match completion {
                         Ok(end) => {
-                            if let Some(signal) = end.owed_signal {
-                                self.owed_signal.get_or_insert(signal);
-                            }
                             for mut rpc in end.unsent {
                                 match &end.error {
                                     // Its second connection ended before taking it too.
@@ -383,7 +399,8 @@ impl SenderPoolRunner {
                         }
                     }
                 }
-                () = send_owed_signal(&self.updates_tx, &mut self.owed_signal), if self.owed_signal.is_some() => {}
+                // A connection's task owes its signal as it ends, so the join above wakes this.
+                () = self.signals.send_owed(), if self.signals.owes() => {}
                 request = self.request_rx.recv() => {
                     let flow = if let Some(request) = request {
                         self.process_request(request).await
@@ -488,13 +505,19 @@ impl SenderPoolRunner {
         // server gave.
         let sender = self.connect_sender(&dc_option).await?;
 
+        // The account's updates come on the home connection, which says it is up before anything
+        // goes to it, behind the signals the connections before it owe.
+        let home_sender = dc_id == self.session.home_dc_id()?;
+        if home_sender {
+            self.signals.send(Signal::Opened);
+        }
         let (rpc_tx, rpc_rx) = mpsc::unbounded_channel();
         self.connection_pool.spawn(run_sender(
             dc_id,
             sender,
             rpc_rx,
-            UpdatesForwarder::new(self.updates_tx.clone()),
-            dc_id == self.session.home_dc_id()?,
+            UpdatesForwarder::new(self.signals.clone()),
+            home_sender,
         ));
         Ok(self.connections.push_mut(ConnectionInfo { dc_id, rpc_tx }))
     }
@@ -676,12 +699,128 @@ impl SetupBudget {
     }
 }
 
-/// Wait for room in `updates`, then send it the `owed` signal. Without a receiver, the signal has
-/// nobody to reach, and is dropped.
-async fn send_owed_signal(updates: &mpsc::Sender<UpdatesLike>, owed: &mut Option<UpdatesLike>) {
-    let permit = updates.reserve().await;
-    if let (Ok(permit), Some(signal)) = (permit, owed.take()) {
-        permit.send(signal);
+/// A signal of the connections for the updates channel ([`SenderPool::updates`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Signal {
+    /// A home connection opened: [`UpdatesLike::ConnectionOpened`].
+    Opened,
+    /// A home connection failed: [`UpdatesLike::ConnectionClosed`], a gap.
+    Closed,
+    /// An ended connection dropped updates the channel had no room for: [`UpdatesLike::Lagged`].
+    Lagged,
+}
+
+impl Signal {
+    /// What the receiver reads of it.
+    fn updates(self) -> UpdatesLike {
+        match self {
+            Signal::Opened => UpdatesLike::ConnectionOpened,
+            Signal::Closed => UpdatesLike::ConnectionClosed,
+            Signal::Lagged => UpdatesLike::Lagged,
+        }
+    }
+}
+
+/// The connection signals the updates channel is owed, as what the receiver makes of them: a gap
+/// signal, then an open. They are owed only while the channel is full, or while others are owed,
+/// so the opens and the closes reach the receiver in the order they happened. Each takes what it
+/// covers of those before it ([`Owed::add`]), so at most two are ever owed, however long the
+/// receiver doesn't read: it acts only on whether to fetch the difference and on whether the home
+/// connection is up, and these two keep both.
+#[derive(Debug, Default)]
+struct Owed {
+    /// [`Signal::Closed`] or [`Signal::Lagged`], never [`Signal::Opened`].
+    gap: Option<Signal>,
+    /// A home connection opened after it.
+    opened: bool,
+}
+
+impl Owed {
+    fn is_empty(&self) -> bool {
+        self.gap.is_none() && !self.opened
+    }
+
+    /// Owe `signal` with those owed: a close takes the place of an owed open, whose connection
+    /// ended before the receiver heard of it, and of an owed `Lagged` (both make it fetch the
+    /// difference); an open goes after the gap; a `Lagged` an owed gap covers adds nothing, and
+    /// one that finds only an open owed goes ahead of it, so the open is still the last
+    /// connection signal the receiver reads.
+    fn add(&mut self, signal: Signal) {
+        match signal {
+            Signal::Opened => self.opened = true,
+            Signal::Closed => {
+                self.opened = false;
+                self.gap = Some(Signal::Closed);
+            }
+            Signal::Lagged => {
+                self.gap.get_or_insert(Signal::Lagged);
+            }
+        }
+    }
+
+    /// The first signal owed, no longer owed.
+    fn take(&mut self) -> Option<UpdatesLike> {
+        match self.gap.take() {
+            Some(gap) => Some(gap.updates()),
+            None => mem::take(&mut self.opened).then_some(UpdatesLike::ConnectionOpened),
+        }
+    }
+}
+
+/// The updates channel's sender, with the connection signals it is owed, shared by the runner,
+/// which sends the opens and what is owed, and the connections' tasks, which owe how they ended
+/// ([`UpdatesForwarder::finish`]). Every signal goes behind those owed, so the opens and the
+/// closes keep their order whichever side sends them: the runner makes a connection to a
+/// datacenter only once the one before it has stopped taking requests, which it does after it
+/// has owed its end.
+#[derive(Clone)]
+struct ConnectionSignals {
+    tx: mpsc::Sender<UpdatesLike>,
+    /// Never locked across an `.await`.
+    owed: Arc<Mutex<Owed>>,
+}
+
+impl ConnectionSignals {
+    fn new(tx: mpsc::Sender<UpdatesLike>) -> Self {
+        Self {
+            tx,
+            owed: Arc::default(),
+        }
+    }
+
+    /// No section panics midway, so a poisoned lock still guards a whole state.
+    fn owed(&self) -> MutexGuard<'_, Owed> {
+        self.owed.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Send `signal` at once if nothing is owed and the channel has room, or else owe it.
+    fn send(&self, signal: Signal) {
+        let mut owed = self.owed();
+        if owed.is_empty() {
+            match self.tx.try_send(signal.updates()) {
+                Ok(()) | Err(TrySendError::Closed(_)) => return,
+                Err(TrySendError::Full(_)) => {}
+            }
+        }
+        owed.add(signal);
+    }
+
+    /// Whether a signal is owed.
+    fn owes(&self) -> bool {
+        !self.owed().is_empty()
+    }
+
+    /// Wait for room in the channel, then send the first signal owed. Without a receiver, the
+    /// signals have nobody to reach, and are dropped. Cancelling it loses nothing.
+    async fn send_owed(&self) {
+        match self.tx.reserve().await {
+            Ok(permit) => {
+                if let Some(signal) = self.owed().take() {
+                    permit.send(signal);
+                }
+            }
+            Err(_) => *self.owed() = Owed::default(),
+        }
     }
 }
 
@@ -690,10 +829,11 @@ async fn send_owed_signal(updates: &mpsc::Sender<UpdatesLike>, owed: &mut Option
 /// close `rpc_rx`, so the runner can send it nothing more, and hand back, for the runner to send
 /// on, the requests that never left: those the sender never wrote, when the runner closed the
 /// connection (a failed connection fails them with its error), and those still queued in
-/// `rpc_rx`, which the sender never took. They go with the error that ended the connection and
-/// the gap signal the updates channel is still owed ([`ConnectionEnd`]). A request whose caller
-/// no longer waits, such as a keepalive ping, is dropped instead: sent on, it could only make a
-/// new connection for nobody.
+/// `rpc_rx`, which the sender never took. They go with the error that ended the connection
+/// ([`ConnectionEnd`]), after the signal its end owes the updates channel
+/// ([`UpdatesForwarder::finish`]), which goes behind every signal before it. A request whose
+/// caller no longer waits, such as a keepalive ping, is dropped instead: sent on, it could only
+/// make a new connection for nobody.
 ///
 /// A new session ([`UpdatesLike::NewSession`]) is a gap in the account's updates only on the home
 /// connection, which they come on, so only the home sender forwards it, as only it reports its
@@ -705,7 +845,7 @@ async fn run_sender<T: transport::Transport, M: mtp::Mtp>(
     mut updates: UpdatesForwarder,
     home_sender: bool,
 ) -> ConnectionEnd {
-    let (owed_signal, error) = loop {
+    let error = loop {
         tokio::select! {
             // The channel first: once the runner closes it, what is still in it reaches the
             // sender and goes back unwritten (`Sender::close`), and a burst is serialized
@@ -715,7 +855,10 @@ async fn run_sender<T: transport::Transport, M: mtp::Mtp>(
             biased;
             rpc = rpc_rx.recv() => match rpc {
                 Some(rpc) => sender.enqueue_body(rpc.body, rpc.tx),
-                None => break (updates.finish(false), None),
+                None => {
+                    updates.finish(false);
+                    break None;
+                }
             },
             () = updates.send_lagged(), if updates.owes_lagged() => {}
             step = sender.step() => match step {
@@ -727,7 +870,10 @@ async fn run_sender<T: transport::Transport, M: mtp::Mtp>(
                     }
                 }
                 // `Sender::step` logged the error and failed the requests with it.
-                Err(error) => break (updates.finish(home_sender), Some(error)),
+                Err(error) => {
+                    updates.finish(home_sender);
+                    break Some(error);
+                }
             },
         }
     };
@@ -755,7 +901,6 @@ async fn run_sender<T: transport::Transport, M: mtp::Mtp>(
         dc_id,
         unsent,
         error,
-        owed_signal,
     }
 }
 
@@ -766,7 +911,8 @@ async fn run_sender<T: transport::Transport, M: mtp::Mtp>(
 /// ([`UpdatesForwarder::send_lagged`]), and always before this connection's next update, so the
 /// receiver fetches the difference instead of waiting for the next gap to show.
 struct UpdatesForwarder {
-    tx: mpsc::Sender<UpdatesLike>,
+    /// The channel, and the connection signals it is owed.
+    signals: ConnectionSignals,
     /// Updates were dropped since the last [`UpdatesLike::Lagged`] went out.
     lagged: bool,
     /// The receiver is gone: nothing more is forwarded.
@@ -777,9 +923,9 @@ struct UpdatesForwarder {
 }
 
 impl UpdatesForwarder {
-    fn new(tx: mpsc::Sender<UpdatesLike>) -> Self {
+    fn new(signals: ConnectionSignals) -> Self {
         Self {
-            tx,
+            signals,
             lagged: false,
             closed: false,
             dropped: 0,
@@ -793,7 +939,7 @@ impl UpdatesForwarder {
             return;
         }
         if self.lagged {
-            match self.tx.try_send(UpdatesLike::Lagged) {
+            match self.signals.tx.try_send(UpdatesLike::Lagged) {
                 Ok(()) => self.lagged = false,
                 Err(TrySendError::Full(_)) => {
                     self.count_dropped();
@@ -805,7 +951,7 @@ impl UpdatesForwarder {
                 }
             }
         }
-        match self.tx.try_send(updates) {
+        match self.signals.tx.try_send(updates) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
                 self.lagged = true;
@@ -823,7 +969,7 @@ impl UpdatesForwarder {
     /// Wait for room in the channel, then send the [`UpdatesLike::Lagged`] owed. Call only while
     /// [`Self::owes_lagged`]; cancelling it loses nothing.
     async fn send_lagged(&mut self) {
-        if let Ok(permit) = self.tx.reserve().await {
+        if let Ok(permit) = self.signals.tx.reserve().await {
             permit.send(UpdatesLike::Lagged);
             self.lagged = false;
             return;
@@ -831,21 +977,20 @@ impl UpdatesForwarder {
         self.close();
     }
 
-    /// End forwarding as the connection ends, and return the gap signal the channel is still
-    /// owed, which only the runner can send now. If `closed_connection`, that is an
-    /// [`UpdatesLike::ConnectionClosed`] that found the channel full (it also covers a
-    /// [`UpdatesLike::Lagged`] owed); otherwise, the `Lagged` owed, if one is.
-    fn finish(self, closed_connection: bool) -> Option<UpdatesLike> {
+    /// End forwarding as the connection ends, with the signal its end owes the channel, behind
+    /// every signal before it ([`ConnectionSignals::send`]), which the runner sends once the
+    /// channel has room if it can't go now: if `closed_connection`, an
+    /// [`UpdatesLike::ConnectionClosed`] (it also covers a [`UpdatesLike::Lagged`] owed);
+    /// otherwise, the `Lagged` owed, if one is.
+    fn finish(self, closed_connection: bool) {
         if self.closed {
-            return None;
+            return;
         }
         if closed_connection {
-            return match self.tx.try_send(UpdatesLike::ConnectionClosed) {
-                Ok(()) | Err(TrySendError::Closed(_)) => None,
-                Err(TrySendError::Full(signal)) => Some(signal),
-            };
+            self.signals.send(Signal::Closed);
+        } else if self.lagged {
+            self.signals.send(Signal::Lagged);
         }
-        self.lagged.then_some(UpdatesLike::Lagged)
     }
 
     fn count_dropped(&mut self) {
@@ -855,7 +1000,7 @@ impl UpdatesForwarder {
             .is_none_or(|last| last.elapsed() >= UPDATES_DROPPED_LOG_COOLDOWN)
         {
             warn!(
-                capacity = self.tx.max_capacity(),
+                capacity = self.signals.tx.max_capacity(),
                 dropped_count = self.dropped,
                 "updates channel full; the receiver will be told to fetch the difference",
             );

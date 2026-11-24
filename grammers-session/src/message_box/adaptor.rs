@@ -9,7 +9,7 @@
 use grammers_tl_types as tl;
 use tracing::{info, warn};
 
-use super::defs::{Gap, Key, NO_PTS, NO_SEQ, PtsInfo, UpdatesLike, WrongPts};
+use super::defs::{Gap, Key, NO_DATE, NO_PTS, NO_SEQ, PtsInfo, UpdatesLike, WrongPts};
 
 // > The `updateShortMessage`, `updateShortSentMessage` and `updateShortChatMessage` constructors
 // > [...] should be transformed to `updateShort` upon receiving.
@@ -383,6 +383,15 @@ pub(super) fn adapt(updates: UpdatesLike) -> Result<tl::types::UpdatesCombined, 
         | UpdatesLike::MalformedUpdates
         | UpdatesLike::Lagged
         | UpdatesLike::NewSession => Err(Gap),
+        // No update and no gap: an empty container of no `seq`, which moves no state.
+        UpdatesLike::ConnectionOpened => Ok(tl::types::UpdatesCombined {
+            updates: Vec::new(),
+            users: Vec::new(),
+            chats: Vec::new(),
+            date: NO_DATE,
+            seq_start: NO_SEQ,
+            seq: NO_SEQ,
+        }),
     }
 }
 

@@ -3117,6 +3117,7 @@ mod account_deadlines;
 mod account_difference;
 mod channel_deadlines;
 mod channel_pts;
+mod connection_signals;
 mod possible_gap;
 mod qts;
 mod retry_jitter;

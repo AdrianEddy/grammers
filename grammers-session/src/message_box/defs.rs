@@ -323,6 +323,11 @@ pub enum UpdatesLike {
     /// Indicates that the connection was closed and had to be recreated.
     /// This may mean that an update gap now exists and should be resolved.
     ConnectionClosed,
+    /// Indicates that a connection that receives updates opened: the server answered its
+    /// `initConnection`, and nothing has gone to it yet. Not a gap: it carries no update. It comes
+    /// in the same order as [`UpdatesLike::ConnectionClosed`], so whether the last of the two read
+    /// is an open says whether such a connection is up.
+    ConnectionOpened,
     /// Indicates that passively-received updates were malformed.
     /// Either the constructor identifier was unexpected (possibly a stale channel
     /// update) or the updates were cut short during deserialization (very unlikely).

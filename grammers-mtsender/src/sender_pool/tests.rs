@@ -8,7 +8,8 @@
 
 //! The server's datacenter options, stored without panicking on ones that can't be used;
 //! updates that find the channel full, which become one `Lagged`, also when the pool drops the
-//! connection; a new session, a gap on the home connection alone; answers read in the poll whose
+//! connection; the connections' opens and closes, which keep their order while the channel is
+//! full; a new session, a gap on the home connection alone; answers read in the poll whose
 //! write or flush fails, which still reach their requests; a request that reaches a connection
 //! as it ends, which goes to a new one, once; and a connection the pool closes, which fails the
 //! requests whose bytes left and hands back the others, those still queued for it unwritten. A
@@ -81,6 +82,7 @@ enum Seen {
     Update(i32),
     Lagged,
     ConnectionClosed,
+    ConnectionOpened,
     NewSession,
 }
 
@@ -94,6 +96,7 @@ fn seen(updates: UpdatesLike) -> Seen {
         UpdatesLike::AffectedMessages(affected) => Seen::Update(affected.pts),
         UpdatesLike::Lagged => Seen::Lagged,
         UpdatesLike::ConnectionClosed => Seen::ConnectionClosed,
+        UpdatesLike::ConnectionOpened => Seen::ConnectionOpened,
         UpdatesLike::NewSession => Seen::NewSession,
         other => panic!("unexpected {other:?}"),
     }
@@ -114,7 +117,7 @@ fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
 #[tokio::test]
 async fn overflow_sends_one_lagged() {
     let (tx, mut rx) = mpsc::channel(2);
-    let mut forwarder = UpdatesForwarder::new(tx);
+    let mut forwarder = UpdatesForwarder::new(ConnectionSignals::new(tx));
 
     forwarder.forward(update(1));
     forwarder.forward(update(2));
@@ -155,42 +158,120 @@ async fn overflow_sends_one_lagged() {
     assert_eq!(drain(&mut rx), [Seen::Lagged]);
 }
 
+/// The signals owed now, each sent as the channel takes it, in order.
+async fn owed(signals: &ConnectionSignals, rx: &mut mpsc::Receiver<UpdatesLike>) -> Vec<Seen> {
+    let mut seen = Vec::new();
+    while signals.owes() {
+        signals.send_owed().await;
+        seen.extend(drain(rx));
+    }
+    seen
+}
+
 #[tokio::test]
-async fn ended_connection_hands_its_owed_signal_to_the_runner() {
-    // A connection that ends while it owes a `Lagged`.
+async fn ended_connection_owes_its_signal() {
+    // A connection that ends while it owes a `Lagged`: it goes once there is room.
     let (tx, mut rx) = mpsc::channel(1);
-    let mut forwarder = UpdatesForwarder::new(tx);
+    let signals = ConnectionSignals::new(tx);
+    let mut forwarder = UpdatesForwarder::new(signals.clone());
     forwarder.forward(update(1));
     forwarder.forward(update(2));
-    assert!(matches!(forwarder.finish(false), Some(UpdatesLike::Lagged)));
+    forwarder.finish(false);
     assert_eq!(drain(&mut rx), [Seen::Update(1)]);
+    assert_eq!(owed(&signals, &mut rx).await, [Seen::Lagged]);
 
     // The home connection fails: `ConnectionClosed` goes out if there is room, and covers a
-    // `Lagged` owed; with none, the runner sends it.
+    // `Lagged` owed; with none, it is owed.
     let (tx, mut rx) = mpsc::channel(1);
-    let mut forwarder = UpdatesForwarder::new(tx);
+    let signals = ConnectionSignals::new(tx);
+    let mut forwarder = UpdatesForwarder::new(signals.clone());
     forwarder.forward(update(1));
     forwarder.forward(update(2));
     rx.recv().await.unwrap();
-    assert!(forwarder.finish(true).is_none());
+    forwarder.finish(true);
+    assert!(!signals.owes());
     assert_eq!(drain(&mut rx), [Seen::ConnectionClosed]);
 
     let (tx, mut rx) = mpsc::channel(1);
-    let mut forwarder = UpdatesForwarder::new(tx);
+    let signals = ConnectionSignals::new(tx);
+    let mut forwarder = UpdatesForwarder::new(signals.clone());
     forwarder.forward(update(1));
-    assert!(matches!(
-        forwarder.finish(true),
-        Some(UpdatesLike::ConnectionClosed)
-    ));
+    forwarder.finish(true);
     assert_eq!(drain(&mut rx), [Seen::Update(1)]);
+    assert_eq!(owed(&signals, &mut rx).await, [Seen::ConnectionClosed]);
 
     // Nothing owed: a clean end, or a receiver that is gone.
     let (tx, _) = mpsc::channel(1);
-    let mut forwarder = UpdatesForwarder::new(tx);
+    let signals = ConnectionSignals::new(tx);
+    let mut forwarder = UpdatesForwarder::new(signals.clone());
     forwarder.forward(update(1));
-    assert!(forwarder.finish(true).is_none());
+    forwarder.finish(true);
+    assert!(!signals.owes());
     let (tx, _rx) = mpsc::channel(1);
-    assert!(UpdatesForwarder::new(tx).finish(false).is_none());
+    let signals = ConnectionSignals::new(tx);
+    UpdatesForwarder::new(signals.clone()).finish(false);
+    assert!(!signals.owes());
+}
+
+#[tokio::test]
+async fn opens_and_closes_keep_their_order_while_the_channel_is_full() {
+    let (tx, mut rx) = mpsc::channel(1);
+    let signals = ConnectionSignals::new(tx);
+    // With room, an open goes at once.
+    signals.send(Signal::Opened);
+    assert_eq!(drain(&mut rx), [Seen::ConnectionOpened]);
+
+    // Full: a close, then the next connection's open, are owed in that order; a `Lagged` the
+    // close covers adds nothing; and once there is room, a signal still goes behind them.
+    signals.tx.try_send(update(1)).unwrap();
+    signals.send(Signal::Closed);
+    signals.send(Signal::Opened);
+    assert_eq!(drain(&mut rx), [Seen::Update(1)]);
+    signals.send(Signal::Lagged);
+    assert_eq!(drain(&mut rx), []);
+    assert_eq!(
+        owed(&signals, &mut rx).await,
+        [Seen::ConnectionClosed, Seen::ConnectionOpened]
+    );
+
+    // An open owed, then its connection's close: the receiver never heard of it, and reads the
+    // close alone, which also takes the place of an owed `Lagged`.
+    signals.tx.try_send(update(2)).unwrap();
+    signals.send(Signal::Lagged);
+    signals.send(Signal::Opened);
+    signals.send(Signal::Closed);
+    assert_eq!(drain(&mut rx), [Seen::Update(2)]);
+    assert_eq!(owed(&signals, &mut rx).await, [Seen::ConnectionClosed]);
+
+    // A `Lagged` owed before an open is read before it, as it happened.
+    signals.tx.try_send(update(3)).unwrap();
+    signals.send(Signal::Lagged);
+    signals.send(Signal::Opened);
+    assert_eq!(drain(&mut rx), [Seen::Update(3)]);
+    assert_eq!(
+        owed(&signals, &mut rx).await,
+        [Seen::Lagged, Seen::ConnectionOpened]
+    );
+    assert!(!signals.owes());
+}
+
+#[tokio::test]
+async fn a_close_goes_behind_the_open_owed_before_it() {
+    // The home connection's open is owed (the channel is full), and the connection fails before
+    // the receiver reads anything: the close comes after the open would, so the receiver reads
+    // the close alone, whatever room the channel has when the connection ends.
+    let mut connection = Connection::run(true).await;
+    connection.signals.tx.try_send(update(1)).unwrap();
+    connection.signals.send(Signal::Opened);
+    assert_eq!(connection.next().await, Seen::Update(1));
+    drop(connection.server);
+    connection.task.await.unwrap();
+    let signals = connection.signals.clone();
+    assert_eq!(
+        owed(&signals, &mut connection.updates).await,
+        [Seen::ConnectionClosed]
+    );
+    drop(connection.rpc_tx);
 }
 
 #[tokio::test]
@@ -200,14 +281,15 @@ async fn runner_sends_the_signal_an_ended_connection_owed() {
         ..Default::default()
     };
     let mut pool = SenderPool::with_configuration(Arc::new(MemorySession::default()), 1, params);
-    pool.runner.updates_tx.try_send(update(1)).unwrap();
+    pool.runner.signals.tx.try_send(update(1)).unwrap();
     // A connection ends owing a `Lagged`, while the channel is full.
-    pool.runner.connection_pool.spawn(async {
+    let signals = pool.runner.signals.clone();
+    pool.runner.connection_pool.spawn(async move {
+        signals.send(Signal::Lagged);
         ConnectionEnd {
             dc_id: 2,
             unsent: Vec::new(),
             error: None,
-            owed_signal: Some(UpdatesLike::Lagged),
         }
     });
     let runner = tokio::spawn(pool.runner.run());
@@ -279,6 +361,8 @@ struct Connection {
     updates: mpsc::Receiver<UpdatesLike>,
     rpc_tx: mpsc::UnboundedSender<Rpc>,
     task: JoinHandle<ConnectionEnd>,
+    /// The channel's sender and the signals it is owed, which the connection shares.
+    signals: ConnectionSignals,
 }
 
 impl Connection {
@@ -305,11 +389,12 @@ impl Connection {
             .unwrap();
         let (rpc_tx, rpc_rx) = mpsc::unbounded_channel();
         let (updates_tx, updates) = mpsc::channel(1);
+        let signals = ConnectionSignals::new(updates_tx);
         let task = tokio::spawn(run_sender(
             2,
             sender,
             rpc_rx,
-            UpdatesForwarder::new(updates_tx),
+            UpdatesForwarder::new(signals.clone()),
             home_sender,
         ));
         Self {
@@ -317,6 +402,7 @@ impl Connection {
             updates,
             rpc_tx,
             task,
+            signals,
         }
     }
 
@@ -360,7 +446,8 @@ async fn connection_sends_lagged_with_no_update_to_carry_it() {
         seen(connection.updates.recv().await.unwrap()),
         Seen::ConnectionClosed
     );
-    assert!(connection.task.await.unwrap().owed_signal.is_none());
+    connection.task.await.unwrap();
+    assert!(!connection.signals.owes());
     drop(connection.rpc_tx);
 }
 
@@ -380,27 +467,31 @@ async fn new_session_is_a_gap_on_the_home_connection_alone() {
 }
 
 #[tokio::test]
-async fn connection_ending_on_a_full_channel_returns_what_it_owes() {
+async fn connection_ending_on_a_full_channel_owes_its_signal() {
     // The home connection fails while the channel is full: its `ConnectionClosed` is owed.
     let mut connection = Connection::run(true).await;
     let packets = [packet(1), packet(2)].concat();
     connection.server.write_all(&packets).await.unwrap();
     drop(connection.server);
-    assert!(matches!(
-        connection.task.await.unwrap().owed_signal,
-        Some(UpdatesLike::ConnectionClosed)
-    ));
+    connection.task.await.unwrap();
     assert_eq!(connection.updates.try_recv().map(seen), Ok(Seen::Update(1)));
+    let signals = connection.signals.clone();
+    assert_eq!(
+        owed(&signals, &mut connection.updates).await,
+        [Seen::ConnectionClosed]
+    );
 
     // Any other connection says nothing of its closing, but still owes the updates it dropped.
     let mut connection = Connection::run(false).await;
     connection.server.write_all(&packets).await.unwrap();
     drop(connection.server);
-    assert!(matches!(
-        connection.task.await.unwrap().owed_signal,
-        Some(UpdatesLike::Lagged)
-    ));
+    connection.task.await.unwrap();
     assert_eq!(connection.updates.try_recv().map(seen), Ok(Seen::Update(1)));
+    let signals = connection.signals.clone();
+    assert_eq!(
+        owed(&signals, &mut connection.updates).await,
+        [Seen::Lagged]
+    );
 
     // The pool drops a connection that owes a `Lagged`: not a closed connection, but still owed.
     let mut connection = Connection::run(true).await;
@@ -409,10 +500,13 @@ async fn connection_ending_on_a_full_channel_returns_what_it_owes() {
         tokio::task::yield_now().await;
     }
     drop(connection.rpc_tx);
-    assert!(matches!(
-        connection.task.await.unwrap().owed_signal,
-        Some(UpdatesLike::Lagged)
-    ));
+    connection.task.await.unwrap();
+    assert_eq!(connection.updates.try_recv().map(seen), Ok(Seen::Update(1)));
+    let signals = connection.signals.clone();
+    assert_eq!(
+        owed(&signals, &mut connection.updates).await,
+        [Seen::Lagged]
+    );
 }
 
 /// Refuses every dial, as a datacenter that is down does, and records the datacenter of each.
@@ -463,7 +557,7 @@ async fn pool_with_connection_over<M: Mtp + Send + 'static>(
         dc_id,
         sender,
         rpc_rx,
-        UpdatesForwarder::new(pool.runner.updates_tx.clone()),
+        UpdatesForwarder::new(pool.runner.signals.clone()),
         true,
     ));
     pool.runner
@@ -589,7 +683,8 @@ async fn answer_read_with_a_failed_write_reaches_its_request() {
     ));
     let closed = timeout(Duration::from_secs(10), connection.updates.recv());
     assert_eq!(seen(closed.await.unwrap().unwrap()), Seen::ConnectionClosed);
-    assert!(connection.task.await.unwrap().owed_signal.is_none());
+    connection.task.await.unwrap();
+    assert!(!connection.signals.owes());
 }
 
 /// A stream that fails every flush, and has nothing to read until one has failed.
@@ -645,7 +740,8 @@ async fn answer_read_with_a_failed_flush_reaches_its_request() {
     let answered = connection.send(ping());
     assert_eq!(answer(answered).await.unwrap(), pong());
     assert_eq!(connection.next().await, Seen::ConnectionClosed);
-    assert!(connection.task.await.unwrap().owed_signal.is_none());
+    connection.task.await.unwrap();
+    assert!(!connection.signals.owes());
 }
 
 #[tokio::test]
@@ -762,7 +858,6 @@ async fn request_handed_back_twice_fails_with_its_connection_error() {
             error: Some(ReadError::Transport(transport::Error::BadStatus {
                 status: 404,
             })),
-            owed_signal: None,
         }
     });
     pool.runner
@@ -779,7 +874,6 @@ async fn request_handed_back_twice_fails_with_its_connection_error() {
                 handed_back: false,
             }],
             error: Some(io::Error::from(io::ErrorKind::ConnectionReset).into()),
-            owed_signal: None,
         }
     });
     let runner = tokio::spawn(pool.runner.run());
