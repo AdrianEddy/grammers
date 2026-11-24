@@ -25,6 +25,14 @@ use crate::{InvocationError, SenderPoolHandle, UpdatesConfiguration};
 const BOT_CHANNEL_DIFF_LIMIT: i32 = 100000;
 const USER_CHANNEL_DIFF_LIMIT: i32 = 100;
 
+/// Whether `error` is the server's own failure, a difference it fails asked again after a
+/// backoff: an RPC error of code 500 (`PERSISTENT_TIMESTAMP_OUTDATED` among them) or of a negative
+/// code, which only the server's own failures carry (-503 `Timeout`: the call timed out on its
+/// side). The transport's negative codes come as [`InvocationError::Transport`] instead.
+fn server_failure(error: &InvocationError) -> bool {
+    matches!(error, InvocationError::Rpc(rpc) if rpc.code == 500 || rpc.code < 0)
+}
+
 pub struct UpdatesReceiver {
     handle: SenderPoolHandle,
     session: Arc<ErasedSession>,
@@ -180,10 +188,29 @@ impl UpdatesReceiver {
             };
 
             if let Some(request) = get_diff {
-                let response = self.invoke(&request).await?;
-                let (updates, users, chats) =
-                    self.message_box.apply_difference(response, self.now());
-                self.extend_update_queue(updates, users, chats);
+                match self.invoke(&request).await {
+                    Ok(response) => {
+                        let (updates, users, chats) =
+                            self.message_box.apply_difference(response, self.now());
+                        self.extend_update_queue(updates, users, chats);
+                    }
+                    // The server refuses the difference's state itself, which asking again can't
+                    // change: the `pts` starts over from `updates.getState`'s, the rest kept, as
+                    // TDLib restores it (`on_get_updates_state`'s "Restore PTS").
+                    Err(e) if e.is("PERSISTENT_TIMESTAMP_INVALID") => {
+                        warn!("the account's difference state is refused; restoring its pts");
+                        match self.invoke(&tl::functions::updates::GetState {}).await {
+                            Ok(tl::enums::updates::State::State(state)) => {
+                                let updates = self.message_box.restore_pts(state.pts, self.now());
+                                self.extend_update_queue(updates, Vec::new(), Vec::new());
+                            }
+                            Err(e) if server_failure(&e) => self.end_account_difference(&e),
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    Err(e) if server_failure(&e) => self.end_account_difference(&e),
+                    Err(e) => return Err(e),
+                }
                 continue;
             }
 
@@ -222,8 +249,8 @@ impl UpdatesReceiver {
                         );
                         continue;
                     }
-                    Err(InvocationError::Rpc(rpc_error)) if rpc_error.code == 500 => {
-                        warn!("Telegram is having internal issues: {:#?}", rpc_error);
+                    Err(error) if server_failure(&error) => {
+                        warn!(%error, "Telegram is having internal issues");
                         let updates = self.message_box.end_channel_difference(
                             channel_id,
                             PrematureEndReason::TemporaryServerIssues,
@@ -297,6 +324,15 @@ impl UpdatesReceiver {
             .do_invoke_in_dc(dc_id, request.to_bytes())
             .await
             .and_then(|body| R::Return::from_bytes(&body).map_err(|e| e.into()))
+    }
+
+    /// End the account's difference unanswered after the server's own failure `error`, as a
+    /// channel's ends after one: the message boxes keep the account's state and ask again after
+    /// their backoff, handing out meanwhile the updates that follow on from it.
+    fn end_account_difference(&mut self, error: &InvocationError) {
+        warn!(%error, "the account's difference failed; asking again after a backoff");
+        let updates = self.message_box.end_account_difference(self.now());
+        self.extend_update_queue(updates, Vec::new(), Vec::new());
     }
 
     async fn process_socket_updates(&mut self, updates: UpdatesLike) {
