@@ -40,7 +40,9 @@ pub use configuration::{
 pub use errors::{InvocationError, ReadError, RpcError};
 #[cfg(feature = "proxy")]
 pub use net::Socks5Dialer;
-pub use net::{ConnKind, DialFuture, DialTarget, Dialer, MtStream, TokioTcpDialer};
+pub use net::{ConnKind, DialFuture, DialTarget, Dialer, MtStream, PermitFuture, TokioTcpDialer};
 pub use sender::{Sender, connect, connect_with_auth, generate_auth_key};
-pub use sender_pool::{SenderPool, SenderPoolFatHandle, SenderPoolHandle, SenderPoolRunner};
+pub use sender_pool::{
+    Disconnection, SenderPool, SenderPoolFatHandle, SenderPoolHandle, SenderPoolRunner,
+};
 pub use updates_receiver::UpdatesReceiver;

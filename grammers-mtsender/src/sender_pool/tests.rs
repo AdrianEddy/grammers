@@ -11,10 +11,14 @@
 //! connection; the connections' opens and closes, which keep their order while the channel is
 //! full; a new session, a gap on the home connection alone; answers read in the poll whose
 //! write or flush fails, which still reach their requests; a request that reaches a connection
-//! as it ends, which goes to a new one, once; and a connection the pool closes, which fails the
-//! requests whose bytes left and hands back the others, those still queued for it unwritten. A
-//! connection that fails gives every request it held its error, cause and all. No pool here
-//! reaches anything but in-memory streams: every dial is refused ([`RefusingDialer`]).
+//! as it ends, which goes to a new one, once; a connection the pool closes, which fails the
+//! requests whose bytes left and hands back the others, those still queued for it unwritten, and
+//! whose disconnect is told once its task has ended, before what it handed back dials, which a
+//! later disconnect that waits for it too holds until it is told; a request held while the
+//! dialer's permit is shut, which holds nothing else back, dials once the permit comes, and fails
+//! once its wait runs out or the pool quits. A connection that fails gives every request it held
+//! its error, cause and all. No pool here reaches anything but in-memory streams: every dial is
+//! refused ([`RefusingDialer`]).
 
 use std::num::NonZeroUsize;
 use std::pin::{Pin, pin};
@@ -27,6 +31,7 @@ use grammers_mtproto::{DequeBuffer, MsgId};
 use grammers_session::storages::MemorySession;
 use tl::{Identifiable, Serializable};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use super::*;
@@ -553,13 +558,14 @@ async fn pool_with_connection_over<M: Mtp + Send + 'static>(
     let sender = Sender::connect(Intermediate::new(), mtp, &Pipe::new(stream), &target)
         .await
         .unwrap();
-    pool.runner.connection_pool.spawn(run_sender(
+    let task = pool.runner.connection_pool.spawn(run_sender(
         dc_id,
         sender,
         rpc_rx,
         UpdatesForwarder::new(pool.runner.signals.clone()),
         true,
     ));
+    pool.runner.tasks.push((task.id(), dc_id));
     pool.runner
         .connections
         .push(ConnectionInfo { dc_id, rpc_tx });
@@ -593,9 +599,9 @@ async fn disconnected_connection_hands_back_the_lagged_it_owed() {
     idle().await;
 
     // The pool drops the connection while the channel is still full.
-    assert!(handle.disconnect_from_dc(2));
+    let disconnected = handle.disconnect_from_dc(2);
     let runner = tokio::spawn(runner.run());
-    idle().await;
+    assert!(disconnected.await);
 
     assert_eq!(seen(updates.recv().await.unwrap()), Seen::Update(1));
     let lagged = timeout(Duration::from_secs(10), updates.recv()).await;
@@ -607,12 +613,14 @@ async fn disconnected_connection_hands_back_the_lagged_it_owed() {
 #[tokio::test]
 async fn quit_right_after_disconnect_ends_the_runner() {
     let (pool, _server, _) = pool_with_connection(2).await;
-    assert!(pool.handle.disconnect_from_dc(2));
+    let disconnected = pool.handle.disconnect_from_dc(2);
     assert!(pool.handle.quit());
     // An aborted connection's task would be a cancelled one, which the runner's last join fails on.
     timeout(Duration::from_secs(10), pool.runner.run())
         .await
         .unwrap();
+    // The connection ended with the runner, which says so.
+    assert!(disconnected.await);
 }
 
 fn ping() -> Vec<u8> {
@@ -936,8 +944,9 @@ async fn connection_holding_a_request_of_each_kind()
 async fn disconnect_fails_what_left_and_sends_on_what_never_did() {
     let (pool, _server, dialer, [sent, partly, queued]) =
         connection_holding_a_request_of_each_kind().await;
-    assert!(pool.handle.disconnect_from_dc(2));
+    let disconnected = pool.handle.disconnect_from_dc(2);
     let runner = tokio::spawn(pool.runner.run());
+    assert!(disconnected.await);
 
     // The server may have taken the request whose bytes left, and its answer could come only on
     // the closed connection: the caller learns it was aborted, as an I/O error its retry policy
@@ -959,6 +968,237 @@ async fn disconnect_fails_what_left_and_sends_on_what_never_did() {
     runner.await.unwrap();
 }
 
+/// Whether `server`'s other end, the client's stream, is closed now: its read returns the end at
+/// once.
+fn closed_at_once(server: &mut DuplexStream) -> bool {
+    let mut buf = [0; 1];
+    let mut read = pin!(server.read(&mut buf));
+    matches!(poll_once(read.as_mut()), Poll::Ready(Ok(0)))
+}
+
+#[tokio::test]
+async fn disconnect_resolves_once_its_connection_has_ended() {
+    let (pool, mut server, _) = pool_with_connection(2).await;
+    // Two disconnects before the runner runs: the second finds the connection ending, no longer
+    // listed, and waits for it too.
+    let first = pool.handle.disconnect_from_dc(2);
+    let second = pool.handle.disconnect_from_dc(2);
+    let runner = tokio::spawn(pool.runner.run());
+    assert!(second.await);
+    // The connection's task has ended, its socket with it.
+    assert!(closed_at_once(&mut server));
+    assert!(first.await);
+    // Nothing to wait for: told at once.
+    assert!(pool.handle.disconnect_from_dc(2).await);
+    assert!(pool.handle.quit());
+    runner.await.unwrap();
+    // The runner is gone.
+    assert!(!pool.handle.disconnect_from_dc(2).await);
+}
+
+/// Refuses every dial, as [`RefusingDialer`] does, and says whether the disconnect it was given
+/// had been told by the time the first dial came.
+#[derive(Default)]
+struct DialsAfterTheDisconnect {
+    disconnection: Mutex<Option<Disconnection>>,
+    told_first: Mutex<Option<bool>>,
+}
+
+impl Dialer for DialsAfterTheDisconnect {
+    fn dial<'a>(&'a self, _: &'a DialTarget) -> DialFuture<'a> {
+        let mut disconnection = self.disconnection.lock().unwrap();
+        if let Some(disconnection) = disconnection.as_mut() {
+            let told = poll_once(Pin::new(disconnection)).is_ready();
+            self.told_first.lock().unwrap().get_or_insert(told);
+        }
+        Box::pin(async { Err(io::ErrorKind::ConnectionRefused.into()) })
+    }
+}
+
+#[tokio::test]
+async fn disconnect_is_told_before_what_its_connection_handed_back_dials() {
+    let dialer = Arc::new(DialsAfterTheDisconnect::default());
+    let (client, mut server) = tokio::io::duplex(1 << 16);
+    let (mut pool, _) =
+        pool_with_connection_over(2, client, Plain::new(), mpsc::unbounded_channel()).await;
+    pool.runner.connection_params.dialer = Arc::clone(&dialer) as Arc<dyn Dialer>;
+    // A request queued for the connection, then the disconnect, before the connection's task
+    // runs: the request goes back unwritten, and on through a new connection, which dials.
+    let (tx, queued) = oneshot::channel();
+    let request = Request::Invoke {
+        dc_id: 2,
+        body: ping(),
+        tx,
+    };
+    assert!(pool.runner.process_request(request).await.is_continue());
+    let (done, ended) = oneshot::channel();
+    let disconnect = Request::Disconnect { dc_id: 2, done };
+    assert!(pool.runner.process_request(disconnect).await.is_continue());
+    *dialer.disconnection.lock().unwrap() = Some(Disconnection(Some(ended)));
+    let runner = tokio::spawn(pool.runner.run());
+    assert!(matches!(
+        answer(queued).await,
+        Err(InvocationError::Io(error)) if error.kind() == io::ErrorKind::ConnectionRefused
+    ));
+    assert_eq!(*dialer.told_first.lock().unwrap(), Some(true));
+    assert!(closed_at_once(&mut server));
+    assert!(pool.handle.quit());
+    runner.await.unwrap();
+}
+
+#[tokio::test]
+async fn a_later_disconnect_holds_what_its_connections_handed_back_until_it_is_told() {
+    let dialer = Arc::new(DialsAfterTheDisconnect::default());
+    let (client, _server) = tokio::io::duplex(1 << 16);
+    let (mut pool, _) =
+        pool_with_connection_over(2, client, Plain::new(), mpsc::unbounded_channel()).await;
+    pool.runner.connection_params.dialer = Arc::clone(&dialer) as Arc<dyn Dialer>;
+    // A request queued for the connection, then a disconnect, before the connection's task runs:
+    // the request goes back unwritten, and the disconnect waits for that connection alone.
+    let (tx, queued) = oneshot::channel();
+    let request = Request::Invoke {
+        dc_id: 2,
+        body: ping(),
+        tx,
+    };
+    assert!(pool.runner.process_request(request).await.is_continue());
+    let (done, first) = oneshot::channel();
+    let disconnect = Request::Disconnect { dc_id: 2, done };
+    assert!(pool.runner.process_request(disconnect).await.is_continue());
+    // A second connection to the datacenter, made after the first disconnect, which ends once it
+    // is let go; then a second disconnect, which waits for both connections.
+    let (let_go, ends) = oneshot::channel::<()>();
+    let second_connection = pool.runner.connection_pool.spawn(async move {
+        drop(ends.await);
+        ConnectionEnd {
+            dc_id: 2,
+            unsent: Vec::new(),
+            error: None,
+        }
+    });
+    pool.runner.tasks.push((second_connection.id(), 2));
+    let (done, second) = oneshot::channel();
+    let disconnect = Request::Disconnect { dc_id: 2, done };
+    assert!(pool.runner.process_request(disconnect).await.is_continue());
+    *dialer.disconnection.lock().unwrap() = Some(Disconnection(Some(second)));
+    let runner = tokio::spawn(pool.runner.run());
+
+    // The first connection ends: the first disconnect is told, and what the connection handed
+    // back waits for the second, which waits for the second connection too.
+    assert!(Disconnection(Some(first)).await);
+    settle().await;
+    assert_eq!(*dialer.told_first.lock().unwrap(), None, "nothing dialed");
+    drop(let_go);
+    assert!(matches!(
+        answer(queued).await,
+        Err(InvocationError::Io(error)) if error.kind() == io::ErrorKind::ConnectionRefused
+    ));
+    assert_eq!(*dialer.told_first.lock().unwrap(), Some(true));
+    assert!(pool.handle.quit());
+    runner.await.unwrap();
+}
+
+/// Refuses every dial, as [`RefusingDialer`] does, and permits dials only while `open` holds.
+struct GatedDialer {
+    dialed: Mutex<Vec<i32>>,
+    open: watch::Sender<bool>,
+}
+
+impl GatedDialer {
+    /// One that permits no dial yet.
+    fn shut() -> Arc<Self> {
+        Arc::new(Self {
+            dialed: Mutex::default(),
+            open: watch::Sender::new(false),
+        })
+    }
+}
+
+impl Dialer for GatedDialer {
+    fn dial<'a>(&'a self, target: &'a DialTarget) -> DialFuture<'a> {
+        self.dialed.lock().unwrap().push(target.dc_id);
+        Box::pin(async { Err(io::ErrorKind::ConnectionRefused.into()) })
+    }
+
+    fn permit(&self) -> PermitFuture {
+        let mut open = self.open.subscribe();
+        Box::pin(async move {
+            drop(open.wait_for(|open| *open).await);
+        })
+    }
+}
+
+/// Ask the runner of `handle` for a ping in `dc_id`, on a task of its own.
+fn ping_in(
+    handle: &SenderPoolHandle,
+    dc_id: i32,
+) -> JoinHandle<Result<InvokeResponse, InvocationError>> {
+    let handle = handle.clone();
+    tokio::spawn(async move { handle.raw_invoke_in_dc(dc_id, ping()).await })
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_request_held_for_the_permit_holds_nothing_else() {
+    let (mut pool, mut server, _) = pool_with_connection(2).await;
+    let dialer = GatedDialer::shut();
+    pool.runner.connection_params.dialer = Arc::clone(&dialer) as Arc<dyn Dialer>;
+    let runner = tokio::spawn(pool.runner.run());
+    let start = tokio::time::Instant::now();
+
+    // A request for datacenter 4, to which no connection is open, while the permit is shut: the
+    // runner holds it, and dials nothing.
+    let held = ping_in(&pool.handle, 4);
+    idle().await;
+    // The runner goes on meanwhile: a disconnect of datacenter 2 is told once its connection's
+    // task has ended, which the runner joins, and one of datacenter 4, which has none, at once,
+    // the request staying held. Neither waits for the held request's wait to run out.
+    assert!(pool.handle.disconnect_from_dc(2).await);
+    assert!(closed_at_once(&mut server));
+    assert!(pool.handle.disconnect_from_dc(4).await);
+    assert!(start.elapsed() < SETUP_TIMEOUT, "{:?}", start.elapsed());
+    assert!(!held.is_finished());
+    assert!(dialer.dialed.lock().unwrap().is_empty());
+
+    // The permit comes: the held request dials, once.
+    dialer.open.send_replace(true);
+    assert!(matches!(
+        held.await.unwrap(),
+        Err(InvocationError::Io(error)) if error.kind() == io::ErrorKind::ConnectionRefused
+    ));
+    assert_eq!(*dialer.dialed.lock().unwrap(), [4]);
+    assert!(pool.handle.quit());
+    runner.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_held_request_times_out_and_the_quit_drops_one_still_held() {
+    let (mut pool, _) = refusing_pool();
+    let dialer = GatedDialer::shut();
+    pool.runner.connection_params.dialer = Arc::clone(&dialer) as Arc<dyn Dialer>;
+    let runner = tokio::spawn(pool.runner.run());
+    let start = tokio::time::Instant::now();
+
+    // The permit never comes: a held request fails once its 60 s are over, as a connection's
+    // setup past them does, with nothing dialed.
+    let first = ping_in(&pool.handle, 2);
+    idle().await;
+    let second = ping_in(&pool.handle, 2);
+    assert!(matches!(
+        first.await.unwrap(),
+        Err(InvocationError::Io(error)) if error.kind() == io::ErrorKind::TimedOut
+    ));
+    assert_eq!(start.elapsed(), SETUP_TIMEOUT);
+    // One held a second later still waits; the quit drops it.
+    assert!(!second.is_finished());
+    assert!(pool.handle.quit());
+    runner.await.unwrap();
+    assert!(matches!(
+        second.await.unwrap(),
+        Err(InvocationError::Dropped(_))
+    ));
+    assert!(dialer.dialed.lock().unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn requests_queued_right_before_a_disconnect_go_back_unwritten() {
     let (client, mut server) = tokio::io::duplex(1 << 16);
@@ -978,7 +1218,8 @@ async fn requests_queued_right_before_a_disconnect_go_back_unwritten() {
         assert!(pool.runner.process_request(request).await.is_continue());
         queued.push(rx);
     }
-    let disconnect = Request::Disconnect { dc_id: 2 };
+    let (done, _) = oneshot::channel();
+    let disconnect = Request::Disconnect { dc_id: 2, done };
     assert!(pool.runner.process_request(disconnect).await.is_continue());
     let runner = tokio::spawn(pool.runner.run());
 

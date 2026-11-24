@@ -115,6 +115,9 @@ impl DialTarget {
 /// The future a [`Dialer`] returns.
 pub type DialFuture<'a> = Pin<Box<dyn Future<Output = io::Result<Box<dyn MtStream>>> + Send + 'a>>;
 
+/// The future [`Dialer::permit`] returns.
+pub type PermitFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+
 /// Opens the byte streams connections run over.
 ///
 /// Every connection a [`crate::SenderPool`] makes is dialed through its
@@ -123,6 +126,22 @@ pub type DialFuture<'a> = Pin<Box<dyn Future<Output = io::Result<Box<dyn MtStrea
 pub trait Dialer: Send + Sync + 'static {
     /// Open a stream to `target`.
     fn dial<'a>(&'a self, target: &'a DialTarget) -> DialFuture<'a>;
+
+    /// Resolve once connections may be dialed: at once while they may. By default they always
+    /// may.
+    ///
+    /// The pool's runner reads it before it dials. While it is pending, the runner holds every
+    /// request that needs a new connection, in the order they came, and goes on with everything
+    /// else: the requests for connections that are open, the disconnects, the connections that
+    /// end. Once it resolves, the held requests go on, each datacenter's through the one new
+    /// connection its first request makes. A request held for 60 seconds fails with an I/O error
+    /// of kind [`io::ErrorKind::TimedOut`], as a new connection's setup past its 60 seconds does.
+    ///
+    /// A dialer that held its dials back by waiting inside [`Dialer::dial`] would hold the
+    /// runner instead: a disconnect its owner awaits meanwhile would wait for the dial's wait.
+    fn permit(&self) -> PermitFuture {
+        Box::pin(std::future::ready(()))
+    }
 }
 
 #[cfg(test)]

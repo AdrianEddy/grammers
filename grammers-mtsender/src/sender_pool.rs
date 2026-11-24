@@ -20,7 +20,9 @@
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use std::num::NonZeroU32;
 use std::ops::{ControlFlow, Deref};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 use std::{fmt, io, mem, panic};
 
@@ -33,14 +35,14 @@ use grammers_tl_types::{self as tl, Deserializable, enums};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::{
     sync::{mpsc, oneshot},
-    task::JoinSet,
-    time::{sleep, timeout},
+    task::{self, JoinSet},
+    time::{sleep, sleep_until, timeout},
 };
 use tracing::{debug, info, warn};
 
 use crate::configuration::{ConnectionParams, RetryContext};
 use crate::errors::{InvocationError, ReadError};
-use crate::net::{ConnKind, DialTarget};
+use crate::net::{ConnKind, DialTarget, PermitFuture};
 use crate::{Sender, connect, connect_with_auth};
 
 /// How long to wait after warning the user that updates were dropped before warning again.
@@ -51,7 +53,9 @@ const UPDATES_DROPPED_LOG_COOLDOWN: Duration = Duration::from_secs(300);
 /// nothing can't hold the pool for longer. It leaves room for the slowest dial through
 /// [`DialTarget::connect_any`], 10 s on each of a target's two addresses, and for the handshake,
 /// including the second dial and handshake a `-404` asks for. The session writes between the
-/// steps don't count: a session write is never cancelled.
+/// steps don't count: a session write is never cancelled. A request held for the dialer's permit
+/// ([`crate::Dialer::permit`]) waits as long at most, then fails as a setup past it does
+/// ([`SenderPoolRunner::expire_held`]).
 const SETUP_TIMEOUT: Duration = Duration::from_secs(60);
 
 type InvokeResponse = Vec<u8>;
@@ -70,6 +74,9 @@ enum Request {
     },
     Disconnect {
         dc_id: i32,
+        /// Told once the connections to `dc_id` the runner found as it read the disconnect have
+        /// ended ([`Disconnection`]).
+        done: oneshot::Sender<()>,
     },
     Quit,
 }
@@ -84,6 +91,25 @@ struct Rpc {
 struct ConnectionInfo {
     dc_id: i32,
     rpc_tx: mpsc::UnboundedSender<Rpc>,
+}
+
+/// A request held for the dialer's permit ([`crate::Dialer::permit`]): it needs a new connection
+/// to its datacenter, which can't be dialed yet ([`SenderPoolRunner::dispatch`]).
+struct Held {
+    dc_id: i32,
+    rpc: Rpc,
+    /// When its wait runs out: [`SETUP_TIMEOUT`] after it was first held.
+    expires: tokio::time::Instant,
+}
+
+/// A disconnect waiting for the connections to its datacenter to end
+/// ([`SenderPoolHandle::disconnect_from_dc`]).
+struct PendingDisconnect {
+    /// The tasks of the connections it waits for that haven't ended.
+    left: Vec<task::Id>,
+    done: oneshot::Sender<()>,
+    /// What those that ended handed back, held until it is told: sent on then, which may dial.
+    unsent: Vec<(i32, Rpc)>,
 }
 
 /// What a connection's task hands back to the runner as it ends ([`run_sender`]).
@@ -123,6 +149,33 @@ pub struct SenderPoolFatHandle {
 /// Cheaply cloneable handle to interact with its [`SenderPoolRunner`].
 #[derive(Clone)]
 pub struct SenderPoolHandle(mpsc::UnboundedSender<Request>);
+
+/// A disconnect the runner was asked for ([`SenderPoolHandle::disconnect_from_dc`]).
+///
+/// Awaited, it resolves once the connections to the datacenter that the runner found as it read
+/// the disconnect have ended, those it dropped and any that was ending already: their tasks have
+/// ended, and their sockets with them. That comes before the requests they never sent go on
+/// through a new connection, which may dial. It resolves to `true` then, or to `false` if the
+/// runner was gone first, its connections with it.
+///
+/// It doesn't wait for a connection that a request made after the disconnect opens meanwhile: such
+/// a request goes on as any does, through a new connection if none is open. While the dialer's
+/// permit is shut ([`crate::Dialer::permit`]) the runner opens none, but holds the request, so
+/// the disconnect resolves with no connection to the datacenter left. A caller that needs none
+/// open once it resolves shuts the permit before it disconnects.
+#[derive(Debug)]
+pub struct Disconnection(Option<oneshot::Receiver<()>>);
+
+impl Future for Disconnection {
+    type Output = bool;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<bool> {
+        match &mut self.0 {
+            Some(ended) => Pin::new(ended).poll(cx).map(|ended| ended.is_ok()),
+            None => Poll::Ready(false),
+        }
+    }
+}
 
 /// Builder to configure the runner to drive I/O and linked handles.
 pub struct SenderPool {
@@ -180,6 +233,13 @@ pub struct SenderPoolRunner {
     connections: Vec<ConnectionInfo>,
     /// The connections' tasks, each ending with what it hands back ([`ConnectionEnd`]).
     connection_pool: JoinSet<ConnectionEnd>,
+    /// Each task in `connection_pool`, with its connection's datacenter: those still listed in
+    /// `connections`, and those ending, which no longer are.
+    tasks: Vec<(task::Id, i32)>,
+    /// The disconnects waiting for their datacenter's connections to end.
+    disconnects: Vec<PendingDisconnect>,
+    /// The requests held for the dialer's permit, in the order they came ([`Self::dispatch`]).
+    held: Vec<Held>,
 }
 
 impl Deref for SenderPoolFatHandle {
@@ -234,8 +294,15 @@ impl SenderPoolHandle {
     /// error of kind [`std::io::ErrorKind::ConnectionAborted`]: the server may have taken it, and
     /// its answer could come only on the closed connection. Any other goes to a new connection to
     /// the datacenter, as a request made after the disconnect would.
-    pub fn disconnect_from_dc(&self, dc_id: i32) -> bool {
-        self.0.send(Request::Disconnect { dc_id }).is_ok()
+    ///
+    /// The request goes to the runner at once. The [`Disconnection`] it returns may be awaited
+    /// until the connections have ended, their sockets closed; dropping it cancels nothing. The
+    /// requests the runner holds for the dialer's permit ([`crate::Dialer::permit`]) stay held:
+    /// they go to the next connection.
+    pub fn disconnect_from_dc(&self, dc_id: i32) -> Disconnection {
+        let (done, ended) = oneshot::channel();
+        let sent = self.0.send(Request::Disconnect { dc_id, done }).is_ok();
+        Disconnection(sent.then_some(ended))
     }
 
     /// Communicate with the running [`SenderPoolRunner`] instance
@@ -245,7 +312,8 @@ impl SenderPoolHandle {
     /// handed back included, each of which may need a new connection's dial and `initConnection`
     /// (up to 60 seconds). The requests the connections still hold then fail: one whose bytes left
     /// with an I/O error of kind [`std::io::ErrorKind::ConnectionAborted`], as
-    /// [`Self::disconnect_from_dc`] fails it, and any other with [`InvocationError::Dropped`].
+    /// [`Self::disconnect_from_dc`] fails it, and any other with [`InvocationError::Dropped`], as
+    /// those held for the dialer's permit ([`crate::Dialer::permit`]) do.
     pub fn quit(&self) -> bool {
         self.0.send(Request::Quit).is_ok()
     }
@@ -353,6 +421,9 @@ impl SenderPool {
                 signals: ConnectionSignals::new(updates_tx),
                 connections: Vec::new(),
                 connection_pool: JoinSet::new(),
+                tasks: Vec::new(),
+                disconnects: Vec::new(),
+                held: Vec::new(),
             },
             handle: SenderPoolFatHandle {
                 thin: SenderPoolHandle(request_tx),
@@ -367,18 +438,28 @@ impl SenderPool {
 impl SenderPoolRunner {
     /// Run the sender pool until [`SenderPoolHandle::quit`] is called or the returned future is dropped.
     ///
-    /// Connections will be initiated on-demand whenever the first request to a datacenter is made.
+    /// Connections will be initiated on-demand whenever the first request to a datacenter is made,
+    /// once the dialer permits it ([`crate::Dialer::permit`]).
     pub async fn run(mut self) {
+        // The dialer's permit, waited for while requests are held for it.
+        let mut permit: Option<PermitFuture> = None;
         loop {
+            if self.held.is_empty() {
+                permit = None;
+            } else if permit.is_none() {
+                permit = Some(self.connection_params.dialer.permit());
+            }
+            let expiry = self.held.iter().map(|held| held.expires).min();
             tokio::select! {
                 biased;
-                Some(completion) = self.connection_pool.join_next(), if !self.connection_pool.is_empty() => {
+                Some(completion) = self.connection_pool.join_next_with_id(), if !self.connection_pool.is_empty() => {
                     // A connection whose task ended, or is ending, closed its end of the channel
                     // (`run_sender`), so it takes no more requests.
                     self.connections
                         .retain(|connection| !connection.rpc_tx.is_closed());
-                    match completion {
-                        Ok(end) => {
+                    let (id, unsent) = match completion {
+                        Ok((id, end)) => {
+                            let mut unsent = Vec::new();
                             for mut rpc in end.unsent {
                                 match &end.error {
                                     // Its second connection ended before taking it too.
@@ -387,20 +468,31 @@ impl SenderPoolRunner {
                                     }
                                     _ => {
                                         rpc.handed_back = true;
-                                        self.dispatch(end.dc_id, rpc).await;
+                                        unsent.push((end.dc_id, rpc));
                                     }
                                 }
                             }
+                            (id, unsent)
                         }
                         Err(err) => {
+                            let id = err.id();
                             if let Ok(reason) = err.try_into_panic() {
                                 panic::resume_unwind(reason);
                             }
+                            (id, Vec::new())
                         }
+                    };
+                    for (dc_id, rpc) in self.ended(id, unsent) {
+                        self.dispatch(dc_id, rpc, None).await;
                     }
                 }
                 // A connection's task owes its signal as it ends, so the join above wakes this.
                 () = self.signals.send_owed(), if self.signals.owes() => {}
+                () = sleep_until_some(expiry), if expiry.is_some() => self.expire_held(),
+                () = permit_given(&mut permit), if permit.is_some() => {
+                    permit = None;
+                    self.release_held().await;
+                }
                 request = self.request_rx.recv() => {
                     let flow = if let Some(request) = request {
                         self.process_request(request).await
@@ -415,8 +507,42 @@ impl SenderPoolRunner {
             }
         }
 
+        // The held requests' callers are told `Dropped`, as those of the requests the connections
+        // never sent are.
+        self.held.clear();
         self.connections.clear(); // drop all channels to cause the `run_sender` loops to stop
         self.connection_pool.join_all().await;
+        // No connection is left, and nothing they handed back goes on.
+        for pending in self.disconnects.drain(..) {
+            let _ = pending.done.send(());
+        }
+    }
+
+    /// The connection task `id` has ended (its socket with it), handing back `unsent`: each
+    /// disconnect that waited for it is told once every connection it waits for has ended, and
+    /// then what they handed back is returned, to go on, which may dial. While a disconnect still
+    /// waits for another of its connections, what this one handed back is held with it: with the
+    /// last disconnect that waited for this one, which is told no earlier than any other that did
+    /// (each waits for every connection to its datacenter not ended as it came, so a later one
+    /// waits for all an earlier one still waits for).
+    fn ended(&mut self, id: task::Id, unsent: Vec<(i32, Rpc)>) -> Vec<(i32, Rpc)> {
+        self.tasks.retain(|(task, _)| *task != id);
+        let mut unsent = Some(unsent);
+        for pending in self.disconnects.iter_mut().rev() {
+            if let Some(at) = pending.left.iter().position(|left| *left == id) {
+                pending.left.swap_remove(at);
+                pending.unsent.extend(unsent.take().into_iter().flatten());
+            }
+        }
+        let mut go_on = unsent.unwrap_or_default();
+        for pending in self
+            .disconnects
+            .extract_if(.., |pending| pending.left.is_empty())
+        {
+            let _ = pending.done.send(());
+            go_on.extend(pending.unsent);
+        }
+        go_on
     }
 
     async fn process_request(&mut self, request: Request) -> ControlFlow<()> {
@@ -427,7 +553,7 @@ impl SenderPoolRunner {
                     tx,
                     handed_back: false,
                 };
-                self.dispatch(dc_id, rpc).await;
+                self.dispatch(dc_id, rpc, None).await;
                 ControlFlow::Continue(())
             }
             Request::CheckRetry {
@@ -452,18 +578,43 @@ impl SenderPoolRunner {
                 let _ = tx.send(flow);
                 ControlFlow::Continue(())
             }
-            Request::Disconnect { dc_id } => {
+            Request::Disconnect { dc_id, done } => {
                 // Dropping `rpc_tx` ends `run_sender`, which fails the requests whose bytes left
-                // and hands back the others, which the join arm sends on, with the signal it owes.
+                // and hands back the others, which the join arm sends on, with the signal it owes,
+                // once the disconnect has been told. The requests held for the dialer's permit stay
+                // held: none has a connection to drop.
                 self.connections
                     .retain(|connection| connection.dc_id != dc_id);
+                let left: Vec<task::Id> = self
+                    .tasks
+                    .iter()
+                    .filter(|(_, dc)| *dc == dc_id)
+                    .map(|(task, _)| *task)
+                    .collect();
+                if left.is_empty() {
+                    let _ = done.send(());
+                } else {
+                    self.disconnects.push(PendingDisconnect {
+                        left,
+                        done,
+                        unsent: Vec::new(),
+                    });
+                }
                 ControlFlow::Continue(())
             }
             Request::Quit => ControlFlow::Break(()),
         }
     }
 
-    /// Hand `rpc` to the connection to `dc_id`, making one if none is open.
+    /// Hand `rpc` to the connection to `dc_id`, making one if none is open, or else hold it while
+    /// the dialer's permit is shut ([`crate::Dialer::permit`]), behind those held for `dc_id`
+    /// already, which go first. `expires` is when the wait of a request held before runs out
+    /// ([`Self::hold`]).
+    ///
+    /// The runner never waits for the permit: it goes on with every other request, disconnects
+    /// among them, and with the connections that end, and the held requests go on once the permit
+    /// comes ([`Self::release_held`]). Waiting for it here would hold all of that: a caller that
+    /// awaits a disconnect while it keeps the permit shut would wait until the wait ran out.
     ///
     /// A connection's task wakes the callers of its requests as its connection fails, before the
     /// runner joins it, so a retry can reach the runner while the connection is still listed. An
@@ -471,7 +622,7 @@ impl SenderPoolRunner {
     /// first): the request goes to a new connection, rather than fail with the old one. A request
     /// a connection hands back comes here too; handed back again by a connection that failed, it
     /// fails with that connection's error instead ([`ConnectionEnd::unsent`]).
-    async fn dispatch(&mut self, dc_id: i32, mut rpc: Rpc) {
+    async fn dispatch(&mut self, dc_id: i32, mut rpc: Rpc, expires: Option<tokio::time::Instant>) {
         loop {
             let open = self
                 .connections
@@ -479,6 +630,10 @@ impl SenderPoolRunner {
                 .find(|connection| connection.dc_id == dc_id && !connection.rpc_tx.is_closed());
             let connection = match open {
                 Some(connection) => connection,
+                None if self.held.iter().any(|held| held.dc_id == dc_id) || !self.permitted() => {
+                    self.hold(dc_id, rpc, expires);
+                    return;
+                }
                 None => match self.create_connection(dc_id).await {
                     Ok(connection) => connection,
                     Err(error) => {
@@ -492,6 +647,54 @@ impl SenderPoolRunner {
                 // It closed its end since it was found: it is ending too.
                 Err(mpsc::error::SendError(unsent)) => rpc = unsent,
             }
+        }
+    }
+
+    /// Whether the dialer permits a dial now ([`crate::Dialer::permit`]).
+    fn permitted(&self) -> bool {
+        let mut permit = self.connection_params.dialer.permit();
+        permit
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_ready()
+    }
+
+    /// Hold `rpc` for the dialer's permit, behind every request held before it, until `expires`
+    /// if it was held before, or else for [`SETUP_TIMEOUT`]: the wait counts against a new
+    /// connection's setup time, as it did when a dialer waited inside its dial.
+    fn hold(&mut self, dc_id: i32, rpc: Rpc, expires: Option<tokio::time::Instant>) {
+        let expires = expires.unwrap_or_else(|| tokio::time::Instant::now() + SETUP_TIMEOUT);
+        self.held.push(Held {
+            dc_id,
+            rpc,
+            expires,
+        });
+    }
+
+    /// The dialer's permit came: the held requests go on in the order they came
+    /// ([`Self::dispatch`]), so a datacenter's first one makes the new connection and the others
+    /// go to it. One whose caller no longer waits is dropped: it could only make a connection for
+    /// nobody. One that finds the permit shut again is held again, its wait running out when it
+    /// would have.
+    async fn release_held(&mut self) {
+        for held in mem::take(&mut self.held) {
+            if !held.rpc.tx.is_closed() {
+                self.dispatch(held.dc_id, held.rpc, Some(held.expires))
+                    .await;
+            }
+        }
+    }
+
+    /// Fail the held requests whose wait for the dialer's permit has run out with an I/O error of
+    /// kind [`io::ErrorKind::TimedOut`], as a new connection's setup past [`SETUP_TIMEOUT`] fails.
+    fn expire_held(&mut self) {
+        let now = tokio::time::Instant::now();
+        for held in self.held.extract_if(.., |held| held.expires <= now) {
+            drop(
+                held.rpc
+                    .tx
+                    .send(Err(InvocationError::Io(io::ErrorKind::TimedOut.into()))),
+            );
         }
     }
 
@@ -512,13 +715,14 @@ impl SenderPoolRunner {
             self.signals.send(Signal::Opened);
         }
         let (rpc_tx, rpc_rx) = mpsc::unbounded_channel();
-        self.connection_pool.spawn(run_sender(
+        let task = self.connection_pool.spawn(run_sender(
             dc_id,
             sender,
             rpc_rx,
             UpdatesForwarder::new(self.signals.clone()),
             home_sender,
         ));
+        self.tasks.push((task.id(), dc_id));
         Ok(self.connections.push_mut(ConnectionInfo { dc_id, rpc_tx }))
     }
 
@@ -675,6 +879,22 @@ impl SenderPoolRunner {
             self.session.set_dc_option(&dc_option).await?;
         }
         Ok(())
+    }
+}
+
+/// Wait for the dialer's permit, if one is waited for ([`SenderPoolRunner::run`]).
+async fn permit_given(permit: &mut Option<PermitFuture>) {
+    match permit {
+        Some(permit) => permit.await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Sleep until `at`, if there is one ([`SenderPoolRunner::run`]).
+async fn sleep_until_some(at: Option<tokio::time::Instant>) {
+    match at {
+        Some(at) => sleep_until(at).await,
+        None => std::future::pending().await,
     }
 }
 
@@ -1042,9 +1262,11 @@ impl fmt::Debug for Request {
                 .field("slept_so_far", slept_so_far)
                 .field("tx", tx)
                 .finish(),
-            Self::Disconnect { dc_id } => {
-                f.debug_struct("Disconnect").field("dc_id", dc_id).finish()
-            }
+            Self::Disconnect { dc_id, done } => f
+                .debug_struct("Disconnect")
+                .field("dc_id", dc_id)
+                .field("done", done)
+                .finish(),
             Self::Quit => write!(f, "Quit"),
         }
     }

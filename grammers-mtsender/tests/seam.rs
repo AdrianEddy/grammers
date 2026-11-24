@@ -14,9 +14,10 @@
 //! never answers and tries the next, and a SOCKS5 dial's error names the proxy and says its cause
 //! once. A connection that makes a new key stores it before anything goes out under it, and the
 //! store's time takes none of the connect's. The home connection says it opened before its first
-//! request goes out, and another datacenter's doesn't. A connection the server sends nothing on
-//! after a keepalive ping fails after the pong timeout, which runs from the write of the ping's
-//! packet. The tests play the server on in-memory streams (the handshake's half too,
+//! request goes out, and another datacenter's doesn't. The requests held while the dialer's permit
+//! is shut go out together through one new connection once it comes. A connection the server
+//! sends nothing on after a keepalive ping fails after the pong timeout, which runs from the write
+//! of the ping's packet. The tests play the server on in-memory streams (the handshake's half too,
 //! `handshake`), and the proxy on loopback; nothing leaves the machine.
 
 mod handshake;
@@ -33,7 +34,7 @@ use grammers_mtproto::mtp::Plain;
 use grammers_mtproto::transport::{self, Intermediate};
 use grammers_mtsender::{
     ConnKind, ConnectionParams, DialFuture, DialTarget, Dialer, InvocationError, MtStream,
-    NoRetries, ReadError, Sender, SenderPool, SenderPoolHandle, TokioTcpDialer,
+    NoRetries, PermitFuture, ReadError, Sender, SenderPool, SenderPoolHandle, TokioTcpDialer,
 };
 use grammers_session::storages::MemorySession;
 use grammers_session::types::{DcOption, PeerId, PeerInfo, UpdateState, UpdatesState};
@@ -45,7 +46,7 @@ use tokio::io::{
     AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter, DuplexStream, ReadBuf,
 };
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, timeout};
 
 /// The modulus of an RSA key made for these tests, in decimal.
@@ -1231,6 +1232,67 @@ async fn the_home_connection_opens_before_its_first_request() {
     runner.await.unwrap();
     // Datacenter 4's connection said nothing of its end either.
     assert!(updates.try_recv().is_err());
+}
+
+/// A [`TestDialer`] that permits dials only while `open` holds.
+struct Permitting {
+    dialer: Arc<TestDialer>,
+    open: watch::Sender<bool>,
+}
+
+impl Dialer for Permitting {
+    fn dial<'a>(&'a self, target: &'a DialTarget) -> DialFuture<'a> {
+        self.dialer.dial(target)
+    }
+
+    fn permit(&self) -> PermitFuture {
+        let mut open = self.open.subscribe();
+        Box::pin(async move {
+            drop(open.wait_for(|open| *open).await);
+        })
+    }
+}
+
+/// The requests that need a new connection while the dialer's permit is shut are held, and nothing
+/// is dialed; once the permit comes, they go out together through the one connection the first
+/// makes.
+#[tokio::test(start_paused = true)]
+async fn requests_held_for_the_permit_go_through_one_connection() {
+    let session = Arc::new(MemorySession::default());
+    let mut dc2 = session.dc_option(2).unwrap().unwrap();
+    dc2.auth_key = Some(AUTH_KEY);
+    session.set_dc_option(&dc2).await.unwrap();
+    let (dialer, mut servers) = TestDialer::new(1 << 16);
+    let permitting = Arc::new(Permitting {
+        dialer: Arc::clone(&dialer),
+        open: watch::Sender::new(false),
+    });
+    let mut params = params(Arc::clone(&dialer), Vec::new());
+    params.dialer = Arc::clone(&permitting) as Arc<dyn Dialer>;
+    let pool = SenderPool::with_configuration(session, 1, params);
+    let runner = tokio::spawn(pool.runner.run());
+
+    let calls = [call_dc2(&pool.handle), call_dc2(&pool.handle)];
+    // Once everything waits (paused time moves on only then), both are held.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(servers.try_recv().is_err());
+    assert!(dialer.targets.lock().unwrap().is_empty());
+
+    permitting.open.send_replace(true);
+    let mut server = servers.recv().await.unwrap();
+    server
+        .answer_encrypted(&config(Vec::new()).to_bytes())
+        .await;
+    // Both requests go out in the connection's next packet; the server hangs up after it, so
+    // both fail with the connection.
+    server.read_packet().await;
+    drop(server);
+    for call in calls {
+        assert!(matches!(call.await.unwrap(), Err(InvocationError::Io(_))));
+    }
+    assert_eq!(dialer.targets.lock().unwrap().len(), 1);
+    assert!(pool.handle.quit());
+    runner.await.unwrap();
 }
 
 /// A [`MemorySession`] whose write of a new authorization key takes [`SlowKeys::DELAY`].
