@@ -440,51 +440,51 @@ impl MessageBoxes {
     /// moved later is only noticed then.
     ///
     /// If a deadline expired, the corresponding entries will be marked as needing to get its difference.
-    /// While there are entries pending of getting their difference, this method returns `now`, and
-    /// checks only the account's deadlines: its retry after an unanswered end
+    /// While there are entries pending of getting their difference, this method returns `now`.
+    /// Every box's timers are its own, as tdesktop's and TDLib's are, so none waits for another
+    /// box's difference: the account's retry after an unanswered end
     /// ([`MessageBoxes::end_account_difference`]), its boxes' possible gaps, its `seq` gap (the
     /// containers held past the local `seq`, [`MessageBoxes::process_updates`]) and its idle
-    /// deadline don't wait for the channels' differences, while the channels' wait for every
-    /// difference to end. While that retry is armed, it is the account's one deadline to begin its
-    /// difference: a possible gap of the account's, or its `seq` gap, whose half second is over
-    /// while the retry waits is dropped instead, for the retry's difference to return its updates
-    /// and set the `seq`; one due with the retry is kept for that difference.
+    /// deadline, and each channel's possible gap and its retry after a temporary failure
+    /// ([`MessageBoxes::end_channel_difference`]), fall due while other boxes get their
+    /// differences: a channel that falls due waits behind the channels already waiting for theirs
+    /// ([`MessageBoxes::get_channel_difference`]). While the account's retry is armed, it is the
+    /// account's one deadline to begin its difference: a possible gap of the account's, or its
+    /// `seq` gap, whose half second is over while the retry waits is dropped instead, for the
+    /// retry's difference to return its updates and set the `seq`; one due with the retry is kept
+    /// for that difference.
     pub fn check_deadlines(&mut self, now: Now) -> Now {
-        if !self.getting_diff_for.is_empty() {
-            // The account's timers are its own, as tdesktop's and TDLib's are: its retry, its
-            // possible gaps and its idle deadline fall due while channels get their differences.
-            if now >= self.next_deadline {
-                self.check_account_deadlines(now);
+        if now >= self.next_deadline {
+            // To avoid hogging up all CPU by sleeping for no duration,
+            // if no deadline is armed, the next one is a full timeout away.
+            let mut next_deadline =
+                next_updates_deadline(now).min(self.check_account_deadlines(now));
+            for entry in &mut self.entries {
+                let Key::Channel(_) = entry.key else {
+                    continue;
+                };
+                // A channel getting its difference has none: beginning it cleared both.
+                let Some(deadline) = entry.deadline() else {
+                    continue;
+                };
+                if now < deadline {
+                    next_deadline = next_deadline.min(deadline);
+                    continue;
+                }
+                debug!(?entry, "deadline for forcibly fetching updates met");
+                // The moral equivalent of `try_begin_get_diff`, behind those waiting already.
+                entry.begin_difference();
+                debug_assert!(
+                    !self.getting_diff_for.contains(&entry.key),
+                    "a channel getting its difference has no deadline: beginning it cleared both"
+                );
+                self.getting_diff_for.push(entry.key);
             }
-            return now;
+            self.next_deadline = next_deadline;
         }
-        if now < self.next_deadline {
-            return self.next_deadline;
-        }
-
-        // To avoid hogging up all CPU by sleeping for no duration,
-        // if no deadline is armed, the next one is a full timeout away.
-        let mut next_deadline = next_updates_deadline(now).min(self.check_account_deadlines(now));
-        for entry in &mut self.entries {
-            let Key::Channel(_) = entry.key else {
-                continue;
-            };
-            let Some(deadline) = entry.deadline() else {
-                continue;
-            };
-            if now < deadline {
-                next_deadline = next_deadline.min(deadline);
-                continue;
-            }
-            debug!(?entry, "deadline for forcibly fetching updates met");
-            // The moral equivalent of `try_begin_get_diff`.
-            entry.begin_difference();
-            self.getting_diff_for.push(entry.key);
-        }
-        self.next_deadline = next_deadline;
 
         if self.getting_diff_for.is_empty() {
-            next_deadline
+            self.next_deadline
         } else {
             now
         }
